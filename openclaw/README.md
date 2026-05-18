@@ -71,9 +71,9 @@ Set these in ClawManager or `docker run` to inject into `openclaw.json`:
 
 | Variable                     | Config path                              | Purpose                                                                                   |
 | ---------------------------- | ---------------------------------------- | ----------------------------------------------------------------------------------------- |
-| `CLAWMANAGER_LLM_BASE_URL` | `models.providers.auto.baseUrl`        | Gateway or upstream base URL                                                              |
-| `CLAWMANAGER_LLM_API_KEY`  | `apiKey`                               | Model API key                                                                             |
-| `CLAWMANAGER_LLM_MODEL`    | `primary` / `agents.defaults.models` | Model id replacement; supports a single id or a JSON array; handled by the agent's config normalizer |
+| `CLAWMANAGER_LLM_BASE_URL` | `models.providers.auto.baseUrl`        | Gateway or upstream base URL; OpenClaw uses the injected value directly                    |
+| `CLAWMANAGER_LLM_API_KEY`  | `models.providers.auto.apiKey`         | Model API key or ClawManager-issued gateway token                                         |
+| `CLAWMANAGER_LLM_MODEL`    | `agents.defaults.model.primary` / `agents.defaults.models` | Model id replacement; supports a single id or a JSON array; written as `auto/<model>` refs so embedded agent runs reuse the managed gateway provider |
 | `CLAWMANAGER_OPENCLAW_CHANNELS_JSON` | `channels` (merge)                     | JSON object with one or more channel keys (`feishu`, `slack`, …); shallow-merge into `channels`; invalid JSON aborts startup |
 | `OPENCLAW_AGENT_INSTANCE_ID` | agent bootstrap                         | Required. Unique instance id used during `/api/v1/agent/register` |
 | `OPENCLAW_AGENT_BOOTSTRAP_TOKEN` | agent bootstrap                      | Required. Bootstrap token for agent registration |

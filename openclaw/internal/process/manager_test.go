@@ -7,19 +7,20 @@ import (
 	appconfig "github.com/iamlovingit/clawmanager-openclaw-image/internal/config"
 )
 
-func TestOpenClawStartEnvSkipsChannelsWhenChannelsEnvMissing(t *testing.T) {
+// TEMP(testing): matches manager.go — OPENCLAW_SKIP_CHANNELS=1 is not injected.
+func TestOpenClawStartEnvNoSkipWhenChannelsEnvMissing(t *testing.T) {
 	env := openClawStartEnv([]string{"PATH=/usr/bin"}, "", false)
 
-	if got := envValue(env, skipChannelsEnv); got != "1" {
-		t.Fatalf("expected %s=1 when %s is missing, got %q", skipChannelsEnv, channelsJSONEnv, got)
+	if got := envValue(env, skipChannelsEnv); got != "" {
+		t.Fatalf("expected %s absent when %s is missing (temp: no inject), got %q", skipChannelsEnv, channelsJSONEnv, got)
 	}
 }
 
-func TestOpenClawStartEnvSkipsChannelsWhenChannelsEnvBlank(t *testing.T) {
+func TestOpenClawStartEnvNoSkipWhenChannelsEnvBlank(t *testing.T) {
 	env := openClawStartEnv([]string{"PATH=/usr/bin", skipChannelsEnv + "=0"}, "  \t\n", true)
 
-	if got := envValue(env, skipChannelsEnv); got != "1" {
-		t.Fatalf("expected blank %s to force %s=1, got %q", channelsJSONEnv, skipChannelsEnv, got)
+	if got := envValue(env, skipChannelsEnv); got != "" {
+		t.Fatalf("expected %s stripped when %s is blank (temp: no inject), got %q", skipChannelsEnv, channelsJSONEnv, got)
 	}
 }
 

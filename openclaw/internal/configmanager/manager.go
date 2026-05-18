@@ -26,9 +26,9 @@ type Manager struct {
 	client revisionClient
 	store  *store.Store
 
-	mu               sync.Mutex
-	modelBaselines   []modelBaselineEntry
-	modelBaselineSet bool
+	mu                 sync.Mutex
+	modelGuardSnapshot modelGuardBaseline
+	modelBaselineSet   bool
 }
 
 func New(cfg appconfig.Config, client revisionClient, st *store.Store) *Manager {

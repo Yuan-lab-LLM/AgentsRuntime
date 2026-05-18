@@ -16,6 +16,7 @@ import os
 import json
 import hashlib
 import re
+import shutil
 from pathlib import Path
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -264,6 +265,10 @@ def parse_bool(value):
     if raw in {"0", "false", "no", "n", "off", "disabled"}:
         return False
     return None
+
+
+def truthy_env(name):
+    return parse_bool(os.environ.get(name, "")) is True
 
 
 def parse_int(value):
@@ -1156,6 +1161,44 @@ def apply_injected_skills(hermes_home):
     return payload["source_env"], applied, payload["error"], errors
 
 
+def ensure_bundled_redis_team_protocol_skill(hermes_home):
+    enabled = truthy_env("CLAWMANAGER_TEAM_ENABLED")
+    source_dir = Path("/usr/local/share/clawmanager/hermes/skills/redis-team-protocol")
+    target_dir = hermes_home / "skills" / "redis-team-protocol"
+    record = {
+        "enabled": enabled,
+        "source": str(source_dir),
+        "target": str(target_dir),
+        "installed": False,
+        "skipped": "",
+        "error": "",
+        "updated_at": utc_now(),
+    }
+
+    if not enabled:
+        return record
+
+    try:
+        if target_dir.exists():
+            record["skipped"] = "target exists"
+        elif not source_dir.exists():
+            record["error"] = "bundled redis-team-protocol skill is missing"
+        else:
+            target_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(source_dir, target_dir)
+            for path in target_dir.rglob("*"):
+                if path.is_dir():
+                    path.chmod(0o755)
+                else:
+                    path.chmod(0o644)
+            record["installed"] = True
+    except Exception as exc:
+        record["error"] = str(exc)
+
+    persist_bootstrap_payload(hermes_home, "redis-team-protocol-skill", record)
+    return record
+
+
 def apply_skill_config(data, hermes_home):
     sources = []
     skills_cfg = data.get("skills")
@@ -1163,8 +1206,11 @@ def apply_skill_config(data, hermes_home):
         skills_cfg = {}
 
     injected_src, injected_skills, injected_error, injected_errors = apply_injected_skills(hermes_home)
+    team_protocol_record = ensure_bundled_redis_team_protocol_skill(hermes_home)
     if injected_src:
         sources.append(injected_src)
+    if team_protocol_record.get("enabled") and not team_protocol_record.get("error"):
+        sources.append("bundled_redis_team_protocol")
 
     existing_dirs = skills_cfg.get("external_dirs")
     if not isinstance(existing_dirs, list):
@@ -1358,6 +1404,66 @@ def apply_bootstrap_manifest(hermes_home):
 def write_applied_state(hermes_home, state):
     state["updated_at"] = utc_now()
     write_json_secure(bootstrap_dir(hermes_home) / "applied-state.json", state)
+
+
+def apply_redis_team_config(hermes_home, data):
+    enabled = truthy_env("CLAWMANAGER_TEAM_ENABLED")
+    shared_dir = os.environ.get("CLAWMANAGER_TEAM_SHARED_DIR", "").strip() or "/team"
+    team_id = os.environ.get("CLAWMANAGER_TEAM_ID", "").strip()
+    member_id = os.environ.get("CLAWMANAGER_TEAM_MEMBER_ID", "").strip()
+    redis_url = os.environ.get("CLAWMANAGER_TEAM_REDIS_URL", "").strip()
+
+    record = {
+        "enabled": enabled,
+        "configured": bool(enabled and team_id and member_id and redis_url),
+        "team_id": team_id,
+        "member_id": member_id,
+        "shared_dir": shared_dir,
+        "redis_url_sha256": hashlib.sha256(redis_url.encode("utf-8")).hexdigest() if redis_url else "",
+        "error": "",
+        "updated_at": utc_now(),
+    }
+
+    if not enabled:
+        return record
+
+    if not Path(shared_dir).is_absolute():
+        record["error"] = "CLAWMANAGER_TEAM_SHARED_DIR must be absolute"
+        persist_bootstrap_payload(hermes_home, "redis-team", record)
+        return record
+
+    for child in ("", "inbox", "status", "tasks", "results", ".hermes-redis-team"):
+        try:
+            path = Path(shared_dir) / child
+            path.mkdir(parents=True, exist_ok=True)
+            path.chmod(0o775)
+        except Exception as exc:
+            record["error"] = f"mkdir {path}: {exc}"
+            break
+
+    platforms_cfg = data.get("platforms")
+    if not isinstance(platforms_cfg, dict):
+        platforms_cfg = {}
+    redis_team_cfg = platforms_cfg.get("redis_team")
+    if not isinstance(redis_team_cfg, dict):
+        redis_team_cfg = {}
+    redis_team_cfg["enabled"] = True
+    extra = redis_team_cfg.get("extra")
+    if not isinstance(extra, dict):
+        extra = {}
+    extra.update(
+        {
+            "from_env": True,
+            "enabled": True,
+            "shared_dir": shared_dir,
+        }
+    )
+    redis_team_cfg["extra"] = extra
+    platforms_cfg["redis_team"] = redis_team_cfg
+    data["platforms"] = platforms_cfg
+
+    persist_bootstrap_payload(hermes_home, "redis-team", record)
+    return record
 
 
 def normalize_provider(provider, base_url):
@@ -1575,6 +1681,7 @@ messaging_env_updates, messaging_sources, configured_platforms, gateway_written,
     data,
     hermes_home,
 )
+redis_team_record = apply_redis_team_config(hermes_home, data)
 manifest_record = apply_bootstrap_manifest(hermes_home)
 write_applied_state(
     hermes_home,
@@ -1600,6 +1707,15 @@ write_applied_state(
             "source_env": manifest_record.get("source_env", ""),
             "raw_sha256": manifest_record.get("raw_sha256", ""),
             "error": manifest_record.get("error", ""),
+        },
+        "redis_team": {
+            "enabled": redis_team_record.get("enabled", False),
+            "configured": redis_team_record.get("configured", False),
+            "team_id": redis_team_record.get("team_id", ""),
+            "member_id": redis_team_record.get("member_id", ""),
+            "shared_dir": redis_team_record.get("shared_dir", ""),
+            "redis_url_sha256": redis_team_record.get("redis_url_sha256", ""),
+            "error": redis_team_record.get("error", ""),
         },
     },
 )
@@ -1649,6 +1765,7 @@ print(
     f"base_url={(base_url or model_cfg.get('base_url', ''))!r} "
     f"skill_dirs={data.get('skills', {}).get('external_dirs', [])!r} "
     f"platforms={configured_platforms!r} gateway_json={gateway_written} "
+    f"redis_team={redis_team_record.get('configured', False)!r} "
     f"sources={sources}"
 )
 PY
