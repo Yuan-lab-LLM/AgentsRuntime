@@ -124,7 +124,8 @@ func (e *Executor) handle(ctx context.Context, cmd *protocol.Command) (map[strin
 		if err != nil {
 			return result, err
 		}
-		if reload, _ := cmd.Payload["reload"].(bool); reload {
+		reload, reloadSet := cmd.Payload["reload"].(bool)
+		if !reloadSet || reload {
 			if err := e.process.Restart(ctx); err != nil {
 				return result, err
 			}

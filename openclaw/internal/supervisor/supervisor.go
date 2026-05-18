@@ -107,6 +107,19 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	if err := s.config.NormalizeActiveConfig(); err != nil {
 		return fmt.Errorf("normalize openclaw config: %w", err)
 	}
+
+	if err := s.ensureSession(ctx); err != nil {
+		return err
+	}
+
+	state := s.store.Snapshot()
+	if state.CurrentConfigRevisionID == "" && s.cfg.InitialConfigRevisionID != "" {
+		if _, err := s.config.ApplyRevision(ctx, s.cfg.InitialConfigRevisionID); err != nil {
+			return fmt.Errorf("apply initial openclaw config revision: %w", err)
+		}
+		s.logger.Printf("initial openclaw config revision applied revision_id=%s", s.cfg.InitialConfigRevisionID)
+	}
+
 	if err := s.config.CaptureModelBaseline(); err != nil {
 		return fmt.Errorf("capture openclaw model baseline: %w", err)
 	}
@@ -124,15 +137,6 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		defer wg.Done()
 		s.modelGuardLoop(ctx)
 	}()
-
-	if err := s.ensureSession(ctx); err != nil {
-		return err
-	}
-
-	state := s.store.Snapshot()
-	if state.CurrentConfigRevisionID == "" && s.cfg.InitialConfigRevisionID != "" {
-		_, _ = s.config.ApplyRevision(ctx, s.cfg.InitialConfigRevisionID)
-	}
 
 	wg.Add(4)
 	go func() {

@@ -1,0 +1,19 @@
+{
+  "skill_id": "redis-team-protocol",
+  "identifier": "redis-team-protocol",
+  "name": "redis-team-protocol",
+  "display_name": "ClawManager Redis Team Protocol",
+  "skill_version": "1.0.0",
+  "version": "1.0.0",
+  "source": "bundled_by_agentsruntime",
+  "type": "hermes-skill",
+  "metadata": {
+    "runtime": "hermes",
+    "manifest": "skill.json",
+    "clawmanager": {
+      "key": "redis-team-protocol",
+      "name": "ClawManager Redis Team Protocol",
+      "content_format": "markdown"
+    }
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "name": "@clawmanager/openclaw-redis-team",
+  "version": "0.1.0",
+  "description": "OpenClaw Redis Streams Team Bus plugin for ClawManager managed runtimes.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "files": [
+    "dist",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "node ./scripts/build-check.mjs",
+    "pack:local": "npm pack --pack-destination ../../openclaw/vendor-plugins"
+  },
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ],
+    "runtimeExtensions": [
+      "./dist/index.js"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.5.4"
+    },
+    "build": {
+      "openclawVersion": "2026.5.4"
+    }
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "openclaw",
+    "clawmanager",
+    "redis",
+    "team",
+    "agent"
+  ],
+  "license": "UNLICENSED"
+}

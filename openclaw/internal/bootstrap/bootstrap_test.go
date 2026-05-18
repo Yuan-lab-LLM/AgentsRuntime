@@ -96,6 +96,48 @@ func TestEnsureExtensionsDirCreates(t *testing.T) {
 	}
 }
 
+func TestEnsureTeamSharedDirsDisabledNoop(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "team")
+	t.Setenv("CLAWMANAGER_TEAM_ENABLED", "")
+	t.Setenv("CLAWMANAGER_TEAM_SHARED_DIR", root)
+
+	if err := ensureTeamSharedDirs(appconfig.Config{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(root); !os.IsNotExist(err) {
+		t.Fatalf("expected disabled team bootstrap to leave %s absent, got err=%v", root, err)
+	}
+}
+
+func TestEnsureTeamSharedDirsCreatesExpectedLayout(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "team")
+	t.Setenv("CLAWMANAGER_TEAM_ENABLED", "true")
+	t.Setenv("CLAWMANAGER_TEAM_SHARED_DIR", root)
+
+	if err := ensureTeamSharedDirs(appconfig.Config{DropUserName: ""}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, path := range append([]string{root}, teamSharedSubdirPaths(root)...) {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("expected %s to exist: %v", path, err)
+		}
+		if !info.IsDir() {
+			t.Fatalf("expected %s to be a directory", path)
+		}
+	}
+}
+
+func TestEnsureTeamSharedDirsRejectsRelativePath(t *testing.T) {
+	t.Setenv("CLAWMANAGER_TEAM_ENABLED", "true")
+	t.Setenv("CLAWMANAGER_TEAM_SHARED_DIR", "relative-team")
+
+	if err := ensureTeamSharedDirs(appconfig.Config{}); err == nil {
+		t.Fatal("expected relative team shared dir to fail")
+	}
+}
+
 func TestEnsureDingtalkOpenclawSymlinkCreates(t *testing.T) {
 	global := filepath.Join(t.TempDir(), "openclaw")
 	if err := os.MkdirAll(global, 0o755); err != nil {

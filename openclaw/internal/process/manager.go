@@ -191,7 +191,9 @@ func openClawStartEnv(base []string, channelsRaw string, channelsPresent bool) [
 	if channelsEnvConfigured(channelsRaw, channelsPresent) {
 		return removeEnv(env, skipChannelsEnv)
 	}
-	return setOrAppend(env, skipChannelsEnv, "1")
+	// TEMP(testing): do not inject OPENCLAW_SKIP_CHANNELS=1 for gateway subprocess.
+	// Restore: return setOrAppend(env, skipChannelsEnv, "1")
+	return removeEnv(env, skipChannelsEnv)
 }
 
 func channelsEnvConfigured(raw string, present bool) bool {

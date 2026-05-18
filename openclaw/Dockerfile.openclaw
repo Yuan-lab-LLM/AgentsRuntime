@@ -31,8 +31,9 @@ RUN apt-get update \
 
 COPY --from=node-runtime /usr/local /usr/local
 
-RUN npm install -g openclaw@v2026.4.27
+RUN npm install -g openclaw@v2026.5.4
 
+COPY vendor-plugins/openclaw-redis-team.tgz /tmp/openclaw-redis-team.tgz
 COPY defaults-template/.config /defaults/.config
 # Seed the runtime template under /defaults so the first /config sync gets the
 # tracked OpenClaw config plus any files the image expects to manage.
@@ -49,7 +50,9 @@ RUN sed -i 's/\r$//' /etc/services.d/openclaw-agent/run \
   && chmod +x /etc/services.d/openclaw-agent/run \
   && chmod +x /etc/services.d/openclaw-agent/finish \
   && chmod +x /usr/local/bin/openclaw-agent \
+  && HOME=/defaults openclaw plugins install /tmp/openclaw-redis-team.tgz \
   && HOME=/defaults openclaw plugins install @dingtalk-real-ai/dingtalk-connector \
+  && rm -f /tmp/openclaw-redis-team.tgz \
   && chown -R abc:abc /defaults/.openclaw \
   && chown -R abc:abc /defaults/.config \
   && mkdir -p /var/lib/openclaw-agent /var/log/openclaw-agent /etc/openclaw-agent

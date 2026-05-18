@@ -23,6 +23,9 @@ func Run(cfg appconfig.Config) error {
 	if err := syncAutostart(cfg); err != nil {
 		return fmt.Errorf("sync autostart: %w", err)
 	}
+	if err := ensureTeamSharedDirs(cfg); err != nil {
+		return fmt.Errorf("ensure team shared dirs: %w", err)
+	}
 	if err := applyOwnership(cfg); err != nil {
 		return fmt.Errorf("apply ownership: %w", err)
 	}
