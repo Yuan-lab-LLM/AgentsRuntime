@@ -40,6 +40,7 @@ COPY defaults-template/.config /defaults/.config
 COPY defaults-template/.openclaw /defaults/.openclaw
 COPY config/openclaw-agent /defaults/openclaw-agent
 COPY --from=agent-builder /out/openclaw-agent /usr/local/bin/openclaw-agent
+COPY scripts/wrapped-chromium /usr/local/bin/wrapped-chromium
 COPY scripts/openclaw-agent-run /etc/services.d/openclaw-agent/run
 COPY scripts/openclaw-agent-finish /etc/services.d/openclaw-agent/finish
 
@@ -47,9 +48,11 @@ COPY scripts/openclaw-agent-finish /etc/services.d/openclaw-agent/finish
 # agent's first startup reconciliation.
 RUN sed -i 's/\r$//' /etc/services.d/openclaw-agent/run \
   && sed -i 's/\r$//' /etc/services.d/openclaw-agent/finish \
+  && sed -i 's/\r$//' /usr/local/bin/wrapped-chromium \
   && chmod +x /etc/services.d/openclaw-agent/run \
   && chmod +x /etc/services.d/openclaw-agent/finish \
   && chmod +x /usr/local/bin/openclaw-agent \
+  && chmod +x /usr/local/bin/wrapped-chromium \
   && HOME=/defaults openclaw plugins install /tmp/openclaw-redis-team.tgz \
   && HOME=/defaults openclaw plugins install @dingtalk-real-ai/dingtalk-connector \
   && rm -f /tmp/openclaw-redis-team.tgz \
