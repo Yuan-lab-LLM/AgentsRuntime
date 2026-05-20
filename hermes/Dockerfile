@@ -119,6 +119,7 @@ RUN set -eux; \
     chmod -R a+rX /usr/local/lib/hermes-agent/plugins/platforms/redis_team; \
     rm -rf /tmp/hermes-vendor-plugins; \
     sed -i 's/\r$//' \
+        /usr/local/bin/wrapped-chromium \
         /usr/local/bin/hermes-apply-runtime-config \
         /usr/local/bin/start-hermes-terminal \
         /usr/local/bin/start-hermes-gateway \
@@ -126,6 +127,7 @@ RUN set -eux; \
         /etc/s6-overlay/s6-rc.d/hermes-agent/run \
         /etc/s6-overlay/s6-rc.d/hermes-gateway/run; \
     chmod 755 \
+        /usr/local/bin/wrapped-chromium \
         /usr/local/bin/hermes-agent \
         /usr/local/bin/hermes-apply-runtime-config \
         /usr/local/bin/start-hermes-terminal \

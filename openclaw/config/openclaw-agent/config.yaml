@@ -31,3 +31,4 @@ process_stop_timeout: 20s
 skill_incremental_interval: 30s
 skill_full_sync_interval: 12h
 max_auto_restart: 3
+browser_executable: /usr/local/bin/wrapped-chromium
