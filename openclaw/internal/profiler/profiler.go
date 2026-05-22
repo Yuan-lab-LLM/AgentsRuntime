@@ -11,6 +11,8 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	appconfig "github.com/iamlovingit/clawmanager-openclaw-image/internal/config"
 )
@@ -18,12 +20,27 @@ import (
 type Profiler struct {
 	diskUsagePath  string
 	diskLimitBytes uint64
+	runtimeType    string
+	runtimeName    string
+	desktopBase    string
+	cpuMu          sync.Mutex
+	lastCPU        cpuUsageSample
+}
+
+type cpuUsageSample struct {
+	usageMicros uint64
+	sampledAt   time.Time
+	source      string
+	ok          bool
 }
 
 func New(cfg appconfig.Config) *Profiler {
 	return &Profiler{
 		diskUsagePath:  cfg.DiskUsagePath,
 		diskLimitBytes: cfg.DiskLimitBytes,
+		runtimeType:    cfg.RuntimeType,
+		runtimeName:    cfg.RuntimeName,
+		desktopBase:    cfg.DesktopBase,
 	}
 }
 
@@ -33,12 +50,15 @@ func (p *Profiler) Collect() map[string]any {
 	osVersion := detectOSVersion()
 	hostMemTotalKB, hostMemAvailableKB := readHostMemInfo()
 	load1, load5, load15 := readLoadAvg()
-	cpuInfo := collectCPUInfo(load1, load5, load15)
+	cpuInfo := p.collectCPUInfo(load1, load5, load15)
 	memoryInfo := collectMemoryInfo(hostMemTotalKB, hostMemAvailableKB)
 	diskInfo := p.collectDiskInfo()
 
 	return map[string]any{
-		"hostname": hostname,
+		"runtime_type": p.runtimeType,
+		"runtime_name": p.runtimeName,
+		"desktop_base": p.desktopBase,
+		"hostname":     hostname,
 		"os": map[string]any{
 			"goos":       runtime.GOOS,
 			"goarch":     runtime.GOARCH,
@@ -109,19 +129,19 @@ func readHostMemInfo() (uint64, uint64) {
 	return total, available
 }
 
-func collectCPUInfo(load1 float64, load5 float64, load15 float64) map[string]any {
-	cores := runtime.NumCPU()
-	source := "host"
+func (p *Profiler) collectCPUInfo(load1 float64, load5 float64, load15 float64) map[string]any {
+	cores, availableCores, source := containerCPUCapacity()
+	usagePercent, usedCores, usageReady, usageSource := p.collectCPUUsage(availableCores)
 
-	if limit, ok := readContainerCPULimit(); ok && limit > 0 {
-		cores = limit
-		source = "cgroup"
-	}
-
-	return map[string]any{
-		"cores":       cores,
-		"scope":       "container",
-		"data_source": source,
+	result := map[string]any{
+		"cores":             cores,
+		"available_cores":   roundFloat(availableCores, 3),
+		"scope":             "container",
+		"data_source":       source,
+		"usage_percent":     usagePercent,
+		"used_cores":        usedCores,
+		"usage_ready":       usageReady,
+		"usage_data_source": usageSource,
 		"load": map[string]any{
 			"1m":  load1,
 			"5m":  load5,
@@ -130,6 +150,25 @@ func collectCPUInfo(load1 float64, load5 float64, load15 float64) map[string]any
 		"load_scope":       "host",
 		"load_data_source": "/proc/loadavg",
 	}
+	if source == "cgroup" {
+		result["quota_cores"] = roundFloat(availableCores, 3)
+	}
+	return result
+}
+
+func (p *Profiler) collectCPUUsage(availableCores float64) (float64, float64, bool, string) {
+	current, ok := readContainerCPUUsage()
+	if !ok || availableCores <= 0 {
+		return 0, 0, false, current.source
+	}
+
+	p.cpuMu.Lock()
+	defer p.cpuMu.Unlock()
+
+	previous := p.lastCPU
+	p.lastCPU = current
+	usagePercent, usedCores, ready := calculateCPUUsage(previous, current, availableCores)
+	return usagePercent, usedCores, ready, current.source
 }
 
 func collectMemoryInfo(hostTotalKB uint64, hostAvailableKB uint64) map[string]any {
@@ -266,11 +305,8 @@ func collectNetworkTraffic() map[string]any {
 }
 
 func readContainerCPULimit() (int, bool) {
-	if quota, period, ok := readCgroupV2CPUQuota(); ok {
-		return quotaToCores(quota, period)
-	}
-	if quota, period, ok := readCgroupV1CPUQuota(); ok {
-		return quotaToCores(quota, period)
+	if _, cores, ok := readContainerCPUQuotaCores(); ok {
+		return quotaToCores(cores), true
 	}
 	if cpus, ok := readCpusetLimit(); ok && cpus > 0 {
 		return cpus, true
@@ -294,6 +330,116 @@ func readContainerMemory() (uint64, uint64, string) {
 		return max, available, "cgroup"
 	}
 	return 0, 0, ""
+}
+
+func containerCPUCapacity() (int, float64, string) {
+	hostCores := runtime.NumCPU()
+	cores := hostCores
+	availableCores := float64(hostCores)
+	source := "host"
+
+	if _, quotaCores, ok := readContainerCPUQuotaCores(); ok {
+		availableCores = quotaCores
+		cores = quotaToCores(quotaCores)
+		source = "cgroup"
+	} else if cpus, ok := readCpusetLimit(); ok && cpus > 0 {
+		cores = cpus
+		availableCores = float64(cpus)
+		source = "cpuset"
+	}
+	if availableCores <= 0 {
+		availableCores = 1
+	}
+	if cores < 1 {
+		cores = 1
+	}
+	return cores, availableCores, source
+}
+
+func readContainerCPUQuotaCores() (string, float64, bool) {
+	if quota, period, ok := readCgroupV2CPUQuota(); ok {
+		return "cgroup_v2:/sys/fs/cgroup/cpu.max", quota / period, true
+	}
+	if quota, period, ok := readCgroupV1CPUQuota(); ok {
+		return "cgroup_v1:cpu.cfs_quota_us", quota / period, true
+	}
+	return "", 0, false
+}
+
+func readContainerCPUUsage() (cpuUsageSample, bool) {
+	if usageMicros, ok := readCgroupV2CPUUsage(); ok {
+		return cpuUsageSample{
+			usageMicros: usageMicros,
+			sampledAt:   time.Now(),
+			source:      "cgroup_v2:/sys/fs/cgroup/cpu.stat",
+			ok:          true,
+		}, true
+	}
+	if usageMicros, source, ok := readCgroupV1CPUUsage(); ok {
+		return cpuUsageSample{
+			usageMicros: usageMicros,
+			sampledAt:   time.Now(),
+			source:      source,
+			ok:          true,
+		}, true
+	}
+	return cpuUsageSample{}, false
+}
+
+func readCgroupV2CPUUsage() (uint64, bool) {
+	raw := readTrimmed("/sys/fs/cgroup/cpu.stat")
+	if raw == "" {
+		return 0, false
+	}
+	scanner := bufio.NewScanner(strings.NewReader(raw))
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) != 2 || fields[0] != "usage_usec" {
+			continue
+		}
+		value, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return value, true
+	}
+	return 0, false
+}
+
+func readCgroupV1CPUUsage() (uint64, string, bool) {
+	for _, path := range []string{
+		"/sys/fs/cgroup/cpuacct/cpuacct.usage",
+		"/sys/fs/cgroup/cpu,cpuacct/cpuacct.usage",
+		"/sys/fs/cgroup/cpu/cpuacct.usage",
+	} {
+		usageNanos, ok := readUintFromFile(path)
+		if !ok {
+			continue
+		}
+		return usageNanos / 1000, "cgroup_v1:" + path, true
+	}
+	return 0, "", false
+}
+
+func calculateCPUUsage(previous cpuUsageSample, current cpuUsageSample, availableCores float64) (float64, float64, bool) {
+	if !previous.ok || !current.ok || current.usageMicros < previous.usageMicros || !current.sampledAt.After(previous.sampledAt) || availableCores <= 0 {
+		return 0, 0, false
+	}
+
+	elapsedMicros := float64(current.sampledAt.Sub(previous.sampledAt).Microseconds())
+	if elapsedMicros <= 0 {
+		return 0, 0, false
+	}
+
+	usedCores := float64(current.usageMicros-previous.usageMicros) / elapsedMicros
+	usagePercent := usedCores / availableCores * 100
+	if usagePercent < 0 {
+		usagePercent = 0
+	}
+	if usagePercent > 100 {
+		usagePercent = 100
+	}
+	return roundFloat(usagePercent, 2), roundFloat(usedCores, 3), true
 }
 
 func readCgroupV2CPUQuota() (float64, float64, bool) {
@@ -336,15 +482,12 @@ func readCgroupV1CPUQuota() (float64, float64, bool) {
 	return quotaValue, periodValue, true
 }
 
-func quotaToCores(quota float64, period float64) (int, bool) {
-	if quota <= 0 || period <= 0 {
-		return 0, false
-	}
-	cores := int(math.Ceil(quota / period))
+func quotaToCores(coresFloat float64) int {
+	cores := int(math.Ceil(coresFloat))
 	if cores < 1 {
 		cores = 1
 	}
-	return cores, true
+	return cores
 }
 
 func readCpusetLimit() (int, bool) {
@@ -437,6 +580,14 @@ func readUintFromFile(path string) (uint64, bool) {
 		return 0, false
 	}
 	return value, true
+}
+
+func roundFloat(value float64, places int) float64 {
+	if places <= 0 {
+		return math.Round(value)
+	}
+	factor := math.Pow10(places)
+	return math.Round(value*factor) / factor
 }
 
 func directorySize(root string) (uint64, error) {

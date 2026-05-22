@@ -31,6 +31,7 @@ const (
 	gatewayReadyHTTPTimeout     = 2 * time.Second
 	gatewayChannelSettleDelay   = 5 * time.Second
 	channelsJSONEnv             = "CLAWMANAGER_OPENCLAW_CHANNELS_JSON"
+	teamEnabledEnv              = "CLAWMANAGER_TEAM_ENABLED"
 	skipChannelsEnv             = "OPENCLAW_SKIP_CHANNELS"
 	gatewayModelsStdoutPath     = "/tmp/gateway-models.json"
 	gatewayModelsStderrPath     = "/tmp/gateway-models.err"
@@ -188,10 +189,7 @@ func openClawStartEnvFromOS() []string {
 
 func openClawStartEnv(base []string, channelsRaw string, channelsPresent bool) []string {
 	env := append([]string(nil), base...)
-	if channelsEnvConfigured(channelsRaw, channelsPresent) {
-		return removeEnv(env, skipChannelsEnv)
-	}
-	return setOrAppend(env, skipChannelsEnv, "1")
+	return removeEnv(env, skipChannelsEnv)
 }
 
 func channelsEnvConfigured(raw string, present bool) bool {
@@ -375,10 +373,19 @@ func gatewayModelsWarmupCommand(cfg appconfig.Config) (string, []string) {
 
 func gatewayChannelSettleDelayFromOS() time.Duration {
 	raw, present := os.LookupEnv(channelsJSONEnv)
-	if channelsEnvConfigured(raw, present) {
+	if channelsEnvConfigured(raw, present) || teamEnabledFromOS() {
 		return gatewayChannelSettleDelay
 	}
 	return 0
+}
+
+func teamEnabledFromOS() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(teamEnabledEnv))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func openClawBinary(cfg appconfig.Config) string {

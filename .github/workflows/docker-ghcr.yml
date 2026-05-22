@@ -52,6 +52,43 @@ jobs:
               continue
             fi
 
+            manifest="${dir}/.runtime-image.json"
+            if [ -f "${manifest}" ]; then
+              runtime="$(jq -r --arg dir "${dir}" '.runtime // $dir' "${manifest}")"
+              context="$(jq -r --arg dir "${dir}" '.context // ("./" + $dir)' "${manifest}")"
+              dockerfile="$(jq -r '.dockerfile // empty' "${manifest}")"
+              image="$(jq -r --arg repo_lower "${repo_lower}" --arg runtime "${runtime}" '.image // ("ghcr.io/" + $repo_lower + "/" + $runtime)' "${manifest}")"
+
+              if [ -z "${runtime}" ] || [ -z "${context}" ] || [ -z "${dockerfile}" ]; then
+                echo "Invalid runtime image manifest: ${manifest}" >&2
+                exit 1
+              fi
+              if [ ! -d "${context}" ]; then
+                echo "Build context does not exist for ${runtime}: ${context}" >&2
+                exit 1
+              fi
+              if [ ! -f "${dockerfile}" ]; then
+                echo "Dockerfile does not exist for ${runtime}: ${dockerfile}" >&2
+                exit 1
+              fi
+
+              entry="$(
+                jq -cn \
+                  --arg runtime "${runtime}" \
+                  --arg context "${context}" \
+                  --arg dockerfile "${dockerfile}" \
+                  --arg image "${image}" \
+                  '{
+                    runtime: $runtime,
+                    context: $context,
+                    dockerfile: $dockerfile,
+                    image: $image
+                  }'
+              )"
+              entries+=("${entry}")
+              continue
+            fi
+
             dockerfile=""
             if [ -f "${dir}/Dockerfile.${dir}" ]; then
               dockerfile="${dir}/Dockerfile.${dir}"

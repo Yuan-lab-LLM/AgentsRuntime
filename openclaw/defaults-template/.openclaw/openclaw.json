@@ -79,7 +79,15 @@
       "restart": true,
       "ownerDisplay": "raw"
     },
-    "channels": {},
+    "channels": {
+      "redis-team": {
+        "accounts": {
+          "default": {
+            "fromEnv": true
+          }
+        }
+      }
+    },
     "gateway": {
       "port": 18789,
       "mode": "local",
@@ -132,6 +140,12 @@
         },
         "dingtalk-connector": {
           "enabled": false
+        },
+        "redis-team": {
+          "enabled": true,
+          "config": {
+            "fromEnv": true
+          }
         }
       }
     }

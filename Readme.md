@@ -6,11 +6,13 @@ Each top-level runtime directory can produce one container image. At the moment,
 
 - `hermes`
 - `openclaw`
+- `openclaw-shell`
 
 ## Repository layout
 
 - `hermes/`: Hermes runtime image
 - `openclaw/`: OpenClaw runtime image
+- `openclaw-shell/`: Alpine-based OpenClaw shell runtime image, built from the repository root so it can reuse the OpenClaw agent implementation under `openclaw/`
 
 ## Manual builds
 
@@ -33,6 +35,17 @@ docker build \
   -t openclaw:local \
   ./openclaw
 ```
+
+### OpenClaw Shell
+
+```bash
+docker build \
+  -f openclaw-shell/Dockerfile \
+  -t openclaw-shell:local \
+  .
+```
+
+This image does not include Webtop or a virtual desktop. It uses `/config` as the persistent directory, runs `openclaw-agent` on container start, and reports `runtime_type=openclaw-shell` to ClawManager when `CLAWMANAGER_AGENT_ENABLED=true`.
 
 ## Manual multi-architecture builds
 
@@ -58,6 +71,17 @@ docker buildx build \
   -t <registry>/openclaw:latest \
   --push \
   ./openclaw
+```
+
+### OpenClaw Shell
+
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -f openclaw-shell/Dockerfile \
+  -t <registry>/openclaw-shell:latest \
+  --push \
+  .
 ```
 
 The supported architectures are:

@@ -1,0 +1,90 @@
+# Sourced by /etc/profile.d/openclaw-shell-login.sh for interactive shells.
+# The Web Shell contract is a single tmux-backed terminal session.
+
+umask 0002
+
+case "$-" in
+  *i*) ;;
+  *) return 0 2>/dev/null || exit 0 ;;
+esac
+
+case "${TERM:-}" in
+  ""|dumb|unknown) export TERM=xterm-256color ;;
+esac
+export COLORTERM="${COLORTERM:-truecolor}"
+export FORCE_COLOR="${FORCE_COLOR:-1}"
+export CLICOLOR="${CLICOLOR:-1}"
+export CLICOLOR_FORCE="${CLICOLOR_FORCE:-1}"
+export NPM_CONFIG_COLOR="${NPM_CONFIG_COLOR:-always}"
+export YARN_FORCE_COLOR="${YARN_FORCE_COLOR:-1}"
+unset NO_COLOR
+
+history_dir="${OPENCLAW_SHELL_HISTORY_DIR:-/config/openclaw-shell-agent/history}"
+log_dir="${OPENCLAW_SHELL_LOG_DIR:-/config/openclaw-shell-agent/logs}"
+session_name="${CLAWMANAGER_TMUX_SESSION:-${OPENCLAW_SHELL_TMUX_SESSION:-openclaw-shell}}"
+workdir="${OPENCLAW_SHELL_WORKDIR:-/team}"
+history_limit="${CLAWMANAGER_TMUX_HISTORY_LIMIT:-${OPENCLAW_SHELL_SCROLLBACK_LINES:-100000}}"
+tmux_runtime_conf="${OPENCLAW_SHELL_TMUX_CONFIG:-$history_dir/../tmux.conf}"
+
+case "$history_limit" in
+  ""|*[!0-9]*) history_limit=100000 ;;
+esac
+
+mkdir -p "$history_dir" "$log_dir"
+[ -d "$workdir" ] || workdir=/config
+cd "$workdir" 2>/dev/null || true
+
+shell_user="${USER:-$(id -un 2>/dev/null || echo shell)}"
+export HISTFILE="${OPENCLAW_SHELL_HISTFILE:-$history_dir/${shell_user}.bash_history}"
+export HISTSIZE="${OPENCLAW_SHELL_HISTSIZE:-50000}"
+export HISTFILESIZE="${OPENCLAW_SHELL_HISTFILESIZE:-200000}"
+export HISTCONTROL="${OPENCLAW_SHELL_HISTCONTROL:-ignoredups:erasedups}"
+export HISTTIMEFORMAT="${OPENCLAW_SHELL_HISTTIMEFORMAT:-%F %T }"
+export INPUTRC="${INPUTRC:-/etc/inputrc}"
+export OPENCLAW_SHELL_COMMAND_LOG="${OPENCLAW_SHELL_COMMAND_LOG:-$history_dir/${shell_user}.commands.log}"
+
+if [ -n "${BASH_VERSION:-}" ]; then
+  shopt -s histappend cmdhist 2>/dev/null || true
+  bind 'set enable-bracketed-paste off' 2>/dev/null || true
+  PS1="${OPENCLAW_SHELL_PS1:-\u@\h:\w\$ }"
+  __OPENCLAW_LAST_LOGGED_HISTORY="$(HISTTIMEFORMAT= history 1 2>/dev/null | awk '{print $1}')"
+
+  __openclaw_shell_history_sync() {
+    local exit_code=$?
+    local hist_line hist_num hist_cmd
+    hist_line="$(HISTTIMEFORMAT= history 1 2>/dev/null || true)"
+    hist_num="$(printf '%s\n' "$hist_line" | awk '{print $1}')"
+    hist_cmd="$(printf '%s\n' "$hist_line" | sed 's/^[[:space:]]*[0-9]\+[[:space:]]*//')"
+    history -a
+    history -n
+    if [ -n "$hist_num" ] && [ "$hist_num" != "${__OPENCLAW_LAST_LOGGED_HISTORY:-}" ] && [ -n "$hist_cmd" ]; then
+      printf '%s exit=%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$exit_code" "$hist_cmd" >>"$OPENCLAW_SHELL_COMMAND_LOG" 2>/dev/null || true
+      __OPENCLAW_LAST_LOGGED_HISTORY="$hist_num"
+    fi
+    return "$exit_code"
+  }
+
+  case ";${PROMPT_COMMAND:-};" in
+    *";__openclaw_shell_history_sync;"*) ;;
+    *) PROMPT_COMMAND="__openclaw_shell_history_sync${PROMPT_COMMAND:+; $PROMPT_COMMAND}" ;;
+  esac
+  export PROMPT_COMMAND
+fi
+
+[ -n "${TMUX:-}" ] && return 0 2>/dev/null || true
+
+{
+  printf '%s\n' 'source-file /etc/tmux.conf'
+  printf 'set-option -g history-limit %s\n' "$history_limit"
+  printf '%s\n' 'set-option -g mouse on'
+  printf '%s\n' 'set-option -g default-terminal "tmux-256color"'
+} >"$tmux_runtime_conf" 2>/dev/null || true
+
+tmux set-option -g history-limit "$history_limit" >/dev/null 2>&1 || true
+tmux set-option -g mouse on >/dev/null 2>&1 || true
+tmux set-option -g default-terminal "tmux-256color" >/dev/null 2>&1 || true
+
+tmux has-session -t "$session_name" 2>/dev/null || \
+  tmux -f "$tmux_runtime_conf" new-session -d -s "$session_name" -c "$workdir" "bash -l" 2>/dev/null || true
+tmux pipe-pane -t "$session_name:0.0" -o "cat >> $log_dir/${session_name}.typescript" >/dev/null 2>&1 || true
+exec tmux new-session -A -s "$session_name" -c "$workdir"

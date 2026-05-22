@@ -57,6 +57,7 @@ func normalizeConfigMap(content []byte, cfg appconfig.Config) ([]byte, bool, err
 		return nil, false, err
 	}
 	normalizeLLMConfigContent(parsed, llm)
+	normalizeProviderAuthContracts(parsed)
 
 	channelOpts := readChannelOverridesFromEnv(cfg)
 	if err := applyChannelOverrides(parsed, channelOpts); err != nil {
@@ -205,6 +206,12 @@ func normalizeLLMConfigContent(cfg map[string]any, overrides llmOverrides) {
 	if overrides.APIKeySet {
 		autoProvider["apiKey"] = overrides.APIKey
 	}
+	if strings.TrimSpace(stringValue(autoProvider["api"])) == "" {
+		autoProvider["api"] = "openai-completions"
+	}
+	if strings.TrimSpace(stringValue(autoProvider["auth"])) == "" && strings.TrimSpace(overrides.APIKey) != "" {
+		autoProvider["auth"] = "api-key"
+	}
 	if len(overrides.ModelIDs) > 0 {
 		autoProvider["models"] = buildProviderModels(autoProvider["models"], overrides.ModelIDs)
 
@@ -213,6 +220,26 @@ func normalizeLLMConfigContent(cfg map[string]any, overrides llmOverrides) {
 		model := ensureObject(defaults, "model")
 		model["primary"] = qualifiedModelID(overrides.ModelIDs[0])
 		defaults["models"] = buildAgentModels(defaults["models"], overrides.ModelIDs)
+	}
+}
+
+func normalizeProviderAuthContracts(cfg map[string]any) {
+	providers, ok := nestedMap(cfg, "models", "providers")
+	if !ok {
+		return
+	}
+	for _, raw := range providers {
+		provider, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(stringValue(provider["auth"])) != "" {
+			continue
+		}
+		if strings.TrimSpace(stringValue(provider["apiKey"])) == "" {
+			continue
+		}
+		provider["auth"] = "api-key"
 	}
 }
 

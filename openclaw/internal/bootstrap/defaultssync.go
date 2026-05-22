@@ -1,6 +1,9 @@
 package bootstrap
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
@@ -9,6 +12,8 @@ import (
 
 	appconfig "github.com/iamlovingit/clawmanager-openclaw-image/internal/config"
 )
+
+const bundledRedisTeamPluginID = "redis-team"
 
 // syncDefaults copies cfg.OpenClawDefaultsDir into the parent directory of
 // cfg.OpenClawConfigPath when the state directory or the active config file
@@ -39,6 +44,96 @@ func ensureExtensionsDir(cfg appconfig.Config) error {
 		return nil
 	}
 	return os.MkdirAll(cfg.OpenClawExtensionsDir, 0o755)
+}
+
+func syncBundledRedisTeamPlugin(cfg appconfig.Config) error {
+	if cfg.OpenClawDefaultsDir == "" || cfg.OpenClawExtensionsDir == "" {
+		return nil
+	}
+
+	src := filepath.Join(cfg.OpenClawDefaultsDir, "extensions", bundledRedisTeamPluginID)
+	dst := filepath.Join(cfg.OpenClawExtensionsDir, bundledRedisTeamPluginID)
+	if !pathExists(src) {
+		return nil
+	}
+	if sameBundledPlugin(src, dst) {
+		return nil
+	}
+	if err := replaceTree(dst, src, cfg.OpenClawExtensionsDir); err != nil {
+		return fmt.Errorf("replace %s: %w", bundledRedisTeamPluginID, err)
+	}
+	return nil
+}
+
+func sameBundledPlugin(src, dst string) bool {
+	if !pathExists(dst) {
+		return false
+	}
+	srcVersion := pluginPackageVersion(src)
+	dstVersion := pluginPackageVersion(dst)
+	if srcVersion != "" && dstVersion != "" && srcVersion != dstVersion {
+		return false
+	}
+	for _, rel := range []string{"package.json", "openclaw.plugin.json", filepath.Join("dist", "index.js")} {
+		s, err := fileSHA256(filepath.Join(src, rel))
+		if err != nil {
+			return false
+		}
+		d, err := fileSHA256(filepath.Join(dst, rel))
+		if err != nil || s != d {
+			return false
+		}
+	}
+	return true
+}
+
+func pluginPackageVersion(root string) string {
+	data, err := os.ReadFile(filepath.Join(root, "package.json"))
+	if err != nil {
+		return ""
+	}
+	var pkg struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(data, &pkg); err != nil {
+		return ""
+	}
+	return pkg.Version
+}
+
+func fileSHA256(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func replaceTree(dst, src, allowedRoot string) error {
+	cleanRoot, err := filepath.Abs(filepath.Clean(allowedRoot))
+	if err != nil {
+		return err
+	}
+	cleanDst, err := filepath.Abs(filepath.Clean(dst))
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(cleanRoot, cleanDst)
+	if err != nil {
+		return err
+	}
+	if rel == "." || rel == "" || relHasParentPrefix(rel) {
+		return fmt.Errorf("refusing to replace path outside extensions dir: %s", cleanDst)
+	}
+	if err := os.RemoveAll(cleanDst); err != nil {
+		return err
+	}
+	return copyTreeIfMissing(src, cleanDst)
+}
+
+func relHasParentPrefix(rel string) bool {
+	return rel == ".." || len(rel) > 3 && rel[:3] == ".."+string(filepath.Separator)
 }
 
 func copyTreeIfMissing(src, dst string) error {

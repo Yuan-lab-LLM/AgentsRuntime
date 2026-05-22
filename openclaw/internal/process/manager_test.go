@@ -7,19 +7,19 @@ import (
 	appconfig "github.com/iamlovingit/clawmanager-openclaw-image/internal/config"
 )
 
-func TestOpenClawStartEnvSkipsChannelsWhenChannelsEnvMissing(t *testing.T) {
+func TestOpenClawStartEnvDoesNotInjectSkipWhenChannelsEnvMissing(t *testing.T) {
 	env := openClawStartEnv([]string{"PATH=/usr/bin"}, "", false)
 
-	if got := envValue(env, skipChannelsEnv); got != "1" {
-		t.Fatalf("expected %s=1 when %s is missing, got %q", skipChannelsEnv, channelsJSONEnv, got)
+	if got := envValue(env, skipChannelsEnv); got != "" {
+		t.Fatalf("expected %s to be absent when %s is missing, got %q", skipChannelsEnv, channelsJSONEnv, got)
 	}
 }
 
-func TestOpenClawStartEnvSkipsChannelsWhenChannelsEnvBlank(t *testing.T) {
+func TestOpenClawStartEnvStripsSkipWhenChannelsEnvBlank(t *testing.T) {
 	env := openClawStartEnv([]string{"PATH=/usr/bin", skipChannelsEnv + "=0"}, "  \t\n", true)
 
-	if got := envValue(env, skipChannelsEnv); got != "1" {
-		t.Fatalf("expected blank %s to force %s=1, got %q", channelsJSONEnv, skipChannelsEnv, got)
+	if got := envValue(env, skipChannelsEnv); got != "" {
+		t.Fatalf("expected %s to be stripped when %s is blank, got %q", skipChannelsEnv, channelsJSONEnv, got)
 	}
 }
 
@@ -63,6 +63,7 @@ func TestGatewayReadyURL(t *testing.T) {
 
 func TestGatewayChannelSettleDelayFromOS(t *testing.T) {
 	t.Setenv(channelsJSONEnv, "")
+	t.Setenv(teamEnabledEnv, "")
 	if got := gatewayChannelSettleDelayFromOS(); got != 0 {
 		t.Fatalf("blank channels env settle delay = %s, want 0", got)
 	}
@@ -70,6 +71,12 @@ func TestGatewayChannelSettleDelayFromOS(t *testing.T) {
 	t.Setenv(channelsJSONEnv, `{"dingtalk":{"enabled":true}}`)
 	if got := gatewayChannelSettleDelayFromOS(); got != gatewayChannelSettleDelay {
 		t.Fatalf("configured channels env settle delay = %s, want %s", got, gatewayChannelSettleDelay)
+	}
+
+	t.Setenv(channelsJSONEnv, "")
+	t.Setenv(teamEnabledEnv, "true")
+	if got := gatewayChannelSettleDelayFromOS(); got != gatewayChannelSettleDelay {
+		t.Fatalf("team enabled settle delay = %s, want %s", got, gatewayChannelSettleDelay)
 	}
 }
 

@@ -37,7 +37,7 @@ func (m *Manager) Ensure(ctx context.Context) (store.State, error) {
 
 	agentID := state.AgentID
 	if agentID == "" {
-		agentID = "openclaw-agent-" + m.cfg.InstanceID
+		agentID = m.cfg.RuntimeType + "-" + m.cfg.InstanceID + "-main"
 	}
 
 	resp, err := m.client.Register(ctx, protocol.RegisterRequest{
@@ -45,8 +45,8 @@ func (m *Manager) Ensure(ctx context.Context) (store.State, error) {
 		AgentID:         agentID,
 		AgentVersion:    protocol.AgentVersion,
 		ProtocolVersion: m.cfg.ProtocolVersion,
-		Capabilities:    []string{"heartbeat", "state-report", "skill-inventory", "skill-installation", "skill-risk-control", "command-execution", "config-apply", "process-management", "local-debug-http"},
-		HostInfo:        collectHostInfo(),
+		Capabilities:    registerCapabilities(),
+		HostInfo:        collectHostInfo(m.cfg),
 	})
 	if err != nil {
 		return state, err
@@ -82,12 +82,42 @@ func mustAtoi(value string) int {
 	return n
 }
 
-func collectHostInfo() map[string]any {
+func collectHostInfo(cfg appconfig.Config) map[string]any {
 	hostname, _ := os.Hostname()
-	return map[string]any{
-		"hostname": hostname,
-		"goos":     runtime.GOOS,
-		"goarch":   runtime.GOARCH,
+	host := map[string]any{
+		"runtime_type":   cfg.RuntimeType,
+		"runtime_name":   cfg.RuntimeName,
+		"runtime":        cfg.RuntimeType,
+		"image":          cfg.RuntimeImage,
+		"desktop_base":   cfg.DesktopBase,
+		"persistent_dir": cfg.DiskUsagePath,
+		"port":           cfg.RuntimePort,
+		"hostname":       hostname,
+		"goos":           runtime.GOOS,
+		"goarch":         runtime.GOARCH,
+		"arch":           runtime.GOARCH,
+	}
+	if cfg.RuntimeImage == "" {
+		delete(host, "image")
+	}
+	if cfg.RuntimePort <= 0 {
+		delete(host, "port")
+	}
+	return host
+}
+
+func registerCapabilities() []string {
+	return []string{
+		"runtime.status",
+		"runtime.health",
+		"metrics.report",
+		"skills.inventory",
+		"skills.upload",
+		"commands.poll",
+		"llm.gateway",
+		"config.apply",
+		"process.management",
+		"local-debug-http",
 	}
 }
 

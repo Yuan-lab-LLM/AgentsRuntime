@@ -96,6 +96,75 @@ func TestEnsureExtensionsDirCreates(t *testing.T) {
 	}
 }
 
+func TestSyncBundledRedisTeamPluginUpdatesExistingCopy(t *testing.T) {
+	root := t.TempDir()
+	defaultsDir := filepath.Join(root, "defaults")
+	extensionsDir := filepath.Join(root, "extensions")
+	defaultPlugin := filepath.Join(defaultsDir, "extensions", "redis-team")
+	userPlugin := filepath.Join(extensionsDir, "redis-team")
+
+	writeRedisTeamPluginForTest(t, defaultPlugin, "0.1.1", "new runtime")
+	writeRedisTeamPluginForTest(t, userPlugin, "0.1.0", "old runtime")
+
+	cfg := appconfig.Config{
+		OpenClawDefaultsDir:   defaultsDir,
+		OpenClawExtensionsDir: extensionsDir,
+	}
+	if err := syncBundledRedisTeamPlugin(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(userPlugin, "dist", "index.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "new runtime" {
+		t.Fatalf("expected redis-team plugin to be updated, got %q", got)
+	}
+}
+
+func TestEnsureTeamSharedDirsDisabledNoop(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "team")
+	t.Setenv("CLAWMANAGER_TEAM_ENABLED", "")
+	t.Setenv("CLAWMANAGER_TEAM_SHARED_DIR", root)
+
+	if err := ensureTeamSharedDirs(appconfig.Config{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(root); !os.IsNotExist(err) {
+		t.Fatalf("expected disabled team bootstrap to leave %s absent, got err=%v", root, err)
+	}
+}
+
+func TestEnsureTeamSharedDirsCreatesExpectedLayout(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "team")
+	t.Setenv("CLAWMANAGER_TEAM_ENABLED", "true")
+	t.Setenv("CLAWMANAGER_TEAM_SHARED_DIR", root)
+
+	if err := ensureTeamSharedDirs(appconfig.Config{DropUserName: ""}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, path := range append([]string{root}, teamSharedSubdirPaths(root)...) {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("expected %s to exist: %v", path, err)
+		}
+		if !info.IsDir() {
+			t.Fatalf("expected %s to be a directory", path)
+		}
+	}
+}
+
+func TestEnsureTeamSharedDirsRejectsRelativePath(t *testing.T) {
+	t.Setenv("CLAWMANAGER_TEAM_ENABLED", "true")
+	t.Setenv("CLAWMANAGER_TEAM_SHARED_DIR", "relative-team")
+
+	if err := ensureTeamSharedDirs(appconfig.Config{}); err == nil {
+		t.Fatal("expected relative team shared dir to fail")
+	}
+}
+
 func TestEnsureDingtalkOpenclawSymlinkCreates(t *testing.T) {
 	global := filepath.Join(t.TempDir(), "openclaw")
 	if err := os.MkdirAll(global, 0o755); err != nil {
@@ -195,5 +264,21 @@ func TestDropPrivilegesNoopWhenNotRoot(t *testing.T) {
 	cfg := appconfig.Config{DropUserName: "abc"}
 	if err := dropPrivileges(cfg); err != nil {
 		t.Fatalf("expected no-op, got %v", err)
+	}
+}
+
+func writeRedisTeamPluginForTest(t *testing.T, root, version, runtime string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(root, "dist"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "package.json"), []byte(`{"version":"`+version+`"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "openclaw.plugin.json"), []byte(`{"id":"redis-team"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "dist", "index.js"), []byte(runtime), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -107,6 +107,19 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	if err := s.config.NormalizeActiveConfig(); err != nil {
 		return fmt.Errorf("normalize openclaw config: %w", err)
 	}
+
+	if err := s.ensureSession(ctx); err != nil {
+		return err
+	}
+
+	state := s.store.Snapshot()
+	if state.CurrentConfigRevisionID == "" && s.cfg.InitialConfigRevisionID != "" {
+		if _, err := s.config.ApplyRevision(ctx, s.cfg.InitialConfigRevisionID); err != nil {
+			return fmt.Errorf("apply initial openclaw config revision: %w", err)
+		}
+		s.logger.Printf("initial openclaw config revision applied revision_id=%s", s.cfg.InitialConfigRevisionID)
+	}
+
 	if err := s.config.CaptureModelBaseline(); err != nil {
 		return fmt.Errorf("capture openclaw model baseline: %w", err)
 	}
@@ -124,15 +137,6 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		defer wg.Done()
 		s.modelGuardLoop(ctx)
 	}()
-
-	if err := s.ensureSession(ctx); err != nil {
-		return err
-	}
-
-	state := s.store.Snapshot()
-	if state.CurrentConfigRevisionID == "" && s.cfg.InitialConfigRevisionID != "" {
-		_, _ = s.config.ApplyRevision(ctx, s.cfg.InitialConfigRevisionID)
-	}
 
 	wg.Add(4)
 	go func() {
@@ -202,9 +206,13 @@ func (s *Supervisor) heartbeatLoop(ctx context.Context, errCh chan<- error) {
 				OpenClawStatus:          string(snapshot.Status),
 				CurrentConfigRevisionID: parseOptionalInt(state.CurrentConfigRevisionID),
 				Summary: map[string]any{
-					"openclaw_pid":   snapshot.PID,
-					"restarts":       snapshot.Restarts,
-					"openclaw_stats": inspect.Stats,
+					"runtime_type":    s.cfg.RuntimeType,
+					"runtime_status":  string(snapshot.Status),
+					"runtime_pid":     snapshot.PID,
+					"runtime_version": inspect.Version,
+					"openclaw_pid":    snapshot.PID,
+					"restarts":        snapshot.Restarts,
+					"openclaw_stats":  inspect.Stats,
 				},
 			})
 			if err != nil {
@@ -237,6 +245,9 @@ func (s *Supervisor) reportLoop(ctx context.Context, errCh chan<- error) {
 			state := s.store.Snapshot()
 			inspect := s.inspector.Collect()
 			systemInfo := s.profiler.Collect()
+			systemInfo["runtime_type"] = s.cfg.RuntimeType
+			systemInfo["runtime_name"] = s.cfg.RuntimeName
+			systemInfo["desktop_base"] = s.cfg.DesktopBase
 			systemInfo["agent"] = protocol.AgentMetadata{
 				AgentID:         state.AgentID,
 				AgentVersion:    protocol.AgentVersion,
@@ -260,12 +271,19 @@ func (s *Supervisor) reportLoop(ctx context.Context, errCh chan<- error) {
 				},
 				SystemInfo: systemInfo,
 				Health: map[string]any{
-					"status":           snapshot.Status,
-					"uptime":           snapshot.Uptime.String(),
-					"openclaw_stats":   inspect.Stats,
-					"last_exit_reason": snapshot.LastExitReason,
-					"last_operation":   snapshot.LastOperation,
-					"last_result":      snapshot.LastOperationResult,
+					"runtime_process":                 runtimeProcessHealth(snapshot.Status),
+					"desktop":                         desktopHealth(s.cfg.DesktopBase),
+					"agent":                           "ok",
+					"metrics_collector":               "ok",
+					"metrics_sample_interval_seconds": int(s.cfg.StateReportInterval.Seconds()),
+					"status":                          snapshot.Status,
+					"uptime":                          snapshot.Uptime.String(),
+					"openclaw_stats":                  inspect.Stats,
+					"last_exit_reason":                snapshot.LastExitReason,
+					"last_operation":                  snapshot.LastOperation,
+					"last_result":                     snapshot.LastOperationResult,
+					"gateway_warmup_started":          snapshot.GatewayWarmupStarted,
+					"gateway_warmup_ready":            snapshot.GatewayWarmupReady,
 				},
 			})
 			if err != nil {
@@ -301,16 +319,35 @@ func optionalInt(value int) *int {
 
 func defaultCapabilities() []string {
 	return []string{
-		"heartbeat",
-		"state-report",
-		"skill-inventory",
-		"skill-installation",
-		"skill-risk-control",
-		"command-execution",
-		"config-apply",
-		"process-management",
+		"runtime.status",
+		"runtime.health",
+		"metrics.report",
+		"skills.inventory",
+		"skills.upload",
+		"commands.poll",
+		"llm.gateway",
+		"config.apply",
+		"process.management",
 		"local-debug-http",
 	}
+}
+
+func runtimeProcessHealth(status process.Status) string {
+	switch status {
+	case process.StatusRunning, process.StatusStarting, process.StatusConfiguring:
+		return "ok"
+	case process.StatusStopped, process.StatusStopping:
+		return "degraded"
+	default:
+		return "error"
+	}
+}
+
+func desktopHealth(desktopBase string) string {
+	if desktopBase == "" || desktopBase == "none" {
+		return "not_applicable"
+	}
+	return "ok"
 }
 
 func (s *Supervisor) skillLoop(ctx context.Context, errCh chan<- error) {
