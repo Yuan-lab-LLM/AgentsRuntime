@@ -70,10 +70,10 @@ RUN apk add --no-cache \
     && npm cache clean --force
 
 COPY openclaw/defaults-template/.openclaw /defaults/.openclaw
-COPY openclaw/config/openclaw-shell-agent /defaults/openclaw-shell-agent
-COPY openclaw/vendor-plugins/openclaw-redis-team.tgz /tmp/openclaw-redis-team.tgz
-COPY openclaw/scripts/openclaw-shell-entrypoint /usr/local/bin/openclaw-shell-entrypoint
-COPY openclaw/scripts/openclaw-shell-login /usr/local/lib/openclaw-shell/login.sh
+COPY openclaw-shell/config/openclaw-shell-agent /defaults/openclaw-shell-agent
+COPY openclaw-shell/vendor-plugins/openclaw-redis-team.tgz /tmp/openclaw-redis-team.tgz
+COPY openclaw-shell/scripts/openclaw-shell-entrypoint /usr/local/bin/openclaw-shell-entrypoint
+COPY openclaw-shell/scripts/openclaw-shell-login /usr/local/lib/openclaw-shell/login.sh
 COPY --from=agent-builder /out/openclaw-agent /usr/local/bin/openclaw-agent
 
 RUN set -eux; \
