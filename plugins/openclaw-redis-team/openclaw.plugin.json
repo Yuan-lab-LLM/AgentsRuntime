@@ -1,0 +1,59 @@
+{
+  "id": "redis-team",
+  "name": "Redis Team",
+  "description": "Connects OpenClaw runtimes to a ClawManager Redis Streams team bus.",
+  "channels": ["redis-team"],
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "team_send",
+      "team_status",
+      "team_update_progress",
+      "team_complete_task"
+    ]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "fromEnv": {
+        "type": "boolean",
+        "default": true
+      },
+      "enabled": {
+        "type": "boolean"
+      },
+      "redisUrl": {
+        "type": "string"
+      },
+      "teamId": {
+        "type": "string"
+      },
+      "memberId": {
+        "type": "string"
+      },
+      "role": {
+        "type": "string"
+      },
+      "sharedDir": {
+        "type": "string"
+      },
+      "autoRun": {
+        "type": "boolean"
+      },
+      "consumerGroup": {
+        "type": "string"
+      },
+      "embeddedTimeoutSeconds": {
+        "type": "number",
+        "minimum": 1,
+        "default": 1800
+      },
+      "managerUrl": {
+        "type": "string"
+      }
+    }
+  }
+}

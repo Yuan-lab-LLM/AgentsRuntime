@@ -1,0 +1,4 @@
+#!/usr/bin/with-contenv bash
+set -euo pipefail
+
+exec /usr/local/bin/start-hermes-gateway

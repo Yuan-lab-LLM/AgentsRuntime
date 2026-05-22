@@ -7,6 +7,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 
 	appconfig "github.com/iamlovingit/clawmanager-openclaw-image/internal/config"
@@ -46,6 +47,9 @@ func TestNormalizeActiveConfigSupportsGatewayModelList(t *testing.T) {
 	if got := provider["apiKey"]; got != "" {
 		t.Fatalf("expected empty apiKey override, got %#v", got)
 	}
+	if _, ok := provider["auth"]; ok {
+		t.Fatalf("did not expect auth override for empty apiKey, got %#v", provider["auth"])
+	}
 
 	expectedModels := []string{"auto", "gpt-4.1", "claude-3.7-sonnet", "deepseek-r1"}
 	if got := providerModelIDsForTest(t, provider); !equalStringSlices(got, expectedModels) {
@@ -71,7 +75,78 @@ func TestNormalizeActiveConfigSupportsGatewayModelList(t *testing.T) {
 	}
 }
 
-func TestApplyRevisionKeepsSingleModelCompatibility(t *testing.T) {
+func TestParseModelIDsSupportsUnquotedClawManagerList(t *testing.T) {
+	got, err := parseModelIDs("[auto,deepseek-v3.2,kimi-k2.5]")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := []string{"auto", "deepseek-v3.2", "kimi-k2.5"}
+	if !equalStringSlices(got, expected) {
+		t.Fatalf("unexpected model ids: got %v want %v", got, expected)
+	}
+}
+
+func TestNormalizeLLMConfigDefaultsManagedProviderAPI(t *testing.T) {
+	cfg := map[string]any{
+		"models": map[string]any{
+			"providers": map[string]any{
+				"auto": map[string]any{
+					"baseUrl": "https://legacy.example/v1",
+					"apiKey":  "legacy-api-key",
+				},
+			},
+		},
+	}
+
+	normalizeLLMConfigContent(cfg, llmOverrides{
+		BaseURL:   "https://gateway.example/v1",
+		APIKey:    "proxy-token",
+		APIKeySet: true,
+		ModelIDs:  []string{"auto"},
+	})
+
+	provider := nestedMapForTest(t, cfg, "models", "providers", "auto")
+	if got := provider["api"]; got != "openai-completions" {
+		t.Fatalf("expected managed provider api default, got %#v", got)
+	}
+	if got := provider["auth"]; got != "api-key" {
+		t.Fatalf("expected explicit config api-key auth, got %#v", got)
+	}
+	if got := provider["baseUrl"]; got != "https://gateway.example/v1" {
+		t.Fatalf("expected injected gateway baseUrl, got %#v", got)
+	}
+	if got := provider["apiKey"]; got != "proxy-token" {
+		t.Fatalf("expected injected apiKey, got %#v", got)
+	}
+}
+
+func TestNormalizeConfigSkipsLLMWhenNoOverrides(t *testing.T) {
+	t.Setenv("CLAWMANAGER_LLM_MODEL", "")
+	t.Setenv("CLAWMANAGER_LLM_BASE_URL", "")
+	t.Setenv("OPENAI_BASE_URL", "")
+	unsetEnvForTest(t, "CLAWMANAGER_LLM_API_KEY")
+	unsetEnvForTest(t, "OPENAI_API_KEY")
+
+	content := []byte(`{"models":{"providers":{"auto":{"baseUrl":"https://legacy.example/v1"}}}}`)
+	normalized, _, err := normalizeConfigMap(content, appconfig.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var cfg map[string]any
+	if err := json.Unmarshal(normalized, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	providers := nestedMapForTest(t, cfg, "models", "providers")
+	if _, ok := providers["auto"]; !ok {
+		t.Fatalf("expected legacy auto provider to stay untouched, got %#v", providers)
+	}
+	if _, ok := providers["openai"]; ok {
+		t.Fatalf("did not expect managed provider without LLM env overrides, got %#v", providers)
+	}
+}
+
+func TestApplyRevisionUsesClawManagerLLMEnv(t *testing.T) {
 	root := t.TempDir()
 	configPath := filepath.Join(root, "active", "openclaw.json")
 	stateDir := filepath.Join(root, "state")
@@ -82,8 +157,8 @@ func TestApplyRevisionKeepsSingleModelCompatibility(t *testing.T) {
 	}
 
 	t.Setenv("CLAWMANAGER_LLM_MODEL", "gpt-4.1")
-	t.Setenv("OPENAI_BASE_URL", "https://gateway.example/v1")
-	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("CLAWMANAGER_LLM_BASE_URL", "https://gateway.example/v1")
+	t.Setenv("CLAWMANAGER_LLM_API_KEY", "proxy-token")
 
 	manager := New(appconfig.Config{
 		AgentDataDir:                 filepath.Join(root, "agent-data"),
@@ -105,10 +180,13 @@ func TestApplyRevisionKeepsSingleModelCompatibility(t *testing.T) {
 	provider := nestedMapForTest(t, cfg, "models", "providers", "auto")
 
 	if got := provider["baseUrl"]; got != "https://gateway.example/v1" {
-		t.Fatalf("expected OPENAI_BASE_URL fallback, got %#v", got)
+		t.Fatalf("expected ClawManager LLM baseUrl, got %#v", got)
 	}
-	if got := provider["apiKey"]; got != "" {
-		t.Fatalf("expected empty apiKey from env fallback, got %#v", got)
+	if got := provider["apiKey"]; got != "proxy-token" {
+		t.Fatalf("expected ClawManager LLM apiKey, got %#v", got)
+	}
+	if got := provider["auth"]; got != "api-key" {
+		t.Fatalf("expected explicit config api-key auth, got %#v", got)
 	}
 
 	expectedModels := []string{"gpt-4.1"}
@@ -126,6 +204,53 @@ func TestApplyRevisionKeepsSingleModelCompatibility(t *testing.T) {
 	expectedKeys := []string{"auto/gpt-4.1"}
 	if !equalStringSlices(gotKeys, expectedKeys) {
 		t.Fatalf("unexpected agent models keys: got %v want %v", gotKeys, expectedKeys)
+	}
+}
+
+func TestApplyRevisionPreservesDynamicAutoProviderConfig(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "active", "openclaw.json")
+	stateDir := filepath.Join(root, "state")
+
+	st, err := store.New(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("CLAWMANAGER_LLM_MODEL", "")
+	t.Setenv("CLAWMANAGER_LLM_BASE_URL", "")
+	unsetEnvForTest(t, "CLAWMANAGER_LLM_API_KEY")
+
+	revisionConfig := strings.ReplaceAll(sampleOpenClawConfig, "https://legacy.example/v1", "http://clawmanager-gateway.clawmanager-system.svc.cluster.local:9001/api/v1/gateway/llm")
+	revisionConfig = strings.ReplaceAll(revisionConfig, "legacy-api-key", "igt_dynamic_test")
+	revisionConfig = strings.ReplaceAll(revisionConfig, "legacy-model", "auto")
+	manager := New(appconfig.Config{
+		AgentDataDir:       filepath.Join(root, "agent-data"),
+		OpenClawConfigPath: configPath,
+	}, stubRevisionClient{
+		resp: protocol.ConfigRevisionResponse{
+			Content: []byte(revisionConfig),
+		},
+	}, st)
+
+	if _, err := manager.ApplyRevision(context.Background(), "dynamic"); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := readConfigForTest(t, configPath)
+	provider := nestedMapForTest(t, cfg, "models", "providers", "auto")
+	if got := provider["baseUrl"]; got != "http://clawmanager-gateway.clawmanager-system.svc.cluster.local:9001/api/v1/gateway/llm" {
+		t.Fatalf("expected dynamic ClawManager gateway baseUrl, got %#v", got)
+	}
+	if got := provider["apiKey"]; got != "igt_dynamic_test" {
+		t.Fatalf("expected dynamic ClawManager apiKey, got %#v", got)
+	}
+	if got := provider["auth"]; got != "api-key" {
+		t.Fatalf("expected explicit config api-key auth, got %#v", got)
+	}
+	model := nestedMapForTest(t, cfg, "agents", "defaults", "model")
+	if got := model["primary"]; got != "auto/auto" {
+		t.Fatalf("expected dynamic primary auto/auto, got %#v", got)
 	}
 }
 
@@ -313,6 +438,21 @@ type stubRevisionClient struct {
 
 func (s stubRevisionClient) FetchConfigRevision(context.Context, string) (protocol.ConfigRevisionResponse, error) {
 	return s.resp, s.err
+}
+
+func unsetEnvForTest(t *testing.T, key string) {
+	t.Helper()
+	previous, existed := os.LookupEnv(key)
+	if err := os.Unsetenv(key); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if existed {
+			_ = os.Setenv(key, previous)
+			return
+		}
+		_ = os.Unsetenv(key)
+	})
 }
 
 func readConfigForTest(t *testing.T, path string) map[string]any {

@@ -95,8 +95,51 @@ func TestEnforceModelBaselineRestoresModelsProvidersChanges(t *testing.T) {
 		t.Fatalf("expected first auto model id to be legacy-model, got %#v", first)
 	}
 	finalProviders := nestedMapForTest(t, finalCfg, "models", "providers")
-	if _, ok := finalProviders["new-provider"]; !ok {
-		t.Fatalf("expected injected provider to be preserved, got %#v", finalProviders["new-provider"])
+	if _, ok := finalProviders["new-provider"]; ok {
+		t.Fatalf("expected injected provider to be removed, still have %#v", finalProviders["new-provider"])
+	}
+}
+
+func TestEnforceModelBaselineAllowsCosmeticModelEdits(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "openclaw.json")
+	if err := os.WriteFile(configPath, []byte(sampleOpenClawConfig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	manager := New(appconfig.Config{OpenClawConfigPath: configPath}, nil, nil)
+	if err := manager.CaptureModelBaseline(); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := readConfigForTest(t, configPath)
+	auto := nestedMapForTest(t, cfg, "models", "providers", "auto")
+	models, ok := auto["models"].([]any)
+	if !ok || len(models) == 0 {
+		t.Fatal("expected auto models array")
+	}
+	first, ok := models[0].(map[string]any)
+	if !ok {
+		t.Fatal("expected model object")
+	}
+	first["name"] = "User Renamed Model"
+	first["contextWindow"] = 128000
+	writeConfigForTest(t, configPath, cfg)
+
+	restored, err := manager.EnforceModelBaseline()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored {
+		t.Fatal("expected cosmetic-only edits not to trigger model guard write")
+	}
+
+	finalCfg := readConfigForTest(t, configPath)
+	finalAuto := nestedMapForTest(t, finalCfg, "models", "providers", "auto")
+	finalModels := finalAuto["models"].([]any)
+	finalFirst := finalModels[0].(map[string]any)
+	if got := finalFirst["name"]; got != "User Renamed Model" {
+		t.Fatalf("expected name to remain user-edited, got %#v", got)
 	}
 }
 

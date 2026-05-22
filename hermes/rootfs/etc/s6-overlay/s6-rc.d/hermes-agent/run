@@ -1,0 +1,56 @@
+#!/usr/bin/with-contenv bash
+set -euo pipefail
+
+if [ "${CLAWMANAGER_AGENT_ENABLED:-false}" != "true" ]; then
+    echo "ClawManager Hermes agent disabled"
+    sleep infinity
+fi
+
+export HOME="${HOME:-/config}"
+export HERMES_HOME="${HERMES_HOME:-/config/.hermes}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/config/.cache}"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-/config/.config}"
+export XDG_DATA_HOME="${XDG_DATA_HOME:-/config/.local/share}"
+export NPM_CONFIG_CACHE="${NPM_CONFIG_CACHE:-/config/.cache/npm}"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-/config/.cache/uv}"
+
+mkdir -p \
+    "${CLAWMANAGER_AGENT_PERSISTENT_DIR:-/config}/hermes-agent" \
+    "${XDG_CACHE_HOME}/npm" \
+    "${XDG_CACHE_HOME}/uv" \
+    "${XDG_CONFIG_HOME}" \
+    "${XDG_DATA_HOME}" \
+    "${HERMES_HOME}"
+
+/usr/local/bin/hermes-apply-runtime-config || true
+
+if [ "${CLAWMANAGER_TEAM_ENABLED:-false}" = "true" ] || [ "${CLAWMANAGER_TEAM_ENABLED:-false}" = "1" ]; then
+    team_dir="${CLAWMANAGER_TEAM_SHARED_DIR:-/team}"
+    case "${team_dir}" in
+        /*)
+            mkdir -p \
+                "${team_dir}/inbox" \
+                "${team_dir}/status" \
+                "${team_dir}/tasks" \
+                "${team_dir}/results" \
+                "${team_dir}/.hermes-redis-team"
+            ;;
+        *)
+            echo "Ignoring relative CLAWMANAGER_TEAM_SHARED_DIR=${team_dir}" >&2
+            ;;
+    esac
+fi
+
+if command -v s6-setuidgid >/dev/null 2>&1 && id abc >/dev/null 2>&1; then
+    chown -R abc:abc "${XDG_CACHE_HOME}" "${XDG_CONFIG_HOME}" "${XDG_DATA_HOME}" "${HERMES_HOME}" || true
+    chown -R abc:abc "${CLAWMANAGER_AGENT_PERSISTENT_DIR:-/config}/hermes-agent" || true
+    if [ "${CLAWMANAGER_TEAM_ENABLED:-false}" = "true" ] || [ "${CLAWMANAGER_TEAM_ENABLED:-false}" = "1" ]; then
+        team_dir="${CLAWMANAGER_TEAM_SHARED_DIR:-/team}"
+        case "${team_dir}" in
+            /*) chown -R abc:abc "${team_dir}" || true ;;
+        esac
+    fi
+    exec s6-setuidgid abc /usr/local/bin/hermes-agent
+fi
+
+exec /usr/local/bin/hermes-agent

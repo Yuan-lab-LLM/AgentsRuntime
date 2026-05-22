@@ -111,7 +111,7 @@ func Load() (Config, error) {
 		InstalledPluginPathPrefix:        "/defaults/.openclaw/extensions/",
 		DropUserName:                     "abc",
 		BrowserAutoLaunchEnabled:         true,
-		BrowserExecutable:                "/usr/bin/chromium",
+		BrowserExecutable:                "/usr/local/bin/wrapped-chromium",
 		BrowserURL:                       "http://localhost:18789",
 		WaylandSocketPath:                "/config/.XDG/wayland-0",
 		BrowserLaunchWaylandTimeoutRaw:   "60s",

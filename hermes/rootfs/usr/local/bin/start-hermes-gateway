@@ -50,6 +50,19 @@ has_runtime_channel_env() {
         [ -n "${HERMES_MESSAGING_CHANNELS:-}" ]
 }
 
+has_redis_team_env() {
+    case "$(printf '%s' "${CLAWMANAGER_TEAM_ENABLED:-}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|y|on|enabled)
+            [ -n "${CLAWMANAGER_TEAM_REDIS_URL:-}" ] &&
+                [ -n "${CLAWMANAGER_TEAM_ID:-}" ] &&
+                [ -n "${CLAWMANAGER_TEAM_MEMBER_ID:-}" ]
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 has_gateway_env_file() {
     [ -f "${env_file}" ] && grep -Eq '^(TELEGRAM_BOT_TOKEN|DISCORD_BOT_TOKEN|SLACK_BOT_TOKEN|WHATSAPP_ENABLED|SIGNAL_HTTP_URL|SIGNAL_ACCOUNT|MATTERMOST_TOKEN|MATRIX_ACCESS_TOKEN|MATRIX_PASSWORD|DINGTALK_CLIENT_ID|FEISHU_APP_ID|WECOM_BOT_ID|WECOM_CALLBACK_CORP_ID|WEIXIN_TOKEN|QQBOT_APP_ID|BLUEBUBBLES_SERVER_URL|YUANBAO_APP_ID|API_SERVER_ENABLED|WEBHOOK_ENABLED)=' "${env_file}"
 }
@@ -63,7 +76,7 @@ case "${gateway_mode}" in
         should_start_gateway=false
         ;;
     *)
-        if has_runtime_channel_env || has_gateway_env_file; then
+        if has_runtime_channel_env || has_redis_team_env || has_gateway_env_file; then
             should_start_gateway=true
         fi
         ;;
@@ -77,6 +90,12 @@ fi
 if [ "$(id -u)" = "0" ]; then
     if id abc >/dev/null 2>&1; then
         chown -R abc:abc "${HERMES_HOME}" "${XDG_CACHE_HOME}" "${XDG_CONFIG_HOME}" "${XDG_DATA_HOME}" || true
+        if has_redis_team_env; then
+            team_dir="${CLAWMANAGER_TEAM_SHARED_DIR:-/team}"
+            case "${team_dir}" in
+                /*) chown -R abc:abc "${team_dir}" || true ;;
+            esac
+        fi
     fi
     if command -v s6-setuidgid >/dev/null 2>&1 && id abc >/dev/null 2>&1; then
         exec s6-setuidgid abc /bin/bash -lc 'cd /config && exec hermes gateway'

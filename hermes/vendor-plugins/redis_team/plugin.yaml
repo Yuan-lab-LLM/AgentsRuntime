@@ -1,0 +1,56 @@
+name: redis-team-platform
+label: Redis Team
+kind: platform
+version: 0.1.0
+description: >
+  Redis Streams Team Bus gateway adapter for Hermes Agent. Connects a
+  ClawManager-managed Hermes runtime to the shared Redis Team inbox/events
+  contract used by OpenClaw runtimes.
+author: ClawManager
+requires_env:
+  - name: CLAWMANAGER_TEAM_ENABLED
+    description: "Enable Redis Team runtime integration"
+    prompt: "Enable Redis Team"
+    password: false
+  - name: CLAWMANAGER_TEAM_REDIS_URL
+    description: "Redis connection URL, for example redis://redis:6379/0"
+    prompt: "Redis URL"
+    password: true
+  - name: CLAWMANAGER_TEAM_ID
+    description: "Stable ClawManager team identifier"
+    prompt: "Team ID"
+    password: false
+  - name: CLAWMANAGER_TEAM_MEMBER_ID
+    description: "Stable member identifier for this Hermes runtime"
+    prompt: "Member ID"
+    password: false
+optional_env:
+  - name: CLAWMANAGER_TEAM_ROLE
+    description: "Member role label"
+    prompt: "Role"
+    password: false
+  - name: CLAWMANAGER_TEAM_SHARED_DIR
+    description: "Shared durable team directory"
+    prompt: "Shared directory"
+    password: false
+  - name: CLAWMANAGER_TEAM_AUTORUN
+    description: "When true, inbound Redis tasks are dispatched to Hermes"
+    prompt: "Autorun tasks"
+    password: false
+  - name: CLAWMANAGER_TEAM_CONSUMER_GROUP
+    description: "Redis Streams consumer group"
+    prompt: "Consumer group"
+    password: false
+  - name: CLAWMANAGER_TEAM_EMBEDDED_TIMEOUT_SECONDS
+    description: "Per-task timeout used by external control planes"
+    prompt: "Task timeout seconds"
+    password: false
+  - name: CLAWMANAGER_TEAM_MANAGER_URL
+    description: "Optional ClawManager control-plane URL"
+    prompt: "Manager URL"
+    password: false
+  - name: CLAWMANAGER_TEAM_TOKEN
+    description: "Optional ClawManager team token"
+    prompt: "Team token"
+    password: true
+

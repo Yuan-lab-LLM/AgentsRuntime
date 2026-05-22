@@ -1,0 +1,31 @@
+#!/bin/sh
+
+BIN="${CHROMIUM_BIN:-/usr/bin/chromium}"
+
+export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/config/.XDG}"
+export DISPLAY="${DISPLAY:-:1}"
+
+if ! pgrep -x chromium >/dev/null 2>&1 && [ -n "${HOME:-}" ]; then
+  rm -f "$HOME"/.config/chromium/Singleton* 2>/dev/null || true
+fi
+
+has_setuid_sandbox() {
+  [ -u /usr/lib/chromium/chrome-sandbox ] && [ -x /usr/lib/chromium/chrome-sandbox ]
+}
+
+can_userns_sandbox() {
+  unshare --user --map-root-user true >/dev/null 2>&1
+}
+
+if has_setuid_sandbox || can_userns_sandbox; then
+  exec "$BIN" --password-store=basic --ozone-platform=wayland "$@"
+fi
+
+exec "$BIN" \
+  --password-store=basic \
+  --no-sandbox \
+  --test-type \
+  --disable-gpu \
+  --ozone-platform=wayland \
+  "$@"

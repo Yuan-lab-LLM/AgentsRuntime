@@ -52,11 +52,13 @@ func normalizeConfigMap(content []byte, cfg appconfig.Config) ([]byte, bool, err
 		return nil, false, err
 	}
 
-	llm, _, err := readLLMOverridesFromEnv()
+	llm, hasLLMOverrides, err := readLLMOverridesFromEnv()
 	if err != nil {
 		return nil, false, err
 	}
-	normalizeLLMConfigContent(parsed, llm)
+	if hasLLMOverrides {
+		normalizeLLMConfigContent(parsed, llm)
+	}
 	normalizeProviderAuthContracts(parsed)
 
 	channelOpts := readChannelOverridesFromEnv(cfg)
@@ -147,8 +149,8 @@ func readLLMOverridesFromEnv() (llmOverrides, bool, error) {
 		overrides.ModelIDs = modelIDs
 	}
 
-	overrides.BaseURL = firstNonEmptyEnv("CLAWMANAGER_LLM_BASE_URL", "OPENAI_BASE_URL")
-	overrides.APIKey, overrides.APIKeySet = firstLookupEnv("CLAWMANAGER_LLM_API_KEY", "OPENAI_API_KEY")
+	overrides.BaseURL = firstNonEmptyEnv("CLAWMANAGER_LLM_BASE_URL")
+	overrides.APIKey, overrides.APIKeySet = firstLookupEnv("CLAWMANAGER_LLM_API_KEY")
 
 	has := overrides.BaseURL != "" || overrides.APIKeySet || len(overrides.ModelIDs) > 0
 	return overrides, has, nil
@@ -163,7 +165,11 @@ func parseModelIDs(raw string) ([]string, error) {
 	if strings.HasPrefix(raw, "[") {
 		var parsed []any
 		if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
-			return nil, fmt.Errorf("parse CLAWMANAGER_LLM_MODEL array: %w", err)
+			modelIDs := parseDelimitedModelIDs(strings.TrimSuffix(strings.TrimPrefix(raw, "["), "]"))
+			if len(modelIDs) == 0 {
+				return nil, fmt.Errorf("parse CLAWMANAGER_LLM_MODEL array: %w", err)
+			}
+			return modelIDs, nil
 		}
 		modelIDs := uniqueNonEmptyModelIDs(parsed)
 		if len(modelIDs) == 0 {
@@ -173,6 +179,19 @@ func parseModelIDs(raw string) ([]string, error) {
 	}
 
 	return []string{raw}, nil
+}
+
+func parseDelimitedModelIDs(raw string) []string {
+	parts := strings.Split(raw, ",")
+	values := make([]any, 0, len(parts))
+	for _, part := range parts {
+		id := strings.Trim(strings.TrimSpace(part), `"'`)
+		if id == "" {
+			continue
+		}
+		values = append(values, id)
+	}
+	return uniqueNonEmptyModelIDs(values)
 }
 
 func uniqueNonEmptyModelIDs(values []any) []string {
@@ -198,28 +217,29 @@ func uniqueNonEmptyModelIDs(values []any) []string {
 func normalizeLLMConfigContent(cfg map[string]any, overrides llmOverrides) {
 	models := ensureObject(cfg, "models")
 	providers := ensureObject(models, "providers")
-	autoProvider := ensureObject(providers, autoProviderName)
+	providerName := autoProviderName
+	provider := ensureObject(providers, providerName)
 
 	if overrides.BaseURL != "" {
-		autoProvider["baseUrl"] = overrides.BaseURL
+		provider["baseUrl"] = overrides.BaseURL
 	}
 	if overrides.APIKeySet {
-		autoProvider["apiKey"] = overrides.APIKey
+		provider["apiKey"] = overrides.APIKey
 	}
-	if strings.TrimSpace(stringValue(autoProvider["api"])) == "" {
-		autoProvider["api"] = "openai-completions"
+	if strings.TrimSpace(stringValue(provider["api"])) == "" {
+		provider["api"] = "openai-completions"
 	}
-	if strings.TrimSpace(stringValue(autoProvider["auth"])) == "" && strings.TrimSpace(overrides.APIKey) != "" {
-		autoProvider["auth"] = "api-key"
+	if strings.TrimSpace(stringValue(provider["auth"])) == "" && strings.TrimSpace(overrides.APIKey) != "" {
+		provider["auth"] = "api-key"
 	}
 	if len(overrides.ModelIDs) > 0 {
-		autoProvider["models"] = buildProviderModels(autoProvider["models"], overrides.ModelIDs)
+		provider["models"] = buildProviderModels(provider["models"], overrides.ModelIDs)
 
 		agents := ensureObject(cfg, "agents")
 		defaults := ensureObject(agents, "defaults")
 		model := ensureObject(defaults, "model")
-		model["primary"] = qualifiedModelID(overrides.ModelIDs[0])
-		defaults["models"] = buildAgentModels(defaults["models"], overrides.ModelIDs)
+		model["primary"] = qualifiedModelID(providerName, overrides.ModelIDs[0])
+		defaults["models"] = buildAgentModels(defaults["models"], providerName, overrides.ModelIDs)
 	}
 }
 
@@ -282,11 +302,11 @@ func indexModelsByID(existing any) map[string]map[string]any {
 	return index
 }
 
-func buildAgentModels(existing any, modelIDs []string) map[string]any {
+func buildAgentModels(existing any, providerName string, modelIDs []string) map[string]any {
 	current, _ := existing.(map[string]any)
 	models := make(map[string]any, len(modelIDs))
 	for _, id := range modelIDs {
-		key := qualifiedModelID(id)
+		key := qualifiedModelID(providerName, id)
 		if current != nil {
 			if value, ok := current[key]; ok {
 				models[key] = value
@@ -312,13 +332,13 @@ func defaultProviderModel(id string) map[string]any {
 			"cacheRead":  0,
 			"cacheWrite": 0,
 		},
-		"contextWindow": 64000,
-		"maxTokens":     8192,
+		"contextWindow": 1000000,
+		"maxTokens":     65536,
 	}
 }
 
-func qualifiedModelID(id string) string {
-	return autoProviderName + "/" + id
+func qualifiedModelID(providerName, id string) string {
+	return providerName + "/" + id
 }
 
 func displayModelName(id string) string {

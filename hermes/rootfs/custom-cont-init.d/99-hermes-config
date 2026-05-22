@@ -1,0 +1,107 @@
+#!/usr/bin/with-contenv bash
+set -e
+
+HERMES_HOME="${HERMES_HOME:-/config/.hermes}"
+HERMES_INSTALL_DIR="/usr/local/lib/hermes-agent"
+export HERMES_HOME
+
+mkdir -p \
+    /config/.cache/npm \
+    /config/.cache/uv \
+    /config/.config \
+    /config/.config/autostart \
+    /config/.config/openbox \
+    /config/.local/share \
+    "${HERMES_HOME}/cron" \
+    "${HERMES_HOME}/sessions" \
+    "${HERMES_HOME}/logs" \
+    "${HERMES_HOME}/pairing" \
+    "${HERMES_HOME}/hooks" \
+    "${HERMES_HOME}/image_cache" \
+    "${HERMES_HOME}/audio_cache" \
+    "${HERMES_HOME}/memories" \
+    "${HERMES_HOME}/skills" \
+    "${CLAWMANAGER_AGENT_PERSISTENT_DIR:-/config}/hermes-agent"
+
+if [ ! -f "${HERMES_HOME}/.env" ]; then
+    if [ -f "${HERMES_INSTALL_DIR}/.env.example" ]; then
+        cp "${HERMES_INSTALL_DIR}/.env.example" "${HERMES_HOME}/.env"
+    else
+        touch "${HERMES_HOME}/.env"
+    fi
+fi
+
+if [ ! -f "${HERMES_HOME}/config.yaml" ] && [ -f "${HERMES_INSTALL_DIR}/cli-config.yaml.example" ]; then
+    cp "${HERMES_INSTALL_DIR}/cli-config.yaml.example" "${HERMES_HOME}/config.yaml"
+fi
+
+if [ ! -f "${HERMES_HOME}/SOUL.md" ]; then
+    cat >"${HERMES_HOME}/SOUL.md" <<'SOUL'
+# Hermes Agent Persona
+
+<!--
+This file defines the agent's personality and tone.
+Edit this to customize how Hermes communicates with you.
+Delete the contents or this file to use the default personality.
+-->
+SOUL
+fi
+
+if [ -x "${HERMES_INSTALL_DIR}/venv/bin/python" ] && [ -f "${HERMES_INSTALL_DIR}/tools/skills_sync.py" ]; then
+    "${HERMES_INSTALL_DIR}/venv/bin/python" "${HERMES_INSTALL_DIR}/tools/skills_sync.py" >/dev/null 2>&1 || true
+fi
+
+if [ -x /usr/local/bin/hermes-apply-runtime-config ]; then
+    /usr/local/bin/hermes-apply-runtime-config || true
+fi
+
+if [ "${CLAWMANAGER_TEAM_ENABLED:-false}" = "true" ] || [ "${CLAWMANAGER_TEAM_ENABLED:-false}" = "1" ]; then
+    team_dir="${CLAWMANAGER_TEAM_SHARED_DIR:-/team}"
+    case "${team_dir}" in
+        /*)
+            mkdir -p \
+                "${team_dir}/inbox" \
+                "${team_dir}/status" \
+                "${team_dir}/tasks" \
+                "${team_dir}/results" \
+                "${team_dir}/.hermes-redis-team"
+            chmod 775 "${team_dir}" "${team_dir}/inbox" "${team_dir}/status" "${team_dir}/tasks" "${team_dir}/results" "${team_dir}/.hermes-redis-team" || true
+            ;;
+        *)
+            echo "Ignoring relative CLAWMANAGER_TEAM_SHARED_DIR=${team_dir}" >&2
+            ;;
+    esac
+fi
+
+cat >/config/.config/autostart/hermes-runtime.desktop <<'DESKTOP'
+[Desktop Entry]
+Type=Application
+Name=Hermes Runtime
+Comment=Open Hermes automatically
+Exec=/usr/local/bin/start-hermes-terminal
+Terminal=false
+X-KDE-Autostart-enabled=true
+DESKTOP
+chmod 755 /config/.config/autostart/hermes-runtime.desktop
+
+touch /config/.config/openbox/autostart
+if ! grep -q 'start-hermes-terminal' /config/.config/openbox/autostart 2>/dev/null; then
+    {
+        echo ''
+        echo '# Hermes Runtime autostart'
+        echo '(/usr/local/bin/start-hermes-terminal) &'
+    } >> /config/.config/openbox/autostart
+fi
+chmod 755 /config/.config/openbox/autostart
+
+if id abc >/dev/null 2>&1; then
+    chown -R abc:abc /config/.cache /config/.config /config/.local || true
+    chown -R abc:abc "${HERMES_HOME}" || true
+    chown -R abc:abc "${CLAWMANAGER_AGENT_PERSISTENT_DIR:-/config}/hermes-agent" || true
+    if [ "${CLAWMANAGER_TEAM_ENABLED:-false}" = "true" ] || [ "${CLAWMANAGER_TEAM_ENABLED:-false}" = "1" ]; then
+        team_dir="${CLAWMANAGER_TEAM_SHARED_DIR:-/team}"
+        case "${team_dir}" in
+            /*) chown -R abc:abc "${team_dir}" || true ;;
+        esac
+    fi
+fi
