@@ -17,6 +17,12 @@ const (
 )
 
 type Config struct {
+	Enabled                          bool          `yaml:"enabled"`
+	RuntimeType                      string        `yaml:"runtime_type"`
+	RuntimeName                      string        `yaml:"runtime_name"`
+	RuntimeImage                     string        `yaml:"runtime_image"`
+	DesktopBase                      string        `yaml:"desktop_base"`
+	RuntimePort                      int           `yaml:"runtime_port"`
 	InstanceID                       string        `yaml:"instance_id"`
 	BootstrapToken                   string        `yaml:"bootstrap_token"`
 	ControlPlaneBaseURL              string        `yaml:"control_plane_base_url"`
@@ -74,9 +80,15 @@ type Config struct {
 }
 
 func Load() (Config, error) {
+	persistentDir := envOrDefault("CLAWMANAGER_AGENT_PERSISTENT_DIR", "/config")
 	cfg := Config{
-		AgentDataDir:                     "/var/lib/openclaw-agent",
-		DiskUsagePath:                    "/config",
+		Enabled:                          strings.EqualFold(envFirst("OPENCLAW_AGENT_ENABLED", "CLAWMANAGER_AGENT_ENABLED"), "true"),
+		RuntimeType:                      "openclaw",
+		RuntimeName:                      "OpenClaw Desktop",
+		DesktopBase:                      "webtop",
+		RuntimePort:                      3001,
+		AgentDataDir:                     filepath.Join(persistentDir, "openclaw-agent"),
+		DiskUsagePath:                    persistentDir,
 		ProtocolVersion:                  "v1",
 		LocalHTTPBind:                    "0.0.0.0:18080",
 		LogFilePath:                      "/var/log/openclaw-agent/agent.log",
@@ -105,7 +117,7 @@ func Load() (Config, error) {
 		BrowserLaunchWaylandTimeoutRaw:   "60s",
 		BrowserLaunchExtraDelayRaw:       "0s",
 		HeartbeatIntervalRaw:             "15s",
-		StateReportIntervalRaw:           "45s",
+		StateReportIntervalRaw:           "5s",
 		CommandPollIntervalRaw:           "5s",
 		CommandPollBackoffMaxRaw:         "60s",
 		RegisterRetryIntervalRaw:         "10s",
@@ -124,10 +136,16 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("read %s: %w", path, err)
 	}
 
+	overrideBoolAny(&cfg.Enabled, "OPENCLAW_AGENT_ENABLED", "CLAWMANAGER_AGENT_ENABLED")
+	overrideStringAny(&cfg.RuntimeType, "OPENCLAW_AGENT_RUNTIME_TYPE", "CLAWMANAGER_AGENT_RUNTIME_TYPE", "CLAWMANAGER_RUNTIME_TYPE")
+	overrideStringAny(&cfg.RuntimeName, "OPENCLAW_AGENT_RUNTIME_NAME", "CLAWMANAGER_AGENT_RUNTIME_NAME", "CLAWMANAGER_RUNTIME_NAME")
+	overrideStringAny(&cfg.RuntimeImage, "OPENCLAW_AGENT_RUNTIME_IMAGE", "CLAWMANAGER_AGENT_RUNTIME_IMAGE", "CLAWMANAGER_RUNTIME_IMAGE")
+	overrideStringAny(&cfg.DesktopBase, "OPENCLAW_AGENT_DESKTOP_BASE", "CLAWMANAGER_AGENT_DESKTOP_BASE")
+	overrideIntAny(&cfg.RuntimePort, "OPENCLAW_AGENT_RUNTIME_PORT", "CLAWMANAGER_AGENT_RUNTIME_PORT")
 	overrideStringAny(&cfg.InstanceID, "OPENCLAW_AGENT_INSTANCE_ID", "CLAWMANAGER_AGENT_INSTANCE_ID", "INSTANCE_ID")
 	overrideStringAny(&cfg.BootstrapToken, "OPENCLAW_AGENT_BOOTSTRAP_TOKEN", "CLAWMANAGER_AGENT_BOOTSTRAP_TOKEN")
 	overrideStringAny(&cfg.ControlPlaneBaseURL, "OPENCLAW_AGENT_CONTROL_PLANE_BASE_URL", "CLAWMANAGER_AGENT_BASE_URL")
-	overrideStringAny(&cfg.AgentDataDir, "OPENCLAW_AGENT_DATA_DIR")
+	overrideStringAny(&cfg.AgentDataDir, "OPENCLAW_AGENT_DATA_DIR", "CLAWMANAGER_AGENT_DATA_DIR")
 	overrideStringAny(&cfg.DiskUsagePath, "OPENCLAW_AGENT_DISK_USAGE_PATH", "CLAWMANAGER_AGENT_DISK_USAGE_PATH", "CLAWMANAGER_AGENT_PERSISTENT_DIR")
 	overrideStringAny(&cfg.InitialConfigRevisionID, "OPENCLAW_AGENT_INITIAL_CONFIG_REVISION_ID")
 	overrideStringAny(&cfg.ProtocolVersion, "OPENCLAW_AGENT_PROTOCOL_VERSION", "CLAWMANAGER_AGENT_PROTOCOL_VERSION")
@@ -220,31 +238,53 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("parse openclaw_startup_health_timeout: %w", err)
 	}
 
-	if cfg.InstanceID == "" {
-		return Config{}, errors.New("instance_id is required")
-	}
-	if cfg.BootstrapToken == "" {
-		return Config{}, errors.New("bootstrap_token is required")
-	}
-	if cfg.ControlPlaneBaseURL == "" {
-		return Config{}, errors.New("control_plane_base_url is required")
+	if cfg.Enabled {
+		if cfg.InstanceID == "" {
+			return Config{}, errors.New("instance_id is required")
+		}
+		if cfg.BootstrapToken == "" {
+			return Config{}, errors.New("bootstrap_token is required")
+		}
+		if cfg.ControlPlaneBaseURL == "" {
+			return Config{}, errors.New("control_plane_base_url is required")
+		}
 	}
 	if len(cfg.OpenClawCommand) == 0 {
 		return Config{}, errors.New("openclaw_command is required")
 	}
 
-	cfg.AgentDataDir = filepath.Clean(cfg.AgentDataDir)
-	cfg.DiskUsagePath = filepath.Clean(cfg.DiskUsagePath)
-	cfg.OpenClawConfigPath = filepath.Clean(cfg.OpenClawConfigPath)
-	cfg.OpenClawWorkspacePath = filepath.Clean(cfg.OpenClawWorkspacePath)
-	cfg.OpenClawSkillsPath = filepath.Clean(cfg.OpenClawSkillsPath)
-	cfg.OpenClawBuiltinSkillsPath = filepath.Clean(cfg.OpenClawBuiltinSkillsPath)
-	cfg.OpenClawDefaultsDir = filepath.Clean(cfg.OpenClawDefaultsDir)
-	cfg.AutostartDefaultsDir = filepath.Clean(cfg.AutostartDefaultsDir)
-	cfg.AutostartTargetDir = filepath.Clean(cfg.AutostartTargetDir)
-	cfg.OpenClawExtensionsDir = filepath.Clean(cfg.OpenClawExtensionsDir)
-	cfg.OpenClawBundledExtensionsDir = filepath.Clean(cfg.OpenClawBundledExtensionsDir)
+	cfg.RuntimeType = strings.TrimSpace(cfg.RuntimeType)
+	if cfg.RuntimeType == "" {
+		cfg.RuntimeType = "openclaw"
+	}
+	cfg.RuntimeName = strings.TrimSpace(cfg.RuntimeName)
+	if cfg.RuntimeName == "" {
+		cfg.RuntimeName = cfg.RuntimeType
+	}
+	cfg.DesktopBase = strings.TrimSpace(cfg.DesktopBase)
+	if cfg.DesktopBase == "" {
+		cfg.DesktopBase = "none"
+	}
+	cfg.AgentDataDir = cleanOptionalPath(cfg.AgentDataDir)
+	cfg.DiskUsagePath = cleanOptionalPath(cfg.DiskUsagePath)
+	cfg.OpenClawConfigPath = cleanOptionalPath(cfg.OpenClawConfigPath)
+	cfg.OpenClawWorkspacePath = cleanOptionalPath(cfg.OpenClawWorkspacePath)
+	cfg.OpenClawSkillsPath = cleanOptionalPath(cfg.OpenClawSkillsPath)
+	cfg.OpenClawBuiltinSkillsPath = cleanOptionalPath(cfg.OpenClawBuiltinSkillsPath)
+	cfg.OpenClawDefaultsDir = cleanOptionalPath(cfg.OpenClawDefaultsDir)
+	cfg.AutostartDefaultsDir = cleanOptionalPath(cfg.AutostartDefaultsDir)
+	cfg.AutostartTargetDir = cleanOptionalPath(cfg.AutostartTargetDir)
+	cfg.OpenClawExtensionsDir = cleanOptionalPath(cfg.OpenClawExtensionsDir)
+	cfg.OpenClawBundledExtensionsDir = cleanOptionalPath(cfg.OpenClawBundledExtensionsDir)
 	return cfg, nil
+}
+
+func cleanOptionalPath(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	return filepath.Clean(value)
 }
 
 func overrideString(target *string, envKey string) {
@@ -269,6 +309,17 @@ func overrideBoolAny(target *bool, envKeys ...string) {
 		*target = true
 	case "0", "false", "no", "off":
 		*target = false
+	}
+}
+
+func overrideIntAny(target *int, envKeys ...string) {
+	value := envFirst(envKeys...)
+	if value == "" {
+		return
+	}
+	parsed, err := strconv.Atoi(value)
+	if err == nil {
+		*target = parsed
 	}
 }
 

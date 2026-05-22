@@ -20,6 +20,9 @@ func Run(cfg appconfig.Config) error {
 	if err := ensureExtensionsDir(cfg); err != nil {
 		return fmt.Errorf("ensure extensions dir: %w", err)
 	}
+	if err := syncBundledRedisTeamPlugin(cfg); err != nil {
+		return fmt.Errorf("sync bundled redis-team plugin: %w", err)
+	}
 	if err := syncAutostart(cfg); err != nil {
 		return fmt.Errorf("sync autostart: %w", err)
 	}

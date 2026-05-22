@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-const AgentVersion = "openclaw-agent-dev"
+var AgentVersion = "openclaw-agent-dev"
 
 type RegisterRequest struct {
 	InstanceID      int            `json:"instance_id"`
