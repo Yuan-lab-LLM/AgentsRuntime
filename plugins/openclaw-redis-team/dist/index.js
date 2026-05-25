@@ -471,7 +471,8 @@ function createRuntime(api) {
         const redis = new RedisClient(cfg.redisUrl);
         await redis.connect();
         try {
-          await xaddJson(redis, eventsKey(cfg), eventFor(cfg, "completion", Object.assign({}, params, { artifactRefs })));
+          const eventName = params.status === "succeeded" ? "task_completed" : "task_failed";
+          await xaddJson(redis, eventsKey(cfg), eventFor(cfg, eventName, Object.assign({}, params, { artifactRefs })));
         } finally {
           redis.close();
         }
@@ -909,6 +910,8 @@ export default definePluginEntry({
                   const createdMs = Date.parse(envelope.createdAt);
                   const ts = Number.isFinite(createdMs) ? createdMs : undefined;
                   const textIn = String(envelope.text || "");
+                  const taskId = String(envelope.taskId || "");
+                  const conversationId = String(envelope.conversationId || cfg.teamId || "");
 
                   await dispatchInboundDirectDmWithRuntime({
                     cfg: ctx.cfg,
@@ -916,7 +919,7 @@ export default definePluginEntry({
                     channel: CHANNEL_ID,
                     channelLabel: "Redis Team",
                     accountId: ctx.accountId,
-                    peer: { kind: "direct", id: peerId },
+                    peer: { kind: "group", id: cfg.teamId },
                     senderId: peerId,
                     senderAddress: peerId,
                     recipientAddress: cfg.memberId,
@@ -931,8 +934,17 @@ export default definePluginEntry({
                     originatingChannel: CHANNEL_ID,
                     originatingTo: peerId,
                     extraContext: {
-                      NativeChannelId: String(envelope.conversationId || envelope.taskId || ""),
-                      MessageThreadId: envelope.taskId,
+                      ChatType: "group",
+                      NativeChannelId: conversationId,
+                      RedisTeamTaskId: taskId,
+                      UntrustedContext: [
+                        "Redis Team context:",
+                        "- teamId: " + cfg.teamId,
+                        "- taskId: " + (taskId || "(none)"),
+                        "- from: " + peerId,
+                        "- to: " + cfg.memberId,
+                        "- conversationId: " + conversationId,
+                      ],
                     },
                     deliver: async (payload) => {
                       ctx.log?.info?.("redis-team: delivering reply for " + envelope.messageId);
@@ -943,6 +955,13 @@ export default definePluginEntry({
                           inReplyTo: envelope.messageId,
                           taskId: envelope.taskId,
                           text: payload?.text || "",
+                          mediaUrls: payload?.mediaUrls,
+                          mediaUrl: payload?.mediaUrl,
+                        }));
+                        await xaddJson(r, eventsKey(cfg), eventFor(cfg, "task_completed", {
+                          messageId: envelope.messageId,
+                          taskId: envelope.taskId,
+                          result: payload?.text || "",
                           mediaUrls: payload?.mediaUrls,
                           mediaUrl: payload?.mediaUrl,
                         }));

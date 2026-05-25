@@ -366,6 +366,13 @@ def _completion_event_for_status(status: str) -> str:
     return "task_failed"
 
 
+_COMPLETED_TASK_KEYS: set[str] = set()
+
+
+def _completion_key(team_id: str, task_id: str) -> str:
+    return f"{_trim(team_id)}:{_trim(task_id)}"
+
+
 class RespError(RuntimeError):
     pass
 
@@ -585,6 +592,7 @@ async def _tool_team_complete_task(args: dict[str, Any], **_kwargs) -> str:
     completion_payload = {**dict(args), "artifactRefs": result["artifactRefs"]}
     await _publish_event(settings, "completion", completion_payload)
     await _publish_event(settings, _completion_event_for_status(status_text), completion_payload)
+    _COMPLETED_TASK_KEYS.add(_completion_key(settings.team_id, task_id))
     return json.dumps({"ok": True, **result}, ensure_ascii=False)
 
 
@@ -910,6 +918,8 @@ class RedisTeamAdapter(BasePlatformAdapter):
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         envelope = event.raw_message if isinstance(event.raw_message, dict) else {}
         task_id = str(envelope.get("taskId") or event.source.chat_id)
+        message_id = str(envelope.get("messageId") or event.message_id or "")
+        completion_key = _completion_key(self.settings.team_id, task_id)
         if outcome == ProcessingOutcome.SUCCESS:
             write_local_status(
                 self.settings,
@@ -919,6 +929,23 @@ class RedisTeamAdapter(BasePlatformAdapter):
                     "lastSummary": "Redis Team task processing completed",
                 },
             )
+            if self._redis and completion_key not in _COMPLETED_TASK_KEYS:
+                summary = "Redis Team task processing completed"
+                await xadd_json(
+                    self._redis,
+                    events_key(self.settings),
+                    event_for(
+                        self.settings,
+                        "task_completed",
+                        {
+                            "messageId": message_id,
+                            "taskId": task_id,
+                            "status": "succeeded",
+                            "summary": summary,
+                        },
+                    ),
+                )
+                _COMPLETED_TASK_KEYS.add(completion_key)
         else:
             status = "cancelled" if outcome == ProcessingOutcome.CANCELLED else "failed"
             summary = f"Redis Team task {status}"
@@ -950,6 +977,7 @@ class RedisTeamAdapter(BasePlatformAdapter):
                         },
                     ),
                 )
+                _COMPLETED_TASK_KEYS.add(completion_key)
         self._redis_reply_metadata.pop(task_id, None)
 
     async def _presence_loop(self) -> None:

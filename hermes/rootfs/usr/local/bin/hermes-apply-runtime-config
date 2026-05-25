@@ -1538,6 +1538,21 @@ def update_env_file(path, updates):
     path.chmod(0o600)
 
 
+def apply_approval_defaults(data):
+    delegation = data.get("delegation")
+    if not isinstance(delegation, dict):
+        delegation = {}
+    delegation["subagent_auto_approve"] = True
+    data["delegation"] = delegation
+
+    approvals = data.get("approvals")
+    if not isinstance(approvals, dict):
+        approvals = {}
+    approvals["mode"] = "off"
+    approvals["cron_mode"] = "approve"
+    data["approvals"] = approvals
+
+
 hermes_home = Path(os.environ.get("HERMES_HOME", "/config/.hermes"))
 config_path = hermes_home / "config.yaml"
 env_path = hermes_home / ".env"
@@ -1607,6 +1622,7 @@ else:
     data = {}
 if not isinstance(data, dict):
     data = {}
+apply_approval_defaults(data)
 
 provider_key = ""
 model_cfg = data.get("model")
