@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 
@@ -22,16 +21,23 @@ type channelOverrides struct {
 	HasRawJSON                bool
 	BundledExtensionsDir      string
 	UserExtensionsDir         string
+	PluginRegistryPath        string
+	DefaultsDir               string
+	ActiveConfigDir           string
 	InstalledPluginPathPrefix string
 }
 
 func readChannelOverridesFromEnv(cfg appconfig.Config) channelOverrides {
 	raw, has := os.LookupEnv("CLAWMANAGER_OPENCLAW_CHANNELS_JSON")
+	activeConfigDir := filepath.Dir(cfg.OpenClawConfigPath)
 	return channelOverrides{
 		RawJSON:                   raw,
 		HasRawJSON:                has,
 		BundledExtensionsDir:      cfg.OpenClawBundledExtensionsDir,
 		UserExtensionsDir:         cfg.OpenClawExtensionsDir,
+		PluginRegistryPath:        filepath.Join(activeConfigDir, "plugins", "installs.json"),
+		DefaultsDir:               cfg.OpenClawDefaultsDir,
+		ActiveConfigDir:           activeConfigDir,
 		InstalledPluginPathPrefix: cfg.InstalledPluginPathPrefix,
 	}
 }
@@ -59,6 +65,7 @@ func applyChannelOverrides(cfg map[string]any, opts channelOverrides) error {
 	supported := map[string]struct{}{}
 	collectSupportedChannelIds(opts.BundledExtensionsDir, supported)
 	collectSupportedChannelIds(opts.UserExtensionsDir, supported)
+	collectSupportedChannelIdsFromRegistry(opts.PluginRegistryPath, opts.DefaultsDir, opts.ActiveConfigDir, supported)
 
 	existing := ensureObject(cfg, "channels")
 	sanitized := sanitizeChannels(existing, supported, "existing config")
@@ -114,13 +121,53 @@ func rewritePluginPathStrings(value any, prefix, userExtensionsDir string) any {
 		}
 		return typed
 	case string:
-		if strings.HasPrefix(typed, prefix) {
-			return path.Join(userExtensionsDir, typed[len(prefix):])
+		if rewritten, ok := rewritePathPrefix(typed, prefix, userExtensionsDir); ok {
+			return rewritten
 		}
 		return typed
 	default:
 		return typed
 	}
+}
+
+func collectSupportedChannelIdsFromRegistry(registryPath, defaultsDir, activeConfigDir string, out map[string]struct{}) {
+	if registryPath == "" {
+		return
+	}
+	data, err := os.ReadFile(registryPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("configmanager: read plugin registry %s: %v", registryPath, err)
+		}
+		return
+	}
+	var registry struct {
+		Plugins []struct {
+			ManifestPath string `json:"manifestPath"`
+		} `json:"plugins"`
+	}
+	if err := json.Unmarshal(data, &registry); err != nil {
+		log.Printf("configmanager: parse plugin registry %s: %v", registryPath, err)
+		return
+	}
+	for _, plugin := range registry.Plugins {
+		manifestPath := strings.TrimSpace(plugin.ManifestPath)
+		if manifestPath == "" {
+			continue
+		}
+		collectSupportedChannelIdsFromManifestCandidates(
+			manifestPathCandidates(manifestPath, defaultsDir, activeConfigDir),
+			out,
+		)
+	}
+}
+
+func manifestPathCandidates(manifestPath, defaultsDir, activeConfigDir string) []string {
+	candidates := []string{manifestPath}
+	if rewritten, ok := rewritePathPrefix(manifestPath, defaultsDir, activeConfigDir); ok && rewritten != manifestPath {
+		candidates = append(candidates, rewritten)
+	}
+	return candidates
 }
 
 func collectSupportedChannelIds(rootDir string, out map[string]struct{}) {
@@ -144,25 +191,38 @@ func collectSupportedChannelIds(rootDir string, out map[string]struct{}) {
 		if _, err := os.Stat(manifestPath); err != nil {
 			continue
 		}
-		data, err := os.ReadFile(manifestPath)
-		if err != nil {
-			log.Printf("configmanager: read %s: %v", manifestPath, err)
-			continue
-		}
-		var manifest struct {
-			Channels []string `json:"channels"`
-		}
-		if err := json.Unmarshal(data, &manifest); err != nil {
-			log.Printf("configmanager: parse %s: %v", manifestPath, err)
-			continue
-		}
-		for _, id := range manifest.Channels {
-			trimmed := strings.TrimSpace(id)
-			if trimmed != "" {
-				out[trimmed] = struct{}{}
-			}
+		collectSupportedChannelIdsFromManifestCandidates([]string{manifestPath}, out)
+	}
+}
+
+func collectSupportedChannelIdsFromManifestCandidates(manifestPaths []string, out map[string]struct{}) {
+	for _, manifestPath := range manifestPaths {
+		if collectSupportedChannelIdsFromManifest(manifestPath, out) {
+			return
 		}
 	}
+}
+
+func collectSupportedChannelIdsFromManifest(manifestPath string, out map[string]struct{}) bool {
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		log.Printf("configmanager: read %s: %v", manifestPath, err)
+		return false
+	}
+	var manifest struct {
+		Channels []string `json:"channels"`
+	}
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		log.Printf("configmanager: parse %s: %v", manifestPath, err)
+		return false
+	}
+	for _, id := range manifest.Channels {
+		trimmed := strings.TrimSpace(id)
+		if trimmed != "" {
+			out[trimmed] = struct{}{}
+		}
+	}
+	return true
 }
 
 func sanitizeChannels(source map[string]any, supported map[string]struct{}, label string) map[string]any {

@@ -296,6 +296,82 @@ func TestChannelsMergeRejectsUnknownIds(t *testing.T) {
 	}
 }
 
+func TestChannelsMergeAcceptsRegistryInstalledNPMChannels(t *testing.T) {
+	root := t.TempDir()
+	configRoot := filepath.Join(root, "config", ".openclaw")
+	defaultsRoot := filepath.Join(root, "defaults", ".openclaw")
+	configPath := filepath.Join(configRoot, "openclaw.json")
+	registryPath := filepath.Join(configRoot, "plugins", "installs.json")
+	dingtalkDefaultsDir := filepath.Join(defaultsRoot, "npm", "node_modules", "@dingtalk-real-ai", "dingtalk-connector")
+	wecomDefaultsDir := filepath.Join(defaultsRoot, "npm", "node_modules", "@wecom", "wecom-openclaw-plugin")
+	dingtalkConfigDir := filepath.Join(configRoot, "npm", "node_modules", "@dingtalk-real-ai", "dingtalk-connector")
+	wecomConfigDir := filepath.Join(configRoot, "npm", "node_modules", "@wecom", "wecom-openclaw-plugin")
+
+	for _, dir := range []string{dingtalkConfigDir, wecomConfigDir, filepath.Dir(registryPath)} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dingtalkConfigDir, "openclaw.plugin.json"), []byte(`{"channels":["dingtalk-connector"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wecomConfigDir, "openclaw.plugin.json"), []byte(`{"channels":["wecom"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(sampleOpenClawConfig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	registry, err := json.Marshal(map[string]any{
+		"plugins": []map[string]any{
+			{
+				"pluginId":     "dingtalk-connector",
+				"manifestPath": filepath.Join(dingtalkDefaultsDir, "openclaw.plugin.json"),
+				"rootDir":      dingtalkDefaultsDir,
+			},
+			{
+				"pluginId":     "wecom-openclaw-plugin",
+				"manifestPath": filepath.Join(wecomDefaultsDir, "openclaw.plugin.json"),
+				"rootDir":      wecomDefaultsDir,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(registryPath, registry, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("CLAWMANAGER_OPENCLAW_CHANNELS_JSON", `{"dingtalk-connector":{"enabled":true},"wecom":{"enabled":true},"slack":{"enabled":true}}`)
+	t.Setenv("CLAWMANAGER_LLM_MODEL", "")
+	t.Setenv("CLAWMANAGER_LLM_BASE_URL", "")
+	unsetEnvForTest(t, "CLAWMANAGER_LLM_API_KEY")
+	unsetEnvForTest(t, "OPENAI_API_KEY")
+
+	manager := New(appconfig.Config{
+		OpenClawConfigPath:           configPath,
+		OpenClawBundledExtensionsDir: t.TempDir(),
+		OpenClawExtensionsDir:        t.TempDir(),
+		OpenClawDefaultsDir:          defaultsRoot,
+	}, nil, nil)
+	if err := manager.NormalizeActiveConfig(); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := readConfigForTest(t, configPath)
+	channels := nestedMapForTest(t, cfg, "channels")
+	if _, ok := channels["dingtalk-connector"]; !ok {
+		t.Fatalf("expected registry dingtalk channel to be preserved, got %#v", channels)
+	}
+	if _, ok := channels["wecom"]; !ok {
+		t.Fatalf("expected registry wecom channel to be preserved, got %#v", channels)
+	}
+	if _, ok := channels["slack"]; ok {
+		t.Fatalf("expected unsupported slack channel to be dropped, got %#v", channels)
+	}
+}
+
 func TestPluginInstallPathRewritten(t *testing.T) {
 	root := t.TempDir()
 	configPath := filepath.Join(root, "openclaw.json")
@@ -365,6 +441,8 @@ func TestNormalizeActiveConfigRewritesPluginInstallRegistry(t *testing.T) {
 	configPath := filepath.Join(root, "openclaw.json")
 	registryPath := filepath.Join(root, "plugins", "installs.json")
 	userDir := "/config/.openclaw/extensions"
+	configRoot := pathClean(filepath.Dir(configPath))
+	defaultsRoot := "/defaults/.openclaw"
 
 	config := `{
     "channels": {},
@@ -383,6 +461,9 @@ func TestNormalizeActiveConfigRewritesPluginInstallRegistry(t *testing.T) {
     "installRecords": {
         "dingtalk-connector": {
             "installPath": "/defaults/.openclaw/extensions/dingtalk-connector"
+        },
+        "wecom-openclaw-plugin": {
+            "installPath": "/defaults/.openclaw/npm/node_modules/@wecom/wecom-openclaw-plugin"
         }
     },
     "plugins": [
@@ -391,6 +472,12 @@ func TestNormalizeActiveConfigRewritesPluginInstallRegistry(t *testing.T) {
             "manifestPath": "/defaults/.openclaw/extensions/dingtalk-connector/openclaw.plugin.json",
             "source": "/defaults/.openclaw/extensions/dingtalk-connector/dist/index.mjs",
             "rootDir": "/defaults/.openclaw/extensions/dingtalk-connector"
+        },
+        {
+            "pluginId": "wecom-openclaw-plugin",
+            "manifestPath": "/defaults/.openclaw/npm/node_modules/@wecom/wecom-openclaw-plugin/openclaw.plugin.json",
+            "source": "/defaults/.openclaw/npm/node_modules/@wecom/wecom-openclaw-plugin/dist/index.js",
+            "rootDir": "/defaults/.openclaw/npm/node_modules/@wecom/wecom-openclaw-plugin"
         }
     ]
 }
@@ -403,6 +490,7 @@ func TestNormalizeActiveConfigRewritesPluginInstallRegistry(t *testing.T) {
 		OpenClawConfigPath:           configPath,
 		OpenClawBundledExtensionsDir: t.TempDir(),
 		OpenClawExtensionsDir:        userDir,
+		OpenClawDefaultsDir:          defaultsRoot,
 		InstalledPluginPathPrefix:    "/defaults/.openclaw/extensions/",
 	}, nil, nil)
 	if err := manager.NormalizeActiveConfig(); err != nil {
@@ -414,9 +502,14 @@ func TestNormalizeActiveConfigRewritesPluginInstallRegistry(t *testing.T) {
 	if gotPath, _ := record["installPath"].(string); gotPath != path.Join(userDir, "dingtalk-connector") {
 		t.Fatalf("expected install registry path to be rewritten, got %q", gotPath)
 	}
+	wecomRecord := nestedMapForTest(t, got, "installRecords", "wecom-openclaw-plugin")
+	wantWecomRoot := path.Join(configRoot, "npm", "node_modules", "@wecom", "wecom-openclaw-plugin")
+	if gotPath, _ := wecomRecord["installPath"].(string); gotPath != wantWecomRoot {
+		t.Fatalf("expected npm install registry path to be rewritten to %q, got %q", wantWecomRoot, gotPath)
+	}
 	plugins, _ := got["plugins"].([]any)
-	if len(plugins) != 1 {
-		t.Fatalf("expected one plugin entry, got %#v", plugins)
+	if len(plugins) != 2 {
+		t.Fatalf("expected two plugin entries, got %#v", plugins)
 	}
 	plugin, _ := plugins[0].(map[string]any)
 	wantRoot := path.Join(userDir, "dingtalk-connector")
@@ -428,6 +521,16 @@ func TestNormalizeActiveConfigRewritesPluginInstallRegistry(t *testing.T) {
 	}
 	if gotPath, _ := plugin["source"].(string); gotPath != path.Join(wantRoot, "dist", "index.mjs") {
 		t.Fatalf("expected source to be rewritten, got %q", gotPath)
+	}
+	wecomPlugin, _ := plugins[1].(map[string]any)
+	if gotPath, _ := wecomPlugin["rootDir"].(string); gotPath != wantWecomRoot {
+		t.Fatalf("expected npm rootDir to be rewritten to %q, got %q", wantWecomRoot, gotPath)
+	}
+	if gotPath, _ := wecomPlugin["manifestPath"].(string); gotPath != path.Join(wantWecomRoot, "openclaw.plugin.json") {
+		t.Fatalf("expected npm manifestPath to be rewritten, got %q", gotPath)
+	}
+	if gotPath, _ := wecomPlugin["source"].(string); gotPath != path.Join(wantWecomRoot, "dist", "index.js") {
+		t.Fatalf("expected npm source to be rewritten, got %q", gotPath)
 	}
 }
 

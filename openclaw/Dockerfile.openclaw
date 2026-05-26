@@ -55,6 +55,7 @@ RUN sed -i 's/\r$//' /etc/services.d/openclaw-agent/run \
   && chmod +x /usr/local/bin/wrapped-chromium \
   && HOME=/defaults openclaw plugins install /tmp/openclaw-redis-team.tgz \
   && HOME=/defaults openclaw plugins install @dingtalk-real-ai/dingtalk-connector \
+  && HOME=/defaults openclaw plugins install @wecom/wecom-openclaw-plugin@beta \
   && rm -f /tmp/openclaw-redis-team.tgz \
   && chown -R abc:abc /defaults/.openclaw \
   && chown -R abc:abc /defaults/.config \

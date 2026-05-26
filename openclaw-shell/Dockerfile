@@ -128,6 +128,8 @@ RUN set -eux; \
     HOME=/defaults openclaw plugins install /tmp/openclaw-redis-team.tgz; \
     HOME=/defaults openclaw plugins install @dingtalk-real-ai/dingtalk-connector \
       || echo "warning: dingtalk-connector preinstall failed; continuing without bundled connector"; \
+    HOME=/defaults openclaw plugins install @wecom/wecom-openclaw-plugin@beta \
+      || echo "warning: wecom-openclaw-plugin preinstall failed; continuing without bundled connector"; \
     node /tmp/enable-redis-team-config.mjs /defaults/.openclaw/openclaw.json; \
     rm -f /tmp/openclaw-redis-team.tgz /tmp/enable-redis-team-config.mjs; \
     chown -R abc:abc /config /etc/openclaw-agent /defaults/.openclaw

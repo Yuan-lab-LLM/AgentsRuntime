@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -98,17 +99,40 @@ func normalizePluginInstallRegistryContent(content []byte, cfg appconfig.Config)
 	if err != nil {
 		return nil, false, err
 	}
-	if cfg.InstalledPluginPathPrefix == "" || cfg.OpenClawExtensionsDir == "" {
-		return content, false, nil
-	}
 
-	rewritePluginPathStrings(parsed, cfg.InstalledPluginPathPrefix, cfg.OpenClawExtensionsDir)
+	if cfg.InstalledPluginPathPrefix != "" && cfg.OpenClawExtensionsDir != "" {
+		rewritePluginPathStrings(parsed, cfg.InstalledPluginPathPrefix, cfg.OpenClawExtensionsDir)
+	}
+	if cfg.OpenClawDefaultsDir != "" && cfg.OpenClawConfigPath != "" {
+		rewritePluginPathStrings(parsed, cfg.OpenClawDefaultsDir, filepath.Dir(cfg.OpenClawConfigPath))
+	}
 
 	normalized, err := rewriteConfig(parsed)
 	if err != nil {
 		return nil, false, err
 	}
 	return normalized, !bytes.Equal(content, normalized), nil
+}
+
+func rewritePathPrefix(value, prefix, replacement string) (string, bool) {
+	if prefix == "" || replacement == "" {
+		return value, false
+	}
+	normalizedValue := pathClean(value)
+	normalizedPrefix := pathClean(prefix)
+	if normalizedValue == normalizedPrefix {
+		return pathClean(replacement), true
+	}
+	prefixWithSlash := strings.TrimSuffix(normalizedPrefix, "/") + "/"
+	if !strings.HasPrefix(normalizedValue, prefixWithSlash) {
+		return value, false
+	}
+	remainder := strings.TrimPrefix(normalizedValue, prefixWithSlash)
+	return path.Join(pathClean(replacement), remainder), true
+}
+
+func pathClean(value string) string {
+	return path.Clean(filepath.ToSlash(value))
 }
 
 func parseConfigJSON(content []byte) (map[string]any, error) {

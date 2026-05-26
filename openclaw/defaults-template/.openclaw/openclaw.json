@@ -141,6 +141,9 @@
         "dingtalk-connector": {
           "enabled": false
         },
+        "wecom-openclaw-plugin": {
+          "enabled": true
+        },
         "redis-team": {
           "enabled": true,
           "config": {
