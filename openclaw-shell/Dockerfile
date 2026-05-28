@@ -66,8 +66,13 @@ RUN apk add --no-cache \
       tmux \
       tzdata \
       unzip \
+    && apk add --no-cache --virtual .openclaw-build-deps \
+      g++ \
+      make \
+      python3 \
     && npm install -g "openclaw@${OPENCLAW_VERSION}" \
-    && npm cache clean --force
+    && npm cache clean --force \
+    && apk del .openclaw-build-deps
 
 COPY openclaw/defaults-template/.openclaw /defaults/.openclaw
 COPY openclaw-shell/config/openclaw-shell-agent /defaults/openclaw-shell-agent
