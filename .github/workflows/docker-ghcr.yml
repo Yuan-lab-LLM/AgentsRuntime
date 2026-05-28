@@ -129,8 +129,8 @@ jobs:
           matrix_json="$(printf '%s\n' "${entries[@]}" | jq -sc '{include: .}')"
           echo "matrix=${matrix_json}" >> "${GITHUB_OUTPUT}"
 
-  build-and-push:
-    name: Build ${{ matrix.runtime }}
+  build-amd64:
+    name: Build ${{ matrix.runtime }} linux/amd64
     needs: discover-images
     runs-on: ubuntu-latest
     strategy:
@@ -149,8 +149,83 @@ jobs:
           set -euo pipefail
           echo "source_date_epoch=$(git log -1 --pretty=%ct)" >> "${GITHUB_OUTPUT}"
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push amd64 image
+        shell: bash
+        env:
+          IMAGE: ${{ matrix.image }}
+          CONTEXT: ${{ matrix.context }}
+          DOCKERFILE: ${{ matrix.dockerfile }}
+          RUNTIME: ${{ matrix.runtime }}
+          ARCH: amd64
+          PLATFORM: linux/amd64
+          SOURCE_DATE_EPOCH: ${{ steps.stamp.outputs.source_date_epoch }}
+        run: |
+          set -euo pipefail
+
+          labels=(
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+            --label "org.opencontainers.image.title=${RUNTIME}"
+          )
+
+          docker buildx build \
+            --file "${DOCKERFILE}" \
+            --platform "${PLATFORM}" \
+            --pull \
+            --provenance=false \
+            --sbom=false \
+            --build-arg BUILDKIT_MULTI_PLATFORM=1 \
+            --build-arg SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}" \
+            --cache-from "type=gha,scope=${RUNTIME}-${ARCH}" \
+            --cache-to "type=gha,mode=max,scope=${RUNTIME}-${ARCH}" \
+            --tag "${IMAGE}:build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${ARCH}" \
+            --push \
+            "${labels[@]}" \
+            "${CONTEXT}"
+
+      - name: Summarize amd64 image
+        shell: bash
+        env:
+          IMAGE: ${{ matrix.image }}
+          RUNTIME: ${{ matrix.runtime }}
+          ARCH: amd64
+        run: |
+          {
+            echo "### ${RUNTIME} ${ARCH}"
+            echo ""
+            echo "- image: \`${IMAGE}:build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${ARCH}\`"
+            echo "- platform: \`linux/${ARCH}\`"
+            echo ""
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  build-arm64:
+    name: Build ${{ matrix.runtime }} linux/arm64
+    needs: discover-images
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover-images.outputs.matrix) }}
+    env:
+      DATE_TAG: ${{ needs.discover-images.outputs.date_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve reproducible build timestamp
+        id: stamp
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "source_date_epoch=$(git log -1 --pretty=%ct)" >> "${GITHUB_OUTPUT}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -162,78 +237,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build candidate image and resolve digest
-        id: candidate
+      - name: Build and push arm64 image
         shell: bash
         env:
           IMAGE: ${{ matrix.image }}
           CONTEXT: ${{ matrix.context }}
           DOCKERFILE: ${{ matrix.dockerfile }}
           RUNTIME: ${{ matrix.runtime }}
-          SOURCE_DATE_EPOCH: ${{ steps.stamp.outputs.source_date_epoch }}
-        run: |
-          set -euo pipefail
-
-          metadata_file="$(mktemp)"
-
-          labels=(
-            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
-            --label "org.opencontainers.image.title=${RUNTIME}"
-          )
-
-          docker buildx build \
-            --file "${DOCKERFILE}" \
-            --platform linux/amd64,linux/arm64 \
-            --pull \
-            --provenance=false \
-            --sbom=false \
-            --build-arg BUILDKIT_MULTI_PLATFORM=1 \
-            --build-arg SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}" \
-            --cache-from "type=gha,scope=${RUNTIME}" \
-            --metadata-file "${metadata_file}" \
-            --output "type=image,name=${IMAGE}:build-check" \
-            "${labels[@]}" \
-            "${CONTEXT}"
-
-          candidate_digest="$(jq -r '."containerimage.digest" // empty' "${metadata_file}")"
-          if [ -z "${candidate_digest}" ]; then
-            echo "Unable to resolve candidate digest for ${RUNTIME}." >&2
-            cat "${metadata_file}" >&2
-            exit 1
-          fi
-
-          echo "candidate_digest=${candidate_digest}" >> "${GITHUB_OUTPUT}"
-
-      - name: Compare against remote latest
-        id: compare
-        shell: bash
-        env:
-          IMAGE: ${{ matrix.image }}
-          CANDIDATE_DIGEST: ${{ steps.candidate.outputs.candidate_digest }}
-        run: |
-          set -euo pipefail
-
-          remote_digest=""
-          if manifest_json="$(docker buildx imagetools inspect "${IMAGE}:latest" --format '{{json .Manifest}}' 2>/dev/null)"; then
-            remote_digest="$(echo "${manifest_json}" | jq -r '.digest // empty')"
-          fi
-
-          changed=true
-          if [ -n "${remote_digest}" ] && [ "${remote_digest}" = "${CANDIDATE_DIGEST}" ]; then
-            changed=false
-          fi
-
-          echo "remote_digest=${remote_digest}" >> "${GITHUB_OUTPUT}"
-          echo "changed=${changed}" >> "${GITHUB_OUTPUT}"
-
-      - name: Push latest and date tags
-        if: steps.compare.outputs.changed == 'true'
-        shell: bash
-        env:
-          IMAGE: ${{ matrix.image }}
-          CONTEXT: ${{ matrix.context }}
-          DOCKERFILE: ${{ matrix.dockerfile }}
-          RUNTIME: ${{ matrix.runtime }}
+          ARCH: arm64
+          PLATFORM: linux/arm64
           SOURCE_DATE_EPOCH: ${{ steps.stamp.outputs.source_date_epoch }}
         run: |
           set -euo pipefail
@@ -245,44 +257,82 @@ jobs:
 
           docker buildx build \
             --file "${DOCKERFILE}" \
-            --platform linux/amd64,linux/arm64 \
+            --platform "${PLATFORM}" \
             --pull \
             --provenance=false \
             --sbom=false \
             --build-arg BUILDKIT_MULTI_PLATFORM=1 \
             --build-arg SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}" \
-            --cache-from "type=gha,scope=${RUNTIME}" \
-            --cache-to "type=gha,mode=max,scope=${RUNTIME}" \
-            --tag "${IMAGE}:latest" \
-            --tag "${IMAGE}:${DATE_TAG}" \
+            --cache-from "type=gha,scope=${RUNTIME}-${ARCH}" \
+            --cache-to "type=gha,mode=max,scope=${RUNTIME}-${ARCH}" \
+            --tag "${IMAGE}:build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${ARCH}" \
             --push \
             "${labels[@]}" \
             "${CONTEXT}"
+
+      - name: Summarize arm64 image
+        shell: bash
+        env:
+          IMAGE: ${{ matrix.image }}
+          RUNTIME: ${{ matrix.runtime }}
+          ARCH: arm64
+        run: |
+          {
+            echo "### ${RUNTIME} ${ARCH}"
+            echo ""
+            echo "- image: \`${IMAGE}:build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${ARCH}\`"
+            echo "- platform: \`linux/${ARCH}\`"
+            echo ""
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  publish-manifest:
+    name: Publish ${{ matrix.runtime }} manifest
+    needs:
+      - discover-images
+      - build-amd64
+      - build-arm64
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover-images.outputs.matrix) }}
+    env:
+      DATE_TAG: ${{ needs.discover-images.outputs.date_tag }}
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifest
+        shell: bash
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+
+          docker buildx imagetools create \
+            --tag "${IMAGE}:latest" \
+            --tag "${IMAGE}:${DATE_TAG}" \
+            "${IMAGE}:build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-amd64" \
+            "${IMAGE}:build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-arm64"
 
       - name: Summarize result
         shell: bash
         env:
           IMAGE: ${{ matrix.image }}
           RUNTIME: ${{ matrix.runtime }}
-          CANDIDATE_DIGEST: ${{ steps.candidate.outputs.candidate_digest }}
-          REMOTE_DIGEST: ${{ steps.compare.outputs.remote_digest }}
-          CHANGED: ${{ steps.compare.outputs.changed }}
         run: |
           {
             echo "### ${RUNTIME}"
             echo ""
             echo "- image: \`${IMAGE}\`"
             echo "- date tag: \`${DATE_TAG}\`"
-            echo "- candidate digest: \`${CANDIDATE_DIGEST}\`"
-            if [ -n "${REMOTE_DIGEST}" ]; then
-              echo "- remote latest digest: \`${REMOTE_DIGEST}\`"
-            else
-              echo "- remote latest digest: \`<missing>\`"
-            fi
-            if [ "${CHANGED}" = "true" ]; then
-              echo "- result: pushed \`latest\` and \`${DATE_TAG}\`"
-            else
-              echo "- result: skipped push because candidate matches remote \`latest\`"
-            fi
+            echo "- platforms: \`linux/amd64\`, \`linux/arm64\`"
+            echo "- result: pushed \`latest\` and \`${DATE_TAG}\` multi-arch manifests"
             echo ""
           } >> "${GITHUB_STEP_SUMMARY}"
