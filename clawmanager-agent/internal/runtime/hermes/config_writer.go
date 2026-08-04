@@ -4,12 +4,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/iamlovingit/clawmanager-agent/internal/gateway"
+	"github.com/iamlovingit/clawmanager-agent/internal/scheduledtasks"
 )
 
 const managedConfigStart = "# clawmanager-managed-start"
@@ -40,6 +42,22 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 	}
 	if err := writeHermesGatewayConfig(filepath.Join(hermesHome, "gateway.json"), resolved, req); err != nil {
 		return err
+	}
+	result := scheduledtasks.ApplyHermesFromEnv(hermesHome, func(key string) string {
+		if req.Environment != nil {
+			if value, ok := req.Environment[key]; ok {
+				return value
+			}
+		}
+		if req.Env != nil {
+			if value, ok := req.Env[key]; ok {
+				return value
+			}
+		}
+		return os.Getenv(key)
+	}, req.UID, req.GID)
+	if result.Error != "" {
+		log.Printf("apply hermes scheduled tasks failed (continuing): source_env=%s error=%s", result.SourceEnv, result.Error)
 	}
 	if err := chownHermesHome(hermesHome, req.UID, req.GID); err != nil {
 		return fmt.Errorf("chown hermes home: %w", err)

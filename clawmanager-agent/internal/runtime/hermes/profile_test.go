@@ -111,6 +111,75 @@ func TestGatewayEnvSetsHermesWorkspace(t *testing.T) {
 	if values["CLAWMANAGER_GATEWAY_GENERATION"] != "7" {
 		t.Fatalf("CLAWMANAGER_GATEWAY_GENERATION = %q, want 7", values["CLAWMANAGER_GATEWAY_GENERATION"])
 	}
+	if values["HERMES_DASHBOARD_BASIC_AUTH_USERNAME"] != "clawmanager" {
+		t.Fatalf("HERMES_DASHBOARD_BASIC_AUTH_USERNAME = %q, want clawmanager", values["HERMES_DASHBOARD_BASIC_AUTH_USERNAME"])
+	}
+	if values["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"] != "secret" {
+		t.Fatalf("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD = %q, want secret from CLAWMANAGER_LLM_API_KEY", values["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"])
+	}
+}
+
+func TestGatewayEnvPrefersInstanceTokenForDashboardBasicAuth(t *testing.T) {
+	profile := hermes.NewProfile("hermes")
+	req := gateway.CreateGatewayRequest{
+		AgentType:  "hermes",
+		InstanceID: 70,
+		UserID:     45,
+		Environment: map[string]string{
+			"CLAWMANAGER_INSTANCE_TOKEN": "igt_instance_70",
+			"CLAWMANAGER_LLM_API_KEY":    "llm-key-should-not-win",
+		},
+	}
+	workspacePath := "/workspaces/hermes/user-45/instance-70"
+	env := profile.GatewayEnv(nil, gateway.Config{RuntimeType: "hermes", GatewayAuthMode: "trusted-proxy"}, req, workspacePath, 20020)
+	values := envMap(env)
+	if values["HERMES_DASHBOARD_BASIC_AUTH_USERNAME"] != "clawmanager" {
+		t.Fatalf("HERMES_DASHBOARD_BASIC_AUTH_USERNAME = %q, want clawmanager", values["HERMES_DASHBOARD_BASIC_AUTH_USERNAME"])
+	}
+	if values["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"] != "igt_instance_70" {
+		t.Fatalf("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD = %q, want instance token", values["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"])
+	}
+}
+
+func TestGatewayEnvKeepsExplicitHermesDashboardBasicAuth(t *testing.T) {
+	profile := hermes.NewProfile("hermes")
+	req := gateway.CreateGatewayRequest{
+		AgentType:  "hermes",
+		InstanceID: 71,
+		UserID:     45,
+		Environment: map[string]string{
+			"HERMES_DASHBOARD_BASIC_AUTH_USERNAME": "admin",
+			"HERMES_DASHBOARD_BASIC_AUTH_PASSWORD": "explicit-password",
+			"CLAWMANAGER_INSTANCE_TOKEN":          "igt_should_not_override",
+		},
+	}
+	workspacePath := "/workspaces/hermes/user-45/instance-71"
+	env := profile.GatewayEnv(nil, gateway.Config{RuntimeType: "hermes", GatewayAuthMode: "trusted-proxy", GatewayToken: "cfg-token"}, req, workspacePath, 20021)
+	values := envMap(env)
+	if values["HERMES_DASHBOARD_BASIC_AUTH_USERNAME"] != "admin" {
+		t.Fatalf("HERMES_DASHBOARD_BASIC_AUTH_USERNAME = %q, want admin", values["HERMES_DASHBOARD_BASIC_AUTH_USERNAME"])
+	}
+	if values["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"] != "explicit-password" {
+		t.Fatalf("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD = %q, want explicit-password", values["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"])
+	}
+}
+
+func TestGatewayEnvUsesGatewayTokenBeforeRequestAccessToken(t *testing.T) {
+	profile := hermes.NewProfile("hermes")
+	req := gateway.CreateGatewayRequest{
+		AgentType:  "hermes",
+		InstanceID: 72,
+		UserID:     45,
+		Environment: map[string]string{
+			"CLAWMANAGER_INSTANCE_TOKEN": "igt_instance_72",
+		},
+	}
+	workspacePath := "/workspaces/hermes/user-45/instance-72"
+	env := profile.GatewayEnv(nil, gateway.Config{RuntimeType: "hermes", GatewayAuthMode: "token", GatewayToken: "cfg-gateway-token"}, req, workspacePath, 20022)
+	values := envMap(env)
+	if values["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"] != "cfg-gateway-token" {
+		t.Fatalf("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD = %q, want cfg.GatewayToken", values["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"])
+	}
 }
 
 func TestGatewayEnvMovesDefaultTeamSharedDirIntoWorkspace(t *testing.T) {

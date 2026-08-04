@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
 
 	appconfig "github.com/iamlovingit/clawmanager-openclaw-image/internal/config"
+	"github.com/iamlovingit/clawmanager-openclaw-image/internal/scheduledtasks"
 )
 
 const autoProviderName = "auto"
@@ -27,7 +29,17 @@ func (m *Manager) NormalizeActiveConfig() error {
 			return err
 		}
 	}
-	return normalizePluginInstallRegistry(m.cfg)
+	if err := normalizePluginInstallRegistry(m.cfg); err != nil {
+		return err
+	}
+	openclawHome := filepath.Dir(m.cfg.OpenClawConfigPath)
+	result := scheduledtasks.ApplyOpenClawFromEnv(openclawHome, os.Getenv)
+	if result.Error != "" {
+		log.Printf("configmanager: apply openclaw scheduled tasks failed (continuing): source_env=%s error=%s", result.SourceEnv, result.Error)
+	} else if result.Skipped {
+		log.Printf("configmanager: openclaw scheduled tasks apply skipped source_env=%s", result.SourceEnv)
+	}
+	return nil
 }
 
 func normalizeConfigFile(path string, cfg appconfig.Config) ([]byte, bool, error) {

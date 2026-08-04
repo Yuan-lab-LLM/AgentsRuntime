@@ -144,6 +144,14 @@ Hermes agent 需要同时处理两类注入：
 | Agents | `CLAWMANAGER_HERMES_AGENTS_JSON` | `CLAWMANAGER_RUNTIME_AGENTS_JSON`，`CLAWMANAGER_OPENCLAW_AGENTS_JSON` |
 | Scheduled Tasks | `CLAWMANAGER_HERMES_SCHEDULED_TASKS_JSON` | `CLAWMANAGER_RUNTIME_SCHEDULED_TASKS_JSON`，`CLAWMANAGER_OPENCLAW_SCHEDULED_TASKS_JSON` |
 
+Scheduled Task 使用 OpenClaw cron 标杆（`schedule` + `payload` + `delivery`，format=`task/openclaw-cron@v1`）。Hermes 启动时会把该 JSON **翻译**为原生 `~/.hermes/cron/jobs.json`（托管 id `cm-st-*`），由 gateway 内置 cron 执行。`announce` 映射为 Hermes `deliver`；`webhook` 映射为 `deliver=local` + prompt 内必填 POST 说明，并写入 `cron/webhooks/cm-st-*.url`。
+
+补充说明：
+
+- apply 为 soft-fail：解析/翻译失败写入 bootstrap `scheduled-tasks` 状态，不中断启动。
+- 相同 payload sha256 且 managed job 数量一致时跳过重写 `jobs.json`。
+- OpenClaw 字段 `wakeMode` / `sessionTarget` 在 Hermes 侧故意忽略（`ignored_fields`）；Hermes cron 始终使用全新 agent 会话。平台资源仍保留这些字段以兼容 OpenClaw。
+
 如果某个变量不存在或为空，按空配置处理，不要让 agent 启动失败。只有变量存在但 JSON 无法解析时，agent 应记录清晰错误，并在 state report 的 `health.bootstrap_config` 或 `health.config_loader` 中标记为 `error`。
 
 建议 agent 把本次读取到的原始 JSON、解析后的配置和 hash 写入：

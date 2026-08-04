@@ -48,6 +48,11 @@ BOOTSTRAP_ENV_NAMES = {
         "CLAWMANAGER_RUNTIME_SKILLS_JSON",
         "CLAWMANAGER_OPENCLAW_SKILLS_JSON",
     ),
+    "scheduled_tasks": (
+        "CLAWMANAGER_HERMES_SCHEDULED_TASKS_JSON",
+        "CLAWMANAGER_RUNTIME_SCHEDULED_TASKS_JSON",
+        "CLAWMANAGER_OPENCLAW_SCHEDULED_TASKS_JSON",
+    ),
 }
 
 
@@ -1401,6 +1406,240 @@ def apply_bootstrap_manifest(hermes_home):
     return record
 
 
+MANAGED_JOB_PREFIX = "cm-st-"
+
+
+def _as_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _translate_schedule(schedule):
+    if not isinstance(schedule, dict):
+        raise ValueError("schedule must be an object")
+    kind = str(schedule.get("kind") or "").strip().lower()
+    if kind == "cron":
+        expr = str(schedule.get("expr") or "").strip()
+        if not expr:
+            raise ValueError("cron expr required")
+        return {"kind": "cron", "expr": expr, "display": expr}, expr
+    if kind == "every":
+        every_ms = _as_int(schedule.get("everyMs"), 0)
+        if every_ms <= 0:
+            raise ValueError("everyMs must be > 0")
+        minutes = max(1, every_ms // 60000)
+        display = f"every {minutes}m"
+        return {"kind": "interval", "minutes": minutes, "display": display}, display
+    if kind == "at":
+        at = str(schedule.get("at") or "").strip()
+        if not at:
+            raise ValueError("at timestamp required")
+        display = f"once at {at}"
+        return {"kind": "once", "run_at": at, "display": display}, display
+    raise ValueError(f"unsupported schedule.kind {kind}")
+
+
+def _translate_delivery(delivery):
+    if not isinstance(delivery, dict):
+        return "origin", ""
+    mode = str(delivery.get("mode") or "").strip().lower()
+    channel = str(delivery.get("channel") or "").strip()
+    to = str(delivery.get("to") or "").strip()
+    if mode in ("", "announce"):
+        if not channel or channel == "last":
+            return "origin", ""
+        if to:
+            return f"{channel}:{to}", ""
+        return channel, ""
+    if mode == "none":
+        return "local", ""
+    if mode == "webhook":
+        if not to:
+            raise ValueError("webhook delivery.to required")
+        parsed = urlparse(to)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError("webhook delivery.to must be http(s)")
+        return "local", to
+    raise ValueError(f"unsupported delivery.mode {mode}")
+
+
+def _extract_prompt(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be an object")
+    kind = str(payload.get("kind") or "").strip()
+    model = payload.get("model")
+    if kind == "agentTurn":
+        message = str(payload.get("message") or "").strip()
+        if not message:
+            raise ValueError("agentTurn message required")
+        return message, model
+    if kind == "systemEvent":
+        text = str(payload.get("text") or "").strip()
+        if not text:
+            raise ValueError("systemEvent text required")
+        return "System event (from ClawManager scheduled task):\n" + text, model
+    raise ValueError(f"unsupported payload.kind {kind}")
+
+
+def apply_scheduled_tasks(hermes_home):
+    payload = read_priority_json("scheduled_tasks")
+    record = {
+        "source_env": payload["source_env"],
+        "raw_sha256": payload["raw_sha256"],
+        "error": payload["error"],
+        "job_count": 0,
+        "skipped": not bool(payload["source_env"]),
+        "ignored_fields": ["wakeMode", "sessionTarget"],
+        "updated_at": utc_now(),
+    }
+    if payload["error"]:
+        persist_bootstrap_payload(hermes_home, "scheduled-tasks", record)
+        return record
+    if not payload["source_env"]:
+        return record
+
+    parsed = payload["parsed"]
+    items = []
+    if isinstance(parsed, dict):
+        raw_items = parsed.get("items")
+        if isinstance(raw_items, list):
+            items = raw_items
+
+    cron_dir = Path(hermes_home) / "cron"
+    jobs_path = cron_dir / "jobs.json"
+    webhook_dir = cron_dir / "webhooks"
+    hash_path = cron_dir / "clawmanager-scheduled-tasks.sha256"
+    cron_dir.mkdir(parents=True, exist_ok=True)
+
+    existing_jobs = []
+    if jobs_path.exists():
+        try:
+            existing_data = json.loads(jobs_path.read_text(encoding="utf-8") or "{}")
+            if isinstance(existing_data, dict) and isinstance(existing_data.get("jobs"), list):
+                existing_jobs = existing_data["jobs"]
+            elif isinstance(existing_data, list):
+                existing_jobs = existing_data
+        except Exception as exc:
+            record["error"] = f"parse existing hermes cron jobs: {exc}"
+            persist_bootstrap_payload(hermes_home, "scheduled-tasks", record)
+            return record
+
+    managed_item_count = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        resource_type = str(item.get("type") or "").strip().lower()
+        if resource_type and resource_type != "scheduled_task":
+            continue
+        managed_item_count += 1
+    existing_managed_count = sum(
+        1
+        for job in existing_jobs
+        if isinstance(job, dict) and str(job.get("id") or "").startswith(MANAGED_JOB_PREFIX)
+    )
+    if (
+        hash_path.exists()
+        and hash_path.read_text(encoding="utf-8").strip() == payload["raw_sha256"]
+        and existing_managed_count == managed_item_count
+    ):
+        record["job_count"] = managed_item_count
+        record["skipped"] = True
+        persist_bootstrap_payload(hermes_home, "scheduled-tasks", record)
+        return record
+
+    existing_by_id = {
+        str(job.get("id")): job
+        for job in existing_jobs
+        if isinstance(job, dict) and job.get("id")
+    }
+    kept = [
+        job
+        for job in existing_jobs
+        if isinstance(job, dict) and not str(job.get("id") or "").startswith(MANAGED_JOB_PREFIX)
+    ]
+
+    managed = []
+    try:
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            resource_type = str(item.get("type") or "").strip().lower()
+            if resource_type and resource_type != "scheduled_task":
+                continue
+            content = item.get("content")
+            if isinstance(content, str):
+                content = json.loads(content)
+            if not isinstance(content, dict):
+                raise ValueError(f"invalid content for scheduled task id={item.get('id')}")
+            cfg = content.get("config")
+            if not isinstance(cfg, dict):
+                raise ValueError(f"missing config for scheduled task id={item.get('id')}")
+            prompt, model = _extract_prompt(cfg.get("payload") or {})
+            schedule, display = _translate_schedule(cfg.get("schedule") or {})
+            deliver, webhook_url = _translate_delivery(cfg.get("delivery") or {})
+            job_id = f"{MANAGED_JOB_PREFIX}{item.get('id')}"
+            if webhook_url:
+                prompt = (
+                    prompt
+                    + "\n\n[ClawManager delivery.webhook]\n"
+                    + "After you finish, POST your complete final answer as JSON {\"text\": \"...\"} to "
+                    + webhook_url
+                    + " using an available HTTP tool. Treat webhook delivery as required."
+                )
+                webhook_dir.mkdir(parents=True, exist_ok=True)
+                (webhook_dir / f"{job_id}.url").write_text(webhook_url + "\n", encoding="utf-8")
+            name = str(cfg.get("name") or item.get("name") or item.get("key") or job_id).strip()
+            enabled = cfg.get("enabled")
+            if enabled is None:
+                enabled = True
+            enabled = bool(enabled)
+            now = utc_now()
+            job = {
+                "id": job_id,
+                "name": name,
+                "prompt": prompt,
+                "schedule": schedule,
+                "skills": [],
+                "skill": None,
+                "deliver": deliver,
+                "repeat": {"times": 1 if cfg.get("deleteAfterRun") else None, "completed": 0},
+                "state": "scheduled" if enabled else "paused",
+                "enabled": enabled,
+                "next_run_at": schedule.get("run_at") if schedule.get("kind") == "once" else now,
+                "last_run_at": None,
+                "last_status": None,
+                "created_at": now,
+                "model": model,
+                "provider": None,
+                "script": None,
+                "schedule_display": display,
+            }
+            prev = existing_by_id.get(job_id)
+            if isinstance(prev, dict):
+                if prev.get("created_at"):
+                    job["created_at"] = prev.get("created_at")
+                job["last_run_at"] = prev.get("last_run_at")
+                job["last_status"] = prev.get("last_status")
+                prev_repeat = prev.get("repeat")
+                if isinstance(prev_repeat, dict) and "completed" in prev_repeat:
+                    job["repeat"]["completed"] = prev_repeat.get("completed")
+            managed.append(job)
+    except Exception as exc:
+        record["error"] = str(exc)
+        persist_bootstrap_payload(hermes_home, "scheduled-tasks", record)
+        return record
+
+    kept.extend(managed)
+    record["job_count"] = len(managed)
+    record["skipped"] = False
+    write_json_secure(jobs_path, {"jobs": kept, "updated_at": utc_now()})
+    hash_path.write_text(payload["raw_sha256"] + "\n", encoding="utf-8")
+    persist_bootstrap_payload(hermes_home, "scheduled-tasks", record)
+    return record
+
+
 def write_applied_state(hermes_home, state):
     state["updated_at"] = utc_now()
     write_json_secure(bootstrap_dir(hermes_home) / "applied-state.json", state)
@@ -1703,6 +1942,7 @@ messaging_env_updates, messaging_sources, configured_platforms, gateway_written,
 )
 redis_team_record = apply_redis_team_config(hermes_home, data)
 manifest_record = apply_bootstrap_manifest(hermes_home)
+scheduled_tasks_record = apply_scheduled_tasks(hermes_home)
 write_applied_state(
     hermes_home,
     {
@@ -1727,6 +1967,14 @@ write_applied_state(
             "source_env": manifest_record.get("source_env", ""),
             "raw_sha256": manifest_record.get("raw_sha256", ""),
             "error": manifest_record.get("error", ""),
+        },
+        "scheduled_tasks": {
+            "source_env": scheduled_tasks_record.get("source_env", ""),
+            "raw_sha256": scheduled_tasks_record.get("raw_sha256", ""),
+            "job_count": scheduled_tasks_record.get("job_count", 0),
+            "skipped": scheduled_tasks_record.get("skipped", False),
+            "ignored_fields": scheduled_tasks_record.get("ignored_fields", []),
+            "error": scheduled_tasks_record.get("error", ""),
         },
         "redis_team": {
             "enabled": redis_team_record.get("enabled", False),

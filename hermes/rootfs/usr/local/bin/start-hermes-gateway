@@ -67,6 +67,52 @@ has_gateway_env_file() {
     [ -f "${env_file}" ] && grep -Eq '^(TELEGRAM_BOT_TOKEN|DISCORD_BOT_TOKEN|SLACK_BOT_TOKEN|WHATSAPP_ENABLED|SIGNAL_HTTP_URL|SIGNAL_ACCOUNT|MATTERMOST_TOKEN|MATRIX_ACCESS_TOKEN|MATRIX_PASSWORD|DINGTALK_CLIENT_ID|FEISHU_APP_ID|WECOM_BOT_ID|WECOM_CALLBACK_CORP_ID|WEIXIN_TOKEN|QQBOT_APP_ID|BLUEBUBBLES_SERVER_URL|YUANBAO_APP_ID|API_SERVER_ENABLED|WEBHOOK_ENABLED)=' "${env_file}"
 }
 
+has_scheduled_tasks_env() {
+    for name in \
+        CLAWMANAGER_HERMES_SCHEDULED_TASKS_JSON \
+        CLAWMANAGER_RUNTIME_SCHEDULED_TASKS_JSON \
+        CLAWMANAGER_OPENCLAW_SCHEDULED_TASKS_JSON
+    do
+        raw="${!name:-}"
+        if [ -z "${raw}" ]; then
+            continue
+        fi
+        # Non-empty managed payload includes at least one object in items[].
+        if printf '%s' "${raw}" | grep -Eq '"type"[[:space:]]*:[[:space:]]*"scheduled_task"'; then
+            return 0
+        fi
+        if printf '%s' "${raw}" | grep -Eq '"items"[[:space:]]*:[[:space:]]*\[[[:space:]]*\{'; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+is_hermes_pro_desktop() {
+    runtime="$(printf '%s' "${CLAWMANAGER_RUNTIME_TYPE:-}" | tr '[:upper:]' '[:lower:]')"
+    agent_rt="$(printf '%s' "${CLAWMANAGER_AGENT_RUNTIME_TYPE:-}" | tr '[:upper:]' '[:lower:]')"
+    case "${runtime}" in
+        desktop) return 0 ;;
+    esac
+    # Dedicated Pro containers set agent runtime to hermes without Runtime Pod tokens.
+    if [ "${agent_rt}" = "hermes" ] &&
+        [ -z "${RUNTIME_AGENT_CONTROL_TOKEN:-}" ] &&
+        [ -z "${RUNTIME_AGENT_REPORT_TOKEN:-}" ]; then
+        return 0
+    fi
+    return 1
+}
+
+ensure_default_gateway_profile() {
+    if hermes profile list 2>/dev/null | grep -Eq '(^|[[:space:]◆*])default([[:space:]]|$)'; then
+        return 0
+    fi
+    echo "Creating Hermes gateway profile 'default'"
+    if ! hermes profile create default --description "ClawManager default gateway profile" 2>/tmp/hermes-profile-create.log; then
+        echo "hermes profile create default failed (continuing): $(tr '\n' ' ' </tmp/hermes-profile-create.log 2>/dev/null || true)"
+    fi
+}
+
 should_start_gateway=false
 case "${gateway_mode}" in
     1|true|yes|y|on|enabled)
@@ -76,16 +122,19 @@ case "${gateway_mode}" in
         should_start_gateway=false
         ;;
     *)
-        if has_runtime_channel_env || has_redis_team_env || has_gateway_env_file; then
+        if has_runtime_channel_env || has_redis_team_env || has_gateway_env_file ||
+            has_scheduled_tasks_env || is_hermes_pro_desktop; then
             should_start_gateway=true
         fi
         ;;
 esac
 
 if [ "${should_start_gateway}" != "true" ]; then
-    echo "Hermes gateway disabled; no channel configuration detected"
+    echo "Hermes gateway disabled; no channel/scheduled-task/Pro configuration detected"
     exec sleep infinity
 fi
+
+ensure_default_gateway_profile || true
 
 if [ "$(id -u)" = "0" ]; then
     if id abc >/dev/null 2>&1; then
@@ -98,7 +147,9 @@ if [ "$(id -u)" = "0" ]; then
         fi
     fi
     if command -v s6-setuidgid >/dev/null 2>&1 && id abc >/dev/null 2>&1; then
-        exec s6-setuidgid abc /bin/bash -lc 'cd /config && exec hermes gateway'
+        # Must use `gateway run`; bare `hermes gateway` exits with a misleading
+        # "no such gateway 'default'" error even when the profile exists.
+        exec s6-setuidgid abc /bin/bash -lc 'cd /config && exec hermes gateway run --accept-hooks --no-supervise'
     fi
 fi
 

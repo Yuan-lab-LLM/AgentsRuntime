@@ -1,0 +1,38 @@
+# Local smoke: published OpenClaw Pro + rebuilt openclaw-agent + clawmanager-agent.
+#
+#   docker build -f openclaw/Dockerfile.pro-overlay.nosyntax \
+#     --build-arg BASE_IMAGE=ghcr.io/yuan-lab-llm/agentsruntime/openclaw:latest \
+#     -t openclaw:local .
+
+ARG BASE_IMAGE=ghcr.io/yuan-lab-llm/agentsruntime/openclaw:latest
+
+FROM --platform=$BUILDPLATFORM golang:1.26.1-alpine AS agent-builder
+
+ARG TARGETOS=linux
+ARG TARGETARCH
+ARG AGENT_VERSION=dev
+
+WORKDIR /src/clawmanager-agent
+COPY clawmanager-agent ./
+RUN go mod download
+RUN set -eux; \
+    arch="${TARGETARCH:-amd64}"; \
+    CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${arch}" \
+      go build -trimpath -ldflags="-s -w -X main.version=${AGENT_VERSION}" \
+      -o /out/clawmanager-agent ./cmd/clawmanager-agent
+
+WORKDIR /src/openclaw
+COPY openclaw/go.mod openclaw/go.sum ./
+RUN go mod download
+COPY openclaw/cmd ./cmd
+COPY openclaw/internal ./internal
+RUN set -eux; \
+    arch="${TARGETARCH:-amd64}"; \
+    CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${arch}" \
+      go build -trimpath -ldflags="-s -w" \
+      -o /out/openclaw-agent ./cmd/openclaw-agent
+
+FROM ${BASE_IMAGE}
+COPY --from=agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent
+COPY --from=agent-builder /out/openclaw-agent /usr/local/bin/openclaw-agent
+RUN chmod 755 /usr/local/bin/clawmanager-agent /usr/local/bin/openclaw-agent

@@ -91,6 +91,37 @@ func TestDockerfilePackagesCanonicalRedisTeamAdapter(t *testing.T) {
 	}
 }
 
+func TestDashboardGatewayScriptEnsuresBasicAuthBeforeBind(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("rootfs", "usr", "local", "bin", "start-hermes-dashboard-gateway"))
+	if err != nil {
+		t.Fatalf("read start-hermes-dashboard-gateway: %v", err)
+	}
+	script := string(data)
+	for _, want := range []string{
+		"ensure_dashboard_basic_auth",
+		"HERMES_DASHBOARD_BASIC_AUTH_USERNAME",
+		"HERMES_DASHBOARD_BASIC_AUTH_PASSWORD",
+		"CLAWMANAGER_DASHBOARD_BASIC_AUTH_PASSWORD",
+		"CLAWMANAGER_INSTANCE_ACCESS_TOKEN",
+		"CLAWMANAGER_INSTANCE_TOKEN",
+		"CLAWMANAGER_GATEWAY_TOKEN",
+		".clawmanager-dashboard-basic-auth",
+		`--host "${host}"`,
+		`--port "${port}"`,
+		"--no-open",
+		"--skip-build",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("start-hermes-dashboard-gateway missing %q", want)
+		}
+	}
+	if idx := strings.Index(script, "hermes dashboard"); idx < 0 {
+		t.Fatal("start-hermes-dashboard-gateway missing hermes dashboard launch")
+	} else if strings.Contains(script[idx:], "--insecure") {
+		t.Fatal("hermes dashboard launch must not pass --insecure; basic auth is required for non-loopback binds")
+	}
+}
+
 func TestDashboardGatewayScriptStartsClawManagerInstanceAgent(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join("rootfs", "usr", "local", "bin", "start-hermes-dashboard-gateway"))
 	if err != nil {
@@ -130,6 +161,51 @@ func TestApplyRuntimeConfigAliasesClawManagerProviderAsCustom(t *testing.T) {
 		if !strings.Contains(script, want) {
 			t.Fatalf("hermes-apply-runtime-config missing %q", want)
 		}
+	}
+}
+
+func TestApplyRuntimeConfigAppliesScheduledTasks(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("rootfs", "usr", "local", "bin", "hermes-apply-runtime-config"))
+	if err != nil {
+		t.Fatalf("read hermes-apply-runtime-config: %v", err)
+	}
+	script := string(data)
+	for _, want := range []string{
+		`"scheduled_tasks": (`,
+		`CLAWMANAGER_HERMES_SCHEDULED_TASKS_JSON`,
+		`def apply_scheduled_tasks(hermes_home):`,
+		`jobs_path = cron_dir / "jobs.json"`,
+		`scheduled_tasks_record = apply_scheduled_tasks(hermes_home)`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("hermes-apply-runtime-config missing %q", want)
+		}
+	}
+}
+
+func TestStartHermesGatewayEnsuresDefaultProfileAndProStart(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("rootfs", "usr", "local", "bin", "start-hermes-gateway"))
+	if err != nil {
+		t.Fatalf("read start-hermes-gateway: %v", err)
+	}
+	script := string(data)
+	for _, want := range []string{
+		"ensure_default_gateway_profile",
+		"hermes profile create default",
+		"has_scheduled_tasks_env",
+		"is_hermes_pro_desktop",
+		"CLAWMANAGER_HERMES_SCHEDULED_TASKS_JSON",
+		"hermes gateway run --accept-hooks --no-supervise",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("start-hermes-gateway missing %q", want)
+		}
+	}
+	if strings.Contains(script, "exec hermes gateway'") || strings.Contains(script, "exec hermes gateway\"") {
+		t.Fatal("start-hermes-gateway must not exec bare `hermes gateway` without run")
+	}
+	if strings.Contains(script, "&& exec hermes gateway\n") || strings.Contains(script, "&& exec hermes gateway'") {
+		t.Fatal("start-hermes-gateway must not exec bare `hermes gateway` without run")
 	}
 }
 

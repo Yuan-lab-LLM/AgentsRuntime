@@ -1,0 +1,33 @@
+# Local smoke: published Hermes Pro + clawmanager-agent + hermes-apply-runtime-config.
+#
+#   docker build -f hermes/Dockerfile.pro-overlay.nosyntax \
+#     --build-arg BASE_IMAGE=ghcr.io/yuan-lab-llm/agentsruntime/hermes:latest \
+#     -t hermes:local .
+
+ARG BASE_IMAGE=ghcr.io/yuan-lab-llm/agentsruntime/hermes:latest
+
+FROM --platform=$BUILDPLATFORM golang:1.26.1-alpine AS clawmanager-agent-builder
+
+WORKDIR /src/clawmanager-agent
+
+ARG TARGETOS=linux
+ARG TARGETARCH
+ARG AGENT_VERSION=dev
+
+COPY clawmanager-agent ./
+RUN go mod download
+
+RUN set -eux; \
+    arch="${TARGETARCH:-amd64}"; \
+    CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${arch}" \
+        go build -trimpath -ldflags="-s -w -X main.version=${AGENT_VERSION}" \
+        -o /out/clawmanager-agent ./cmd/clawmanager-agent
+
+FROM ${BASE_IMAGE}
+COPY --from=clawmanager-agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent
+COPY hermes/rootfs/usr/local/bin/hermes-apply-runtime-config /usr/local/bin/hermes-apply-runtime-config
+COPY hermes/rootfs/usr/local/bin/start-hermes-gateway /usr/local/bin/start-hermes-gateway
+RUN sed -i 's/\r$//' /usr/local/bin/hermes-apply-runtime-config /usr/local/bin/start-hermes-gateway \
+  && chmod 755 /usr/local/bin/clawmanager-agent \
+    /usr/local/bin/hermes-apply-runtime-config \
+    /usr/local/bin/start-hermes-gateway

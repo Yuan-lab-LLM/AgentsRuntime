@@ -1,0 +1,3 @@
+FROM ghcr.io/yuan-lab-llm/agentsruntime/hermes:v2026.6.12
+COPY clawmanager-agent/clawmanager-agent-linux /usr/local/bin/clawmanager-agent
+RUN chmod 755 /usr/local/bin/clawmanager-agent

@@ -112,6 +112,46 @@ prepare_managed_bundled_skills() {
     fi
 }
 
+# Newer Hermes ignores --insecure for non-loopback binds; require a dashboard
+# auth provider (basic auth) before binding HOST=0.0.0.0.
+ensure_dashboard_basic_auth() {
+    if [ -n "${HERMES_DASHBOARD_BASIC_AUTH_USERNAME:-}" ] && {
+        [ -n "${HERMES_DASHBOARD_BASIC_AUTH_PASSWORD:-}" ] ||
+            [ -n "${HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH:-}" ]
+    }; then
+        return 0
+    fi
+
+    export HERMES_DASHBOARD_BASIC_AUTH_USERNAME="${HERMES_DASHBOARD_BASIC_AUTH_USERNAME:-clawmanager}"
+
+    if [ -z "${HERMES_DASHBOARD_BASIC_AUTH_PASSWORD:-}" ] && [ -z "${HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH:-}" ]; then
+        if [ -n "${CLAWMANAGER_DASHBOARD_BASIC_AUTH_PASSWORD:-}" ]; then
+            export HERMES_DASHBOARD_BASIC_AUTH_PASSWORD="${CLAWMANAGER_DASHBOARD_BASIC_AUTH_PASSWORD}"
+        elif [ -n "${CLAWMANAGER_INSTANCE_ACCESS_TOKEN:-}" ]; then
+            export HERMES_DASHBOARD_BASIC_AUTH_PASSWORD="${CLAWMANAGER_INSTANCE_ACCESS_TOKEN}"
+        elif [ -n "${CLAWMANAGER_INSTANCE_TOKEN:-}" ]; then
+            # ClawManager BuildGatewayEnv currently ships this key for AccessToken.
+            export HERMES_DASHBOARD_BASIC_AUTH_PASSWORD="${CLAWMANAGER_INSTANCE_TOKEN}"
+        elif [ -n "${CLAWMANAGER_GATEWAY_TOKEN:-}" ]; then
+            export HERMES_DASHBOARD_BASIC_AUTH_PASSWORD="${CLAWMANAGER_GATEWAY_TOKEN}"
+        else
+            auth_file="${HERMES_HOME}/.clawmanager-dashboard-basic-auth"
+            if [ -f "${auth_file}" ]; then
+                export HERMES_DASHBOARD_BASIC_AUTH_PASSWORD="$(tr -d '\r\n' <"${auth_file}")"
+            else
+                if command -v openssl >/dev/null 2>&1; then
+                    generated_password="$(openssl rand -hex 16)"
+                else
+                    generated_password="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+                fi
+                umask 077
+                printf '%s' "${generated_password}" >"${auth_file}"
+                export HERMES_DASHBOARD_BASIC_AUTH_PASSWORD="${generated_password}"
+            fi
+        fi
+    fi
+}
+
 should_start_team_gateway() {
     truthy "${CLAWMANAGER_TEAM_ENABLED:-}" || return 1
     falsey "${CLAWMANAGER_TEAM_AUTORUN:-true}" && return 1
@@ -237,12 +277,12 @@ if should_start_team_gateway; then
 fi
 
 prepare_managed_bundled_skills "${HERMES_HOME}"
+ensure_dashboard_basic_auth
 echo "Starting Hermes dashboard gateway: dashboard_port=${port} host=${host}"
 hermes dashboard \
     --host "${host}" \
     --port "${port}" \
     --no-open \
-    --insecure \
     --skip-build &
 dashboard_pid="$!"
 echo "Hermes dashboard gateway started: dashboard_pid=${dashboard_pid} dashboard_port=${port}"

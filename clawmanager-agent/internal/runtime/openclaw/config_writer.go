@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -11,10 +12,12 @@ import (
 	"strings"
 
 	"github.com/iamlovingit/clawmanager-agent/internal/gateway"
+	"github.com/iamlovingit/clawmanager-agent/internal/scheduledtasks"
 )
 
 const openClawTrustedProxyUserHeader = "x-forwarded-prefix"
 const openClawTrustedProxyRequiredHeader = "x-forwarded-proto"
+const openClawTrustedProxyDefaultPassword = "9fb3edf4bf38bb834227d41fe9cc1196"
 const openClawAutoProviderName = "auto"
 const openClawRedisTeamPluginID = "redis-team"
 const openClawRedisTeamPluginDirEnv = "CLAWMANAGER_OPENCLAW_REDIS_TEAM_PLUGIN_DIR"
@@ -117,6 +120,9 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 	} else {
 		auth["mode"] = "trusted-proxy"
 		delete(auth, "token")
+		if strings.TrimSpace(configStringValue(auth["password"])) == "" {
+			auth["password"] = openClawTrustedProxyDefaultPassword
+		}
 		trustedProxy := ensureObject(auth, "trustedProxy")
 		trustedProxy["userHeader"] = openClawTrustedProxyUserHeader
 		trustedProxy["requiredHeaders"] = []string{openClawTrustedProxyRequiredHeader}
@@ -160,6 +166,33 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 		if err := gateway.PrepareLiteTeamSharedWorkspace(cfg.WorkspaceRoot, req, workspacePath); err != nil {
 			return err
 		}
+	}
+	openclawHome := filepath.Join(workspacePath, "home", ".openclaw")
+	result := scheduledtasks.ApplyOpenClawFromEnv(openclawHome, func(key string) string {
+		if req.Environment != nil {
+			if value, ok := req.Environment[key]; ok {
+				return value
+			}
+		}
+		if req.Env != nil {
+			if value, ok := req.Env[key]; ok {
+				return value
+			}
+		}
+		return os.Getenv(key)
+	}, req.UID, req.GID)
+	if result.Error != "" {
+		log.Printf("apply openclaw scheduled tasks failed (continuing): source_env=%s error=%s", result.SourceEnv, result.Error)
+	}
+	// Apply writes jobs.json as the agent user (often root). Gateway runs as
+	// instance UID, so chown the whole cron tree — not only the directory inode.
+	cronDir := filepath.Join(openclawHome, "cron")
+	if _, err := os.Stat(cronDir); err == nil {
+		if err := chownTree(cronDir, req.UID, req.GID); err != nil {
+			return fmt.Errorf("chown openclaw cron tree: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat openclaw cron dir: %w", err)
 	}
 	return nil
 }

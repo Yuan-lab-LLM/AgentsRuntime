@@ -76,6 +76,9 @@ func TestWriteOpenClawGatewayConfigMergesControlUIWithoutOverwritingExistingConf
 	if _, ok := auth["token"]; ok {
 		t.Fatalf("gateway.auth.token was preserved in trusted-proxy mode")
 	}
+	if auth["password"] != "9fb3edf4bf38bb834227d41fe9cc1196" {
+		t.Fatalf("gateway.auth.password = %#v, want managed trusted-proxy password", auth["password"])
+	}
 	trustedProxy := objectAt(t, auth, "trustedProxy")
 	if trustedProxy["userHeader"] != "x-forwarded-prefix" {
 		t.Fatalf("gateway.auth.trustedProxy.userHeader = %#v, want x-forwarded-prefix", trustedProxy["userHeader"])
@@ -220,6 +223,27 @@ func TestWriteOpenClawGatewayConfigCompletesPartialBrowserConfig(t *testing.T) {
 	openclawProfile := objectAt(t, objectAt(t, browser, "profiles"), "openclaw")
 	if openclawProfile["cdpPort"] != float64(20004) {
 		t.Fatalf("browser.profiles.openclaw.cdpPort = %#v, want 20004", openclawProfile["cdpPort"])
+	}
+}
+
+func TestWriteOpenClawGatewayConfigPreservesExplicitTrustedProxyPassword(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "openclaw", "user-45", "instance-651")
+	configPath := filepath.Join(workspace, "home", ".openclaw", "openclaw.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"gateway":{"auth":{"password":"custom-password"}}}`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	req := CreateGatewayRequest{InstanceID: 651, UserID: 45, UID: 200651, GID: 200651}
+	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace, 20003); err != nil {
+		t.Fatalf("WriteGatewayConfig() error = %v", err)
+	}
+
+	auth := objectAt(t, objectAt(t, readOpenClawConfigForTest(t, configPath), "gateway"), "auth")
+	if auth["password"] != "custom-password" {
+		t.Fatalf("gateway.auth.password = %#v, want explicit password preserved", auth["password"])
 	}
 }
 

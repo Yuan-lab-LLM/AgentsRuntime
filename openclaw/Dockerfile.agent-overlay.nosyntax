@@ -13,7 +13,7 @@
 
 ARG BASE_IMAGE=ghcr.io/yuan-lab-llm/agentsruntime/openclaw-lite:latest
 
-FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS clawmanager-agent-builder
+FROM --platform=$BUILDPLATFORM golang:1.26.1-alpine AS clawmanager-agent-builder
 
 WORKDIR /src/clawmanager-agent
 
