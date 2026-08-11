@@ -13,6 +13,7 @@ import re
 import ssl
 import stat
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -38,6 +39,8 @@ PROTOCOL_CAPABILITIES = [
     "completion_ack_v1",
     "explicit_completion_receipt_v1",
     "turn_end_monitor_v1",
+    "turn_outcome_v1",
+    "immediate_recheck_v1",
     "assignment_lifecycle_v1",
     "assignment_heartbeat_v1",
     "durable_turn_facts_v1",
@@ -315,6 +318,10 @@ def root_workflow_state_key(settings: RedisTeamSettings, root_task_id: str) -> s
     return f"{_key_prefix(settings)}:root:{_redis_key_part(root_task_id)}:state"
 
 
+def assignment_dispatch_state_key(settings: RedisTeamSettings, root_task_id: str) -> str:
+    return f"{_key_prefix(settings)}:root:{_redis_key_part(root_task_id)}:assignment-dispatch"
+
+
 def event_for(settings: RedisTeamSettings, event: str, extra: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     payload = {
         "v": WIRE_SCHEMA_VERSION,
@@ -351,6 +358,123 @@ def _load_active_envelope(settings: RedisTeamSettings) -> dict[str, Any]:
 
 def _persist_active_envelope(settings: RedisTeamSettings, envelope: dict[str, Any]) -> None:
     _atomic_write_json(_active_envelope_path(settings), envelope)
+
+
+def _turn_observation_path(settings: RedisTeamSettings) -> Path:
+    return settings.shared_path / ".hermes-redis-team" / f"turn-{_safe_name(settings.member_id)}.json"
+
+
+def _begin_turn_observation(settings: RedisTeamSettings, envelope: dict[str, Any], *, context_only: bool) -> None:
+    try:
+        _atomic_write_json(_turn_observation_path(settings), {
+            "messageId": _trim(envelope.get("messageId")),
+            "rootTaskId": _trim(envelope.get("rootTaskId") or envelope.get("taskId")),
+            "assignmentId": _trim(envelope.get("assignmentId") or envelope.get("workId")),
+            "revision": max(1, int(envelope.get("revision") or 1)),
+            "contextOnly": context_only,
+            "startedAt": _now_iso(),
+            "lastTool": None,
+        })
+    except Exception as exc:
+        logger.warning("Redis Team: turn observation start skipped: %s", exc)
+
+
+def _record_turn_tool_result(settings: RedisTeamSettings, tool_name: str, result: dict[str, Any]) -> None:
+    try:
+        observation = _read_json(_turn_observation_path(settings)) or {}
+        if not isinstance(observation, dict) or not _trim(observation.get("messageId")):
+            return
+        failed = result.get("ok") is False or result.get("success") is False or bool(result.get("error"))
+        observation["lastTool"] = {
+            "toolName": tool_name,
+            "failed": failed,
+            "retryable": result.get("retryable") is True,
+            "succeeded": not failed,
+            "error": _trim(result.get("error") or result.get("message")) or None,
+            "code": _trim(result.get("code")) or None,
+            "candidates": result.get("candidates") if isinstance(result.get("candidates"), list) else None,
+            "observedAt": _now_iso(),
+        }
+        _atomic_write_json(_turn_observation_path(settings), observation)
+    except Exception as exc:
+        logger.warning("Redis Team: turn tool observation skipped: %s", exc)
+
+
+def _team_tool_json_result(settings: RedisTeamSettings, tool_name: str, result: dict[str, Any]) -> str:
+    _record_turn_tool_result(settings, tool_name, result)
+    return json.dumps(result, ensure_ascii=False)
+
+
+def _finish_turn_observation(settings: RedisTeamSettings, message_id: str) -> dict[str, Any]:
+    path = _turn_observation_path(settings)
+    try:
+        observation = _read_json(path) or {}
+    except Exception as exc:
+        logger.warning("Redis Team: turn observation read skipped: %s", exc)
+        return {}
+    if not isinstance(observation, dict) or _trim(observation.get("messageId")) != _trim(message_id):
+        return {}
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return observation
+
+
+def _context_turn_outcome_policy(envelope: dict[str, Any]) -> dict[str, Any]:
+    configured = envelope.get("turnOutcomePolicy") or envelope.get("turn_outcome_policy")
+    if isinstance(configured, dict):
+        return {
+            "actionExpected": _truthy(configured.get("actionExpected", configured.get("action_expected")), False),
+            "immediateRecoveryAllowed": _truthy(configured.get("immediateRecoveryAllowed", configured.get("immediate_recovery_allowed")), False),
+            "reason": _trim(configured.get("reason")) or "control_plane_policy",
+        }
+    metadata = envelope.get("metadata") if isinstance(envelope.get("metadata"), dict) else {}
+    intent = _trim(envelope.get("intent") or metadata.get("intent") or metadata.get("monitorType")).lower()
+    if intent in {"member_result_confirmed", "leader_synthesis_reminder", "leader_workflow_decision", "leader_decision_reminder"}:
+        return {"actionExpected": True, "immediateRecoveryAllowed": True, "reason": "legacy_workflow_notification"}
+    if intent in {"root_coordination_recovery", "root_assignment_recovery", "assignment_recovery_reminder", "target_resolution_review"}:
+        return {"actionExpected": True, "immediateRecoveryAllowed": False, "reason": "recovery_turn"}
+    return {"actionExpected": False, "immediateRecoveryAllowed": False, "reason": "ordinary_context"}
+
+
+def _observe_team_turn_outcome(envelope: dict[str, Any], active: dict[str, Any], turn: dict[str, Any]) -> dict[str, Any]:
+    context_only = not _truthy(envelope.get("requiresCompletion"), True)
+    policy = _context_turn_outcome_policy(envelope) if context_only else {
+        "actionExpected": True,
+        "immediateRecoveryAllowed": True,
+        "reason": "formal_assignment",
+    }
+    last_tool = turn.get("lastTool") if isinstance(turn.get("lastTool"), dict) else {}
+    completion_observed = bool(active.get("terminal") or active.get("explicitCompletionSubmitted"))
+    conflicts: list[str] = []
+    if completion_observed and last_tool.get("failed") is True and last_tool.get("retryable") is True:
+        conflicts.append("completion_and_retryable_tool_gap")
+    if conflicts:
+        outcome = "runtime_observation_unknown"
+    elif completion_observed:
+        outcome = "completed"
+    elif last_tool.get("toolName") == "team_send" and last_tool.get("succeeded") is True:
+        outcome = "legitimate_wait"
+    elif last_tool.get("failed") is True and last_tool.get("retryable") is True:
+        outcome = "retryable_tool_gap"
+    elif policy["actionExpected"]:
+        outcome = "completion_receipt_gap"
+    else:
+        outcome = "ordinary_open_turn"
+    return {
+        "outcome": outcome,
+        "contextOnly": context_only,
+        "actionExpected": policy["actionExpected"],
+        "immediateRecoveryEligible": bool(
+            policy["immediateRecoveryAllowed"]
+            and outcome in {"retryable_tool_gap", "completion_receipt_gap"}
+        ),
+        "policyReason": policy["reason"],
+        "evidenceConflict": bool(conflicts),
+        "evidenceConflicts": conflicts,
+        "lastTool": last_tool,
+    }
 
 
 def _envelope_value(settings: RedisTeamSettings, args: dict[str, Any], *keys: str) -> str:
@@ -992,6 +1116,102 @@ def read_team_statuses(settings: RedisTeamSettings, member_id: str = "") -> Any:
     return statuses
 
 
+def _team_roster_members(settings: RedisTeamSettings) -> list[dict[str, Any]]:
+    raw = _read_json(settings.shared_path / "team.json") or {}
+    candidates = raw.get("members")
+    if not isinstance(candidates, list) and isinstance(raw.get("team"), dict):
+        candidates = raw["team"].get("members")
+    if not isinstance(candidates, list):
+        return []
+    members: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        member_id = _trim(
+            candidate.get("memberId") or candidate.get("memberID")
+            or candidate.get("memberKey") or candidate.get("id") or candidate.get("key")
+        )
+        if not member_id:
+            continue
+        aliases = {member_id, _safe_name(member_id)}
+        for value in (candidate.get("displayName"), candidate.get("name")):
+            text = _trim(value)
+            if text:
+                aliases.update({text, _safe_name(text)})
+        members.append({"memberId": member_id, "aliases": sorted(aliases)})
+    return members
+
+
+def _comparable_roster_identity(value: Any) -> str:
+    return unicodedata.normalize("NFKC", _trim(value)).casefold()
+
+
+def _roster_identity_fragments(value: Any) -> set[str]:
+    comparable = _comparable_roster_identity(value)
+    if not comparable:
+        return set()
+    return {comparable, *[part for part in re.split(r"[^\w]+", comparable, flags=re.UNICODE) if part]}
+
+
+def _bounded_roster_alias_match(value: str, alias: str) -> bool:
+    if not value or not alias:
+        return False
+    if value == alias:
+        return True
+    return re.search(r"(?<!\w)" + re.escape(alias) + r"(?!\w)", value, flags=re.UNICODE) is not None
+
+
+def _roster_edit_distance(left: str, right: str) -> int:
+    previous = list(range(len(right) + 1))
+    for index, left_char in enumerate(left, start=1):
+        current = [index]
+        for offset, right_char in enumerate(right, start=1):
+            current.append(min(
+                current[-1] + 1,
+                previous[offset] + 1,
+                previous[offset - 1] + (0 if left_char == right_char else 1),
+            ))
+        previous = current
+    return previous[-1]
+
+
+def _resolve_roster_target(settings: RedisTeamSettings, value: Any) -> dict[str, Any]:
+    original = _trim(value)
+    comparable = _comparable_roster_identity(original)
+    fragments = _roster_identity_fragments(original)
+    members = _team_roster_members(settings)
+    if not comparable or not members:
+        return {"memberId": original if comparable and not members else "", "kind": "roster_unavailable", "candidates": [], "suggestions": []}
+    matches: list[dict[str, Any]] = []
+    for member in members:
+        aliases = {_comparable_roster_identity(alias) for alias in member["aliases"] if _trim(alias)}
+        matched = sorted(alias for alias in aliases if alias in fragments or _bounded_roster_alias_match(comparable, alias))
+        if matched:
+            matches.append({"member": member, "aliases": matched})
+    if len(matches) == 1:
+        return {
+            "memberId": matches[0]["member"]["memberId"],
+            "kind": "exact_roster_alias" if comparable in matches[0]["aliases"] else "unique_roster_information",
+            "candidates": [matches[0]["member"]["memberId"]],
+            "suggestions": [],
+        }
+    if len(matches) > 1:
+        return {"memberId": "", "kind": "ambiguous_roster_information", "candidates": [match["member"]["memberId"] for match in matches], "suggestions": []}
+    scored: list[tuple[int, str]] = []
+    for member in members:
+        distances = [
+            _roster_edit_distance(fragment, _comparable_roster_identity(alias))
+            for fragment in fragments
+            for alias in member["aliases"]
+            if len(fragment) >= 3 and len(_comparable_roster_identity(alias)) >= 3
+        ]
+        if distances and min(distances) <= 2:
+            scored.append((min(distances), member["memberId"]))
+    best = min((score for score, _ in scored), default=None)
+    suggestions = [member_id for score, member_id in scored if score == best] if best is not None else []
+    return {"memberId": "", "kind": "suggestion_only" if suggestions else "unresolved", "candidates": [], "suggestions": suggestions}
+
+
 def write_task_result(
     settings: RedisTeamSettings,
     task_id: str,
@@ -1088,6 +1308,18 @@ def normalize_envelope(raw: Any) -> Optional[dict[str, Any]]:
         "sessionKey": raw.get("sessionKey") or raw.get("approvalSessionKey") or "",
         "approval": raw.get("approval") if isinstance(raw.get("approval"), dict) else {},
         "requiresCompletion": raw.get("requiresCompletion", raw.get("requires_completion", True)),
+        "turnOutcomePolicy": (
+            raw.get("turnOutcomePolicy")
+            or raw.get("turn_outcome_policy")
+            or (raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}).get("turnOutcomePolicy")
+            or {}
+        ),
+        "businessDeliveryKind": raw.get("businessDeliveryKind") or raw.get("business_delivery_kind"),
+        "businessDeliveryReason": raw.get("businessDeliveryReason") or raw.get("business_delivery_reason"),
+        "deliverySemanticsVersion": raw.get("deliverySemanticsVersion") or raw.get("delivery_semantics_version"),
+        "businessMutation": raw.get("businessMutation", raw.get("business_mutation")),
+        "revisionAuthorized": raw.get("revisionAuthorized", raw.get("revision_authorized")),
+        "nonAuthoritative": raw.get("nonAuthoritative", raw.get("non_authoritative")),
         "responseLocale": raw.get("responseLocale") or raw.get("response_locale") or "zh-CN",
         "sharedWorkspace": raw.get("sharedWorkspace") if isinstance(raw.get("sharedWorkspace"), dict) else {},
         "idempotencyKey": raw.get("idempotencyKey") or message_id,
@@ -1107,9 +1339,21 @@ def _is_context_only_envelope(envelope: dict[str, Any]) -> bool:
         return False
     if not _truthy(envelope.get("requiresCompletion"), True):
         return True
+    delivery_kind = _trim(
+        envelope.get("businessDeliveryKind")
+        or envelope.get("business_delivery_kind")
+        or envelope.get("deliveryKind")
+        or envelope.get("delivery_kind")
+    ).lower()
+    if delivery_kind in {"context", "peer_request", "notification", "monitor", "ambiguous"}:
+        return True
     metadata = envelope.get("metadata") if isinstance(envelope.get("metadata"), dict) else {}
     intent = _trim(envelope.get("intent") or metadata.get("intent") or envelope.get("type")).lower()
-    return intent in {"member_result_confirmed", "context", "notification"}
+    return intent in {
+        "member_result_confirmed", "context", "context_update", "notification",
+        "peer_request", "question", "reminder", "follow_up",
+        "assignment_status_check", "assignment_recovery_request", "leader_synthesis_reminder",
+    }
 
 
 def _is_formal_assignment(envelope: dict[str, Any]) -> bool:
@@ -1153,6 +1397,59 @@ async def _root_task_is_terminal(
         # Keep the Runtime compatible and rely on the control-plane terminal
         # barrier rather than turning a transient read failure into task loss.
         return False
+
+
+async def _read_root_workflow_state(
+    redis: "AsyncRedisClient",
+    settings: RedisTeamSettings,
+    root_task_id: str,
+) -> dict[str, Any]:
+    if not root_task_id:
+        return {}
+    try:
+        raw = await redis.command("GET", root_workflow_state_key(settings, root_task_id))
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        value = json.loads(raw) if isinstance(raw, str) and raw else raw
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
+async def _recent_target_assignment_dispatch(
+    redis: "AsyncRedisClient",
+    settings: RedisTeamSettings,
+    root_task_id: str,
+    target_member_id: str,
+) -> dict[str, Any]:
+    try:
+        entries = await redis.command("HGETALL", assignment_dispatch_state_key(settings, root_task_id))
+    except Exception:
+        return {}
+    if not isinstance(entries, list):
+        return {}
+    latest: dict[str, Any] = {}
+    latest_timestamp = 0.0
+    for index in range(0, len(entries) - 1, 2):
+        try:
+            value = json.loads(str(entries[index + 1]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(value, dict) or _trim(value.get("to")) != _trim(target_member_id):
+            continue
+        if _trim(value.get("rootTaskId")) != _trim(root_task_id):
+            continue
+        if _trim(value.get("status")).lower() not in {"dispatched", "waiting_dependencies"}:
+            continue
+        try:
+            created_at = datetime.fromisoformat(_trim(value.get("createdAt")).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+        if time.time() - created_at > 120 or created_at <= latest_timestamp:
+            continue
+        latest = value
+        latest_timestamp = created_at
+    return latest
 
 
 def _is_monitor_envelope(envelope: dict[str, Any]) -> bool:
@@ -1656,16 +1953,178 @@ async def _publish_event(settings: RedisTeamSettings, event: str, payload: dict[
         redis.close()
 
 
+def _normalized_send_intent(value: Any) -> str:
+    return re.sub(r"[\s-]+", "_", _trim(value).lower())
+
+
+def _send_intent_is_context(value: Any) -> bool:
+    return _normalized_send_intent(value) in {
+        "context", "context_update", "peer_request", "question", "reminder",
+        "follow_up", "status_check", "assignment_status_check", "notification", "ack",
+    }
+
+
+def _stable_hermes_assignment_id(settings: RedisTeamSettings, root_task_id: str, target: str, title: str, text: str) -> str:
+    digest = hashlib.sha256(
+        "\n".join([settings.team_id, settings.member_id, root_task_id, target, title, text]).encode("utf-8")
+    ).hexdigest()[:12]
+    return f"assignment-{_safe_name(target)}-{digest}"
+
+
+def _hermes_business_delivery_from_ledger(
+    settings: RedisTeamSettings,
+    message: dict[str, Any],
+    workflow_state: dict[str, Any],
+    *,
+    explicit_assignment_id: bool,
+    recent_target_dispatch: Optional[dict[str, Any]] = None,
+    target_status: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    intent = _normalized_send_intent(message.get("intent"))
+    if "leader" in _trim(message.get("to")).lower():
+        return {"kind": "context", "reason": "message_to_leader", "revision": 1, "authorized": False}
+    if _send_intent_is_context(intent):
+        return {"kind": "peer_request" if intent == "peer_request" else "context", "reason": "explicit_context_intent", "revision": 1, "authorized": False}
+    assignments_value = workflow_state.get("assignments")
+    assignments = list(assignments_value.values()) if isinstance(assignments_value, dict) else []
+    assignments = [entry for entry in assignments if isinstance(entry, dict)]
+    existing = assignments_value.get(message.get("assignmentId")) if isinstance(assignments_value, dict) else None
+    target_assignments = [
+        entry for entry in assignments
+        if _trim(entry.get("ownerMemberKey")) == _trim(message.get("to"))
+    ]
+    target_assignments.sort(
+        key=lambda entry: (int(entry.get("revision") or 1), _trim(entry.get("updatedAt"))),
+        reverse=True,
+    )
+    latest = target_assignments[0] if target_assignments else None
+    if isinstance(existing, dict):
+        revision = max(1, int(existing.get("revision") or 1))
+        assignment_id = _trim(existing.get("assignmentId") or existing.get("workId"))
+        owner = _trim(existing.get("ownerMemberKey"))
+        if owner and owner != _trim(message.get("to")):
+            return {"kind": "ambiguous", "reason": "assignment_owner_conflict", "revision": revision, "authorized": False}
+        status = _trim(existing.get("status")).lower()
+        if status in {"pending", "dispatched", "running"}:
+            return {"kind": "context", "reason": "existing_attempt_active", "assignmentId": assignment_id, "revision": revision, "authorized": False}
+        runtime_status = _trim((target_status or {}).get("runtimeStatus")).lower()
+        availability = _trim((target_status or {}).get("availability")).lower()
+        status_assignment = _trim((target_status or {}).get("currentAssignmentId") or (target_status or {}).get("assignmentId") or (target_status or {}).get("workId"))
+        status_revision = max(1, int((target_status or {}).get("currentRevision") or 1))
+        last_seen = _trim((target_status or {}).get("lastSeenAt"))
+        try:
+            last_seen_at = datetime.fromisoformat(last_seen.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            last_seen_at = 0.0
+        runtime_active = (
+            (runtime_status in {"running", "busy", "completion_pending", "recovering"} or availability == "busy")
+            and last_seen_at > 0
+            and time.time() - last_seen_at <= 120
+            and status_assignment == assignment_id
+            and status_revision == revision
+        )
+        if runtime_active:
+            return {"kind": "context", "reason": "runtime_attempt_still_active", "assignmentId": assignment_id, "revision": revision, "authorized": False}
+        if existing.get("nextRevisionAllowed") is True and int(existing.get("nextRevision") or 0) == revision + 1:
+            return {"kind": "assignment", "reason": "ledger_authorized_recovery", "assignmentId": assignment_id, "revision": revision + 1, "authorized": True}
+        return {"kind": "ambiguous", "reason": "terminal_attempt_follow_up", "assignmentId": assignment_id, "revision": revision, "authorized": False}
+    if not explicit_assignment_id and isinstance(latest, dict):
+        revision = max(1, int(latest.get("revision") or 1))
+        assignment_id = _trim(latest.get("assignmentId") or latest.get("workId"))
+        return {"kind": "ambiguous", "reason": "target_has_existing_assignment", "assignmentId": assignment_id, "revision": revision, "authorized": False}
+    if not explicit_assignment_id and isinstance(recent_target_dispatch, dict) and recent_target_dispatch:
+        return {
+            "kind": "ambiguous",
+            "reason": "target_has_recent_unprojected_assignment",
+            "assignmentId": _trim(recent_target_dispatch.get("assignmentId") or recent_target_dispatch.get("workId")),
+            "revision": max(1, int(recent_target_dispatch.get("revision") or 1)),
+            "authorized": False,
+        }
+    sender_is_leader = "leader" in settings.role.lower() or "leader" in settings.member_id.lower()
+    if not sender_is_leader and not explicit_assignment_id:
+        return {"kind": "peer_request", "reason": "member_message_without_assignment_contract", "revision": 1, "authorized": False}
+    return {"kind": "assignment", "reason": "new_assignment_contract", "assignmentId": message.get("assignmentId"), "revision": 1, "authorized": True}
+
+
 async def _tool_team_send(args: dict[str, Any], **_kwargs) -> str:
     settings = load_settings(None)
     if not settings.valid:
-        return json.dumps({"error": "Redis Team env is incomplete"}, ensure_ascii=False)
-    to = _trim(args.get("to"))
+        return _team_tool_json_result(settings, "team_send", {"ok": False, "retryable": True, "error": "Redis Team env is incomplete"})
+    target_values = {
+        _trim(args.get(key))
+        for key in ("to", "recipient", "targetMemberId", "target_member_id")
+        if _trim(args.get(key))
+    }
     text = _trim(args.get("text") or args.get("prompt"))
-    if not to or not text:
-        return json.dumps({"error": "to and text are required"}, ensure_ascii=False)
+    if len(target_values) > 1:
+        return _team_tool_json_result(settings, "team_send", {
+            "ok": False,
+            "retryable": True,
+            "clarificationRequired": True,
+            "error": "Conflicting Team recipient fields; confirm one current roster member.",
+            "candidates": sorted(target_values),
+        })
+    raw_to = next(iter(target_values), "")
+    if not raw_to or not text:
+        return _team_tool_json_result(settings, "team_send", {
+            "ok": False,
+            "retryable": True,
+            "error": "A recipient and text are required",
+        })
+    target_resolution = _resolve_roster_target(settings, raw_to)
+    to = _trim(target_resolution.get("memberId"))
+    if not to:
+        active = _load_active_envelope(settings)
+        warning = {
+            "eventKind": "target_resolution_warning",
+            "failureDomain": "transport",
+            "failureKind": "target_resolution",
+            "retryable": True,
+            "nonAuthoritative": True,
+            "stateEffect": "none",
+            "rootTaskTerminal": False,
+            "clarificationRequired": True,
+            "status": "attention_required",
+            "runtimeStatus": "running",
+            "availability": "busy",
+            "taskId": _trim(active.get("taskId") or active.get("rootTaskId")),
+            "rootTaskId": _trim(active.get("rootTaskId") or active.get("taskId")),
+            "rootMessageId": _trim(active.get("rootMessageId") or active.get("messageId")),
+            "assignmentId": _trim(active.get("assignmentId") or active.get("workId")),
+            "workId": _trim(active.get("workId") or active.get("assignmentId")),
+            "revision": max(1, int(active.get("revision") or 1)),
+            "from": settings.member_id,
+            "to": raw_to,
+            "targetCandidates": target_resolution.get("candidates") or [],
+            "targetSuggestions": target_resolution.get("suggestions") or [],
+            "summary": "Redis Team recipient could not be uniquely resolved from the current roster.",
+        }
+        await _publish_event(settings, "message_warning", warning)
+        return _team_tool_json_result(settings, "team_send", {
+            "ok": False,
+            "sent": False,
+            "messageDelivered": False,
+            "retryable": True,
+            "nonAuthoritative": True,
+            "clarificationRequired": True,
+            "candidates": target_resolution.get("candidates") or [],
+            "suggestions": target_resolution.get("suggestions") or [],
+            "error": "Recipient is ambiguous or unknown; confirm one current roster member.",
+        })
     active = _load_active_envelope(settings)
     task_id = _trim(args.get("taskId")) or _trim(active.get("taskId") or active.get("rootTaskId"))
+    root_task_id = _trim(active.get("rootTaskId") or task_id)
+    intent = _normalized_send_intent(args.get("intent") or "send")
+    explicit_assignment_id = _trim(args.get("assignmentId") or args.get("workId"))
+    title = _trim(args.get("title")) or "Team Message"
+    trusted_recovery_assignment_id = ""
+    if (
+        not explicit_assignment_id
+        and _normalized_send_intent(active.get("intent")) == "assignment_recovery_request"
+        and _trim(active.get("from")).lower() == "clawmanager"
+    ):
+        trusted_recovery_assignment_id = _trim(active.get("assignmentId") or active.get("workId"))
+    assignment_id = explicit_assignment_id or trusted_recovery_assignment_id or _stable_hermes_assignment_id(settings, root_task_id, to, title, text)
     message = {
         "v": WIRE_SCHEMA_VERSION,
         "protocolVersion": PROTOCOL_VERSION,
@@ -1673,14 +2132,14 @@ async def _tool_team_send(args: dict[str, Any], **_kwargs) -> str:
         "teamId": settings.team_id,
         "from": settings.member_id,
         "to": to,
-        "intent": _trim(args.get("intent")) or "send",
+        "intent": intent or "send",
         "taskId": task_id,
-        "rootTaskId": _trim(active.get("rootTaskId") or task_id),
+        "rootTaskId": root_task_id,
         "rootMessageId": _trim(active.get("rootMessageId")),
-        "workId": _trim(args.get("workId")) or _trim(active.get("assignmentId") or active.get("workId")),
-        "assignmentId": _trim(args.get("assignmentId")) or _trim(active.get("assignmentId") or active.get("workId")),
+        "workId": assignment_id,
+        "assignmentId": assignment_id,
         "phaseId": _trim(args.get("phaseId")) or _trim(active.get("phaseId")),
-        "revision": int(args.get("revision") or active.get("revision") or 1),
+        "revision": 1,
         "required": _truthy(args.get("required"), True),
         "reviewRequired": _truthy(args.get("reviewRequired") or args.get("review_required"), False),
         "validationRequired": _truthy(args.get("validationRequired") or args.get("validation_required"), False),
@@ -1699,7 +2158,7 @@ async def _tool_team_send(args: dict[str, Any], **_kwargs) -> str:
             for value in (args.get("dependsOn") if isinstance(args.get("dependsOn"), list) else [])
             if _trim(value)
         ],
-        "title": _trim(args.get("title")) or "Team Message",
+        "title": title,
         "text": text,
         "contextRefs": args.get("contextRefs") if isinstance(args.get("contextRefs"), list) else [],
         "ttlSeconds": args.get("ttlSeconds") if isinstance(args.get("ttlSeconds"), int) else 3600,
@@ -1710,22 +2169,82 @@ async def _tool_team_send(args: dict[str, Any], **_kwargs) -> str:
     redis = AsyncRedisClient(settings.redis_url)
     try:
         await redis.connect()
+        workflow_state = await _read_root_workflow_state(redis, settings, root_task_id)
+        recent_target_dispatch = {}
+        if not explicit_assignment_id and not trusted_recovery_assignment_id:
+            recent_target_dispatch = await _recent_target_assignment_dispatch(
+                redis, settings, root_task_id, to
+            )
+        decision = _hermes_business_delivery_from_ledger(
+            settings,
+            message,
+            workflow_state,
+            explicit_assignment_id=bool(explicit_assignment_id or trusted_recovery_assignment_id),
+            recent_target_dispatch=recent_target_dispatch,
+            target_status=read_team_statuses(settings, to) or {},
+        )
+        if _trim(decision.get("assignmentId")):
+            message["assignmentId"] = _trim(decision.get("assignmentId"))
+            message["workId"] = message["assignmentId"]
+        business_delivery_kind = _trim(decision.get("kind")) or "ambiguous"
+        message.update({
+            "revision": max(1, int(decision.get("revision") or 1)),
+            "businessDeliveryKind": business_delivery_kind,
+            "businessDeliveryReason": decision.get("reason"),
+            "deliverySemanticsVersion": 1,
+            "decisionLedgerVersion": int(workflow_state.get("ledgerVersion") or 0),
+            "decisionPlanVersion": int(workflow_state.get("planVersion") or 0),
+            "businessMutation": business_delivery_kind == "assignment",
+            "requiresCompletion": business_delivery_kind == "assignment",
+            "revisionAuthorized": decision.get("authorized") is True,
+            "sourceTool": "team_send",
+            "agentIntent": _trim(args.get("intent")) or None,
+            "nonAuthoritative": business_delivery_kind != "assignment",
+        })
         redis_id = await xadd_json(redis, inbox_key(settings, to), message)
+        if business_delivery_kind == "assignment":
+            dispatch_state = json.dumps({
+                "assignmentId": message["assignmentId"],
+                "workId": message["workId"],
+                "revision": message["revision"],
+                "rootTaskId": root_task_id,
+                "to": to,
+                "messageId": message["messageId"],
+                "status": "dispatched",
+                "createdAt": message["createdAt"],
+            }, ensure_ascii=False)
+            dispatch_key = assignment_dispatch_state_key(settings, root_task_id)
+            await redis.command("HSET", dispatch_key, message["assignmentId"], dispatch_state)
+            await redis.command("EXPIRE", dispatch_key, 604800)
         await xadd_json(
             redis,
             events_key(settings),
-            event_for(settings, "outbound", {"messageId": message["messageId"], "to": to}),
+            event_for(settings, "peer_request" if business_delivery_kind == "peer_request" else "outbound", {
+                **message,
+                "inReplyTo": _trim(active.get("messageId")),
+            }),
         )
     finally:
         redis.close()
     message["redisId"] = redis_id
-    return json.dumps({"ok": True, "sent": message}, ensure_ascii=False)
+    response: dict[str, Any] = {"ok": True, "sent": message}
+    if message.get("businessDeliveryKind") == "ambiguous":
+        response.update({
+            "deliveryState": "delivered_as_context",
+            "clarificationRequired": True,
+            "leaderGuidance": (
+                "The message was delivered without creating a new Work Item because the current ledger does not "
+                "uniquely identify a new business assignment. If this is a real next stage, resend it with a distinct "
+                "assignmentId; if it is rework, first confirm the exact failed or stale attempt."
+            ),
+        })
+    return _team_tool_json_result(settings, "team_send", response)
 
 
 async def _tool_team_status(args: dict[str, Any], **_kwargs) -> str:
     settings = load_settings(None)
     if not settings.enabled:
-        return json.dumps({"error": "Redis Team is disabled"}, ensure_ascii=False)
+        return _team_tool_json_result(settings, "team_update_progress", {"ok": False, "retryable": True, "error": "Redis Team is disabled"})
     return json.dumps(
         {"ok": True, "status": read_team_statuses(settings, _trim(args.get("memberId")))},
         ensure_ascii=False,
@@ -1743,7 +2262,7 @@ async def _tool_team_update_progress(args: dict[str, Any], **_kwargs) -> str:
     status_text = _trim(args.get("status"))
     summary = _trim(args.get("summary"))
     if not task_id or not status_text:
-        return json.dumps({"error": "taskId and status are required"}, ensure_ascii=False)
+        return _team_tool_json_result(settings, "team_update_progress", {"ok": False, "retryable": True, "error": "taskId and status are required"})
     progress = args.get("progress")
     status = write_local_status(
         settings,
@@ -1768,13 +2287,13 @@ async def _tool_team_update_progress(args: dict[str, Any], **_kwargs) -> str:
         "reportedTaskId": reported_task_id if reported_task_id and reported_task_id != task_id else None,
     }
     await _publish_event(settings, "task_progress", progress_payload)
-    return json.dumps({"ok": True, "status": status}, ensure_ascii=False)
+    return _team_tool_json_result(settings, "team_update_progress", {"ok": True, "status": status})
 
 
 async def _tool_team_complete_task(args: dict[str, Any], **_kwargs) -> str:
     settings = load_settings(None)
     if not settings.enabled:
-        return json.dumps({"error": "Redis Team is disabled"}, ensure_ascii=False)
+        return _team_tool_json_result(settings, "team_complete_task", {"ok": False, "retryable": True, "error": "Redis Team is disabled"})
     active = _load_active_envelope(settings)
     reported_task_id = _trim(args.get("taskId"))
     active_task_id = _trim(active.get("rootTaskId") or active.get("taskId"))
@@ -1782,12 +2301,9 @@ async def _tool_team_complete_task(args: dict[str, Any], **_kwargs) -> str:
     status_text = _trim(args.get("status")).lower()
     summary = _trim(args.get("summary"))
     if not task_id or not status_text or not summary:
-        return json.dumps({"error": "taskId, status and summary are required"}, ensure_ascii=False)
+        return _team_tool_json_result(settings, "team_complete_task", {"ok": False, "retryable": True, "error": "taskId, status and summary are required"})
     if status_text not in {"succeeded", "failed", "cancelled"}:
-        return json.dumps(
-            {"error": "status must be succeeded, failed or cancelled"},
-            ensure_ascii=False,
-        )
+        return _team_tool_json_result(settings, "team_complete_task", {"ok": False, "retryable": True, "error": "status must be succeeded, failed or cancelled"})
     if reported_task_id and reported_task_id != task_id:
         active["reportedTaskId"] = reported_task_id
     active["taskId"] = active.get("taskId") or task_id
@@ -1808,8 +2324,10 @@ async def _tool_team_complete_task(args: dict[str, Any], **_kwargs) -> str:
             reviewed_artifact_refs=args.get("reviewedArtifactRefs") if isinstance(args.get("reviewedArtifactRefs"), list) else [],
         )
     except Exception as exc:
-        return json.dumps({"error": str(exc)}, ensure_ascii=False)
-    return json.dumps(result, ensure_ascii=False)
+        return _team_tool_json_result(settings, "team_complete_task", {"ok": False, "retryable": True, "error": str(exc)})
+    normalized_result = dict(result) if isinstance(result, dict) else {"ok": True, "result": result}
+    normalized_result.setdefault("ok", True)
+    return _team_tool_json_result(settings, "team_complete_task", normalized_result)
 
 
 class RedisTeamAdapter(BasePlatformAdapter):
@@ -2598,10 +3116,12 @@ class RedisTeamAdapter(BasePlatformAdapter):
         envelope = event.raw_message if isinstance(event.raw_message, dict) else _load_active_envelope(self.settings)
         task_id = str(envelope.get("taskId") or event.source.chat_id)
         message_id = str(envelope.get("messageId") or event.message_id or "")
+        turn_observation = _finish_turn_observation(self.settings, message_id)
         if outcome == ProcessingOutcome.SUCCESS:
             active = _load_active_envelope(self.settings)
             response = _trim(self._turn_responses.get(message_id) or active.get("lastAssistantResponse"))
             if not _truthy(envelope.get("requiresCompletion"), True):
+                observation = _observe_team_turn_outcome(envelope, active, turn_observation)
                 if self._redis:
                     await xadd_json(
                         self._redis,
@@ -2612,10 +3132,28 @@ class RedisTeamAdapter(BasePlatformAdapter):
                             envelope,
                             {
                                 "messageId": message_id,
+                                "eventKind": "turn_finished_without_completion",
                                 "summary": "Non-terminal Team turn finished",
+                                "activeTurnFinished": True,
+                                "nonAuthoritative": True,
+                                "rootTaskTerminal": False,
                                 "stateEffect": "none",
                                 "visibleToChat": False,
                                 "chatPolicy": "hidden",
+                                "turnObservationOutcome": observation["outcome"],
+                                "contextOnlyTurn": True,
+                                "observationActionExpected": observation["actionExpected"],
+                                "immediateRecoveryEligible": observation["immediateRecoveryEligible"],
+                                "observationConflict": observation["evidenceConflict"] or None,
+                                "observationConflicts": observation["evidenceConflicts"] or None,
+                                "observationPolicyReason": observation["policyReason"],
+                                "hadOutboundAssignment": observation["outcome"] == "legitimate_wait",
+                                "lastToolFailed": observation["lastTool"].get("failed") is True or None,
+                                "lastToolName": _trim(observation["lastTool"].get("toolName")) or None,
+                                "lastToolError": _trim(observation["lastTool"].get("error")) or None,
+                                "lastToolCode": _trim(observation["lastTool"].get("code")) or None,
+                                "targetCandidates": observation["lastTool"].get("candidates") or None,
+                                "retryable": observation["outcome"] in {"retryable_tool_gap", "completion_receipt_gap"} or None,
                             },
                         ),
                     )
@@ -2697,6 +3235,7 @@ class RedisTeamAdapter(BasePlatformAdapter):
                             envelope,
                             {
                                 "messageId": message_id,
+                                "eventKind": "turn_finished_without_completion",
                                 "summary": "Turn finished without an explicit completion receipt",
                                 "status": "running",
                                 "availability": "busy",
@@ -3279,6 +3818,7 @@ class RedisTeamAdapter(BasePlatformAdapter):
             "source_message_id": envelope.get("messageId"),
             "context_only": context_only,
         }
+        _begin_turn_observation(self.settings, envelope, context_only=context_only)
         if not context_only:
             if self._redis and await _root_task_is_terminal(self._redis, self.settings, envelope):
                 identity = _assignment_identity(envelope)
@@ -3557,9 +4097,12 @@ def register(ctx) -> None:
             "parameters": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["to", "text"],
+                "required": ["text"],
                 "properties": {
                     "to": {"type": "string", "description": "Recipient member ID, or broadcast if supported"},
+                    "recipient": {"type": "string", "description": "Compatibility alias for to"},
+                    "targetMemberId": {"type": "string", "description": "Compatibility alias for to"},
+                    "target_member_id": {"type": "string", "description": "Compatibility alias for to"},
                     "text": {"type": "string", "description": "Task or message text"},
                     "intent": {"type": "string"},
                     "taskId": {"type": "string"},
