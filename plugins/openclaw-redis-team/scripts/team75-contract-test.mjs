@@ -1020,13 +1020,23 @@ try {
   assert.equal(ordinaryContextObservation.immediateRecoveryEligible, false, "ordinary context must never create a reminder loop");
   const handoffObservation = pluginModule.observeTeamTurnOutcome({
     envelope: { requiresCompletion: false, intent: "member_result_confirmed" },
-    activeResult: { outbound: { message: { to: "reviewer" } } },
+    activeResult: { outbound: { message: { to: "reviewer", businessMutation: true, businessDeliveryKind: "assignment" } } },
     durableFacts: { available: true, completionProposed: false },
     toolEvidence: { source: "dispatch_session", retryableTeamToolGap: null },
     contextOnly: true,
   });
   assert.equal(handoffObservation.outcome, "legitimate_wait");
   assert.equal(handoffObservation.immediateRecoveryEligible, false, "a successful handoff must not be nudged again");
+  const workerReturnObservation = pluginModule.observeTeamTurnOutcome({
+    envelope: { requiresCompletion: true },
+    activeResult: { outbound: { message: { to: "leader", businessMutation: false, businessDeliveryKind: "peer_request" } } },
+    durableFacts: { available: true, completionProposed: false },
+    toolEvidence: { source: "dispatch_session", retryableTeamToolGap: null },
+    memberRouting: { workerToLeader: true, leaderCoordination: false },
+  });
+  assert.equal(workerReturnObservation.outcome, "completion_receipt_gap", "a Worker return to Leader is not downstream delegation");
+  assert.equal(workerReturnObservation.downstreamAssignmentStarted, false);
+  assert.equal(workerReturnObservation.hadOutboundAssignment, true, "transport evidence remains available for compatibility auditing");
   const incompleteAttempt = pluginModule.assignmentAttemptFailedEvent({ taskId: "team-75-task-150" });
   assert.equal(incompleteAttempt.eventKind, "assignment_attempt_failed");
   assert.equal(incompleteAttempt.stateEffect, "none");

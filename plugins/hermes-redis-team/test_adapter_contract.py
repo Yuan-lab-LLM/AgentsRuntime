@@ -995,6 +995,49 @@ class HermesRedisTeamContractTests(unittest.TestCase):
         self.assertEqual(ordinary["outcome"], "ordinary_open_turn")
         self.assertFalse(ordinary["immediateRecoveryEligible"])
 
+    def test_turn_observer_distinguishes_leader_return_from_downstream_assignment(self):
+        envelope = {
+            "messageId": "worker-return-1",
+            "requiresCompletion": True,
+            "intent": "assignment",
+            "turnOutcomePolicy": {
+                "actionExpected": True,
+                "immediateRecoveryAllowed": True,
+            },
+        }
+        leader_return = adapter._observe_team_turn_outcome(envelope, {}, {
+            "lastTool": {
+                "toolName": "team_send",
+                "failed": False,
+                "retryable": False,
+                "succeeded": True,
+                "outboundObserved": True,
+                "businessMutation": False,
+                "businessDeliveryKind": "peer_request",
+                "outboundTarget": "leader",
+            },
+        })
+        self.assertEqual(leader_return["outcome"], "completion_receipt_gap")
+        self.assertTrue(leader_return["immediateRecoveryEligible"])
+        self.assertTrue(leader_return["hadOutboundAssignment"])
+        self.assertFalse(leader_return["downstreamAssignmentStarted"])
+
+        downstream = adapter._observe_team_turn_outcome(envelope, {}, {
+            "lastTool": {
+                "toolName": "team_send",
+                "failed": False,
+                "retryable": False,
+                "succeeded": True,
+                "outboundObserved": True,
+                "businessMutation": True,
+                "businessDeliveryKind": "assignment",
+                "outboundTarget": "worker-2",
+            },
+        })
+        self.assertEqual(downstream["outcome"], "legitimate_wait")
+        self.assertFalse(downstream["immediateRecoveryEligible"])
+        self.assertTrue(downstream["downstreamAssignmentStarted"])
+
     def test_context_processing_emits_actionable_hidden_turn_fact_without_business_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = self.settings(Path(tmp))

@@ -71,8 +71,8 @@ func TestRedisTeamPluginDeclaresTargetOpenClawBuildBaseline(t *testing.T) {
 		t.Fatalf("parse Redis Team package.json: %v", err)
 	}
 
-	if pkg.Version != "0.2.1" {
-		t.Errorf("Redis Team package version = %q, want %q", pkg.Version, "0.2.1")
+	if pkg.Version != "0.2.2" {
+		t.Errorf("Redis Team package version = %q, want %q", pkg.Version, "0.2.2")
 	}
 	if pkg.OpenClaw.Compat.PluginAPI != ">=2026.5.4" {
 		t.Errorf("Redis Team plugin API range = %q, want old/new Runtime compatible lower bound", pkg.OpenClaw.Compat.PluginAPI)

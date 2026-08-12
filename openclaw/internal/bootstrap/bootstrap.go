@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"fmt"
+	"log"
 
 	appconfig "github.com/iamlovingit/clawmanager-openclaw-image/internal/config"
 )
@@ -21,7 +22,11 @@ func Run(cfg appconfig.Config) error {
 		return fmt.Errorf("ensure extensions dir: %w", err)
 	}
 	if err := syncBundledRedisTeamPlugin(cfg); err != nil {
-		return fmt.Errorf("sync bundled redis-team plugin: %w", err)
+		// The managed Team extension must never make the whole desktop
+		// instance unavailable.  The synchronizer preserves the previous
+		// verified copy on every failure, so keep serving it and surface the
+		// degraded upgrade in the bootstrap log.
+		log.Printf("warning: sync bundled redis-team plugin: %v", err)
 	}
 	if err := syncAutostart(cfg); err != nil {
 		return fmt.Errorf("sync autostart: %w", err)

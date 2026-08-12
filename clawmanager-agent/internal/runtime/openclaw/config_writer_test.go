@@ -1001,6 +1001,9 @@ func TestWriteOpenClawGatewayConfigEnablesRedisTeamForLiteTeam(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(sourcePlugin, "openclaw.plugin.json"), []byte(`{"id":"redis-team","channels":["redis-team"]}`), 0o644); err != nil {
 		t.Fatalf("write source manifest: %v", err)
 	}
+	if err := os.WriteFile(filepath.Join(sourcePlugin, "package.json"), []byte(`{"name":"@clawmanager/openclaw-redis-team","version":"0.2.1"}`), 0o644); err != nil {
+		t.Fatalf("write source package: %v", err)
+	}
 	if err := os.WriteFile(filepath.Join(sourcePlugin, "dist", "index.js"), []byte(`module.exports = {};`), 0o644); err != nil {
 		t.Fatalf("write source plugin entrypoint: %v", err)
 	}
@@ -1079,6 +1082,76 @@ func TestWriteOpenClawGatewayConfigEnablesRedisTeamForLiteTeam(t *testing.T) {
 	copiedManifest := filepath.Join(workspace, "home", ".openclaw", "extensions", "redis-team", "openclaw.plugin.json")
 	if _, err := os.Stat(copiedManifest); err != nil {
 		t.Fatalf("expected redis-team plugin manifest to be seeded at %s: %v", copiedManifest, err)
+	}
+}
+
+func TestSeedOpenClawRedisTeamPluginUpdatesOnlyRecognizedManagedCopy(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "defaults", "redis-team")
+	workspace := filepath.Join(root, "workspace")
+	target := filepath.Join(workspace, "home", ".openclaw", "extensions", "redis-team")
+	writeManagedRedisTeamPlugin(t, source, "0.2.1", "new-runtime")
+	writeManagedRedisTeamPlugin(t, target, "0.2.1", "old-runtime")
+	t.Setenv(openClawRedisTeamPluginDirEnv, source)
+	if err := seedOpenClawRedisTeamPlugin(gateway.CreateGatewayRequest{}, workspace); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(target, "dist", "index.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "new-runtime" {
+		t.Fatalf("managed redis-team plugin was not updated: %q", data)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "home", ".openclaw", "extensions", "another-plugin")); !os.IsNotExist(err) {
+		t.Fatalf("redis-team synchronization must not create or touch other plugins: %v", err)
+	}
+}
+
+func TestSeedOpenClawRedisTeamPluginPreservesUnrecognizedExtension(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "defaults", "redis-team")
+	workspace := filepath.Join(root, "workspace")
+	target := filepath.Join(workspace, "home", ".openclaw", "extensions", "redis-team")
+	writeManagedRedisTeamPlugin(t, source, "0.2.1", "managed-runtime")
+	if err := os.MkdirAll(filepath.Join(target, "dist"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "package.json"), []byte(`{"name":"user-owned-plugin","version":"1.0.0"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "openclaw.plugin.json"), []byte(`{"id":"redis-team","channels":["redis-team"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "dist", "index.js"), []byte("user-runtime"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(openClawRedisTeamPluginDirEnv, source)
+	if err := seedOpenClawRedisTeamPlugin(gateway.CreateGatewayRequest{}, workspace); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(target, "dist", "index.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "user-runtime" {
+		t.Fatalf("unrecognized user extension was overwritten: %q", data)
+	}
+}
+
+func writeManagedRedisTeamPlugin(t *testing.T, root, version, runtime string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(root, "dist"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "package.json"), []byte(`{"name":"@clawmanager/openclaw-redis-team","version":"`+version+`"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "openclaw.plugin.json"), []byte(`{"id":"redis-team","channels":["redis-team"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "dist", "index.js"), []byte(runtime), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -2606,6 +2606,7 @@ function observeTeamTurnOutcome({
   dispatchFailed = false,
   incompleteTurnDetected = false,
   contextOnly = false,
+  memberRouting = {},
 } = {}) {
   const policy = contextOnly
     ? contextTurnOutcomePolicy(envelope)
@@ -2613,7 +2614,17 @@ function observeTeamTurnOutcome({
   const localCompletion = activeResult?.completed === true || activeResult?.completionPending === true;
   const durableCompletion = durableFacts?.completionProposed === true;
   const completionObserved = terminalAfterDispatch === true || localCompletion || durableCompletion;
-  const hadOutboundAssignment = !!activeResult?.outbound;
+  const outbound = activeResult?.outbound || null;
+  const hadOutbound = !!outbound;
+  const outboundMessage = outbound?.message || {};
+  // Team messages are transport facts, not automatically downstream work.
+  // Prefer the Runtime's ledger-derived business mutation bit. The routing
+  // fallback keeps old ClawManager/Runtime pairs working without treating a
+  // Worker returning evidence to its Leader as a new assignment.
+  const downstreamAssignmentStarted =
+    outboundMessage.businessMutation === true ||
+    trim(outboundMessage.businessDeliveryKind).toLowerCase() === "assignment" ||
+    (outboundMessage.businessMutation === undefined && memberRouting?.leaderCoordination === true);
   const retryableGap = toolEvidence?.retryableTeamToolGap || null;
   const conflicts = [];
   if (retryableGap && completionObserved) conflicts.push("completion_and_retryable_tool_gap");
@@ -2626,7 +2637,7 @@ function observeTeamTurnOutcome({
   if (conflicts.length) outcome = "runtime_observation_unknown";
   else if (terminalAfterDispatch || activeResult?.completed === true) outcome = "completed";
   else if (localCompletion || durableCompletion) outcome = "completed";
-  else if (hadOutboundAssignment) outcome = "legitimate_wait";
+  else if (downstreamAssignmentStarted) outcome = "legitimate_wait";
   else if (retryableGap) outcome = "retryable_tool_gap";
   else if (policy.actionExpected) outcome = "completion_receipt_gap";
 
@@ -2646,7 +2657,10 @@ function observeTeamTurnOutcome({
       durableTurnFacts: durableFacts?.available !== false,
       terminalReceipt: terminalAfterDispatch === true,
     },
-    hadOutboundAssignment,
+    hadOutboundAssignment: hadOutbound,
+    downstreamAssignmentStarted,
+    outboundDeliveryKind: trim(outboundMessage.businessDeliveryKind) || undefined,
+    outboundTarget: trim(outboundMessage.to || outbound?.target?.to || outbound?.target?.originalTo) || undefined,
     retryableToolGap: retryableGap,
   };
 }
@@ -2692,6 +2706,9 @@ function turnFinishedWithoutCompletionEvent(envelope, {
     chatPolicy: "hidden",
     hadAssistantNarrative: deliveredViaCallback || assistantNarratives.length > 0 || !!trim(fallbackText),
     hadOutboundAssignment: observation ? !!observation.hadOutboundAssignment : !!hadOutboundAssignment,
+    downstreamAssignmentStarted: observation ? !!observation.downstreamAssignmentStarted : undefined,
+    outboundDeliveryKind: trim(observation?.outboundDeliveryKind) || undefined,
+    outboundTarget: trim(observation?.outboundTarget) || undefined,
     resultMarkdown: resultMarkdown || undefined,
     resultSummary: resultMarkdown
       ? resultMarkdown.replace(/\s+/g, " ").trim().slice(0, 500)
@@ -7720,6 +7737,7 @@ export default definePluginEntry({
                     dispatchFailed,
                     incompleteTurnDetected,
                     contextOnly: false,
+                    memberRouting: routing,
                   });
 
                   // OpenClaw can execute tools in a runtime/plugin instance that

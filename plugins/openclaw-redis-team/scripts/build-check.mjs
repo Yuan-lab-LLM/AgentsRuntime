@@ -11,7 +11,7 @@ const manifest = JSON.parse(fs.readFileSync(path.join(root, "openclaw.plugin.jso
 const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
 const dist = fs.readFileSync(path.join(root, "dist", "index.js"), "utf8");
 if (manifest.id !== "redis-team") throw new Error(`unexpected plugin id: ${manifest.id}`);
-if (pkg.version !== "0.2.1") {
+if (pkg.version !== "0.2.2") {
   throw new Error(`unexpected package version: ${pkg.version}`);
 }
 if (pkg.openclaw?.compat?.pluginApi !== ">=2026.5.4") {

@@ -385,6 +385,7 @@ def _record_turn_tool_result(settings: RedisTeamSettings, tool_name: str, result
         if not isinstance(observation, dict) or not _trim(observation.get("messageId")):
             return
         failed = result.get("ok") is False or result.get("success") is False or bool(result.get("error"))
+        team_send_result = result.get("sent") if tool_name == "team_send" and isinstance(result.get("sent"), dict) else {}
         observation["lastTool"] = {
             "toolName": tool_name,
             "failed": failed,
@@ -394,6 +395,10 @@ def _record_turn_tool_result(settings: RedisTeamSettings, tool_name: str, result
             "code": _trim(result.get("code")) or None,
             "candidates": result.get("candidates") if isinstance(result.get("candidates"), list) else None,
             "observedAt": _now_iso(),
+            "outboundObserved": bool(team_send_result),
+            "businessMutation": team_send_result.get("businessMutation") is True,
+            "businessDeliveryKind": _trim(team_send_result.get("businessDeliveryKind")) or None,
+            "outboundTarget": _trim(team_send_result.get("to")) or None,
         }
         _atomic_write_json(_turn_observation_path(settings), observation)
     except Exception as exc:
@@ -454,7 +459,14 @@ def _observe_team_turn_outcome(envelope: dict[str, Any], active: dict[str, Any],
         outcome = "runtime_observation_unknown"
     elif completion_observed:
         outcome = "completed"
-    elif last_tool.get("toolName") == "team_send" and last_tool.get("succeeded") is True:
+    elif (
+        last_tool.get("toolName") == "team_send"
+        and last_tool.get("succeeded") is True
+        and (
+            last_tool.get("businessMutation") is True
+            or _trim(last_tool.get("businessDeliveryKind")).lower() == "assignment"
+        )
+    ):
         outcome = "legitimate_wait"
     elif last_tool.get("failed") is True and last_tool.get("retryable") is True:
         outcome = "retryable_tool_gap"
@@ -474,6 +486,13 @@ def _observe_team_turn_outcome(envelope: dict[str, Any], active: dict[str, Any],
         "evidenceConflict": bool(conflicts),
         "evidenceConflicts": conflicts,
         "lastTool": last_tool,
+        "hadOutboundAssignment": last_tool.get("outboundObserved") is True,
+        "downstreamAssignmentStarted": (
+            last_tool.get("businessMutation") is True
+            or _trim(last_tool.get("businessDeliveryKind")).lower() == "assignment"
+        ),
+        "outboundDeliveryKind": _trim(last_tool.get("businessDeliveryKind")) or None,
+        "outboundTarget": _trim(last_tool.get("outboundTarget")) or None,
     }
 
 
@@ -3147,7 +3166,10 @@ class RedisTeamAdapter(BasePlatformAdapter):
                                 "observationConflict": observation["evidenceConflict"] or None,
                                 "observationConflicts": observation["evidenceConflicts"] or None,
                                 "observationPolicyReason": observation["policyReason"],
-                                "hadOutboundAssignment": observation["outcome"] == "legitimate_wait",
+                                "hadOutboundAssignment": observation["hadOutboundAssignment"],
+                                "downstreamAssignmentStarted": observation["downstreamAssignmentStarted"],
+                                "outboundDeliveryKind": observation["outboundDeliveryKind"],
+                                "outboundTarget": observation["outboundTarget"],
                                 "lastToolFailed": observation["lastTool"].get("failed") is True or None,
                                 "lastToolName": _trim(observation["lastTool"].get("toolName")) or None,
                                 "lastToolError": _trim(observation["lastTool"].get("error")) or None,
@@ -3216,6 +3238,7 @@ class RedisTeamAdapter(BasePlatformAdapter):
                     },
                 )
             else:
+                observation = _observe_team_turn_outcome(envelope, active, turn_observation)
                 write_local_status(
                     self.settings,
                     {
@@ -3244,6 +3267,22 @@ class RedisTeamAdapter(BasePlatformAdapter):
                                 "nonAuthoritative": True,
                                 "rootTaskTerminal": False,
                                 "activeTurnFinished": True,
+                                "turnObservationOutcome": observation["outcome"],
+                                "observationActionExpected": observation["actionExpected"],
+                                "immediateRecoveryEligible": observation["immediateRecoveryEligible"],
+                                "observationConflict": observation["evidenceConflict"] or None,
+                                "observationConflicts": observation["evidenceConflicts"] or None,
+                                "observationPolicyReason": observation["policyReason"],
+                                "hadOutboundAssignment": observation["hadOutboundAssignment"],
+                                "downstreamAssignmentStarted": observation["downstreamAssignmentStarted"],
+                                "outboundDeliveryKind": observation["outboundDeliveryKind"],
+                                "outboundTarget": observation["outboundTarget"],
+                                "lastToolFailed": observation["lastTool"].get("failed") is True or None,
+                                "lastToolName": _trim(observation["lastTool"].get("toolName")) or None,
+                                "lastToolError": _trim(observation["lastTool"].get("error")) or None,
+                                "lastToolCode": _trim(observation["lastTool"].get("code")) or None,
+                                "targetCandidates": observation["lastTool"].get("candidates") or None,
+                                "retryable": observation["outcome"] in {"retryable_tool_gap", "completion_receipt_gap"} or None,
                                 "resultMarkdown": response or None,
                                 "visibleToChat": False,
                                 "chatPolicy": "hidden",
