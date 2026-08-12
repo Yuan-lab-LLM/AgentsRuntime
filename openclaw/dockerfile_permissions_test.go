@@ -21,6 +21,10 @@ func TestImageKeepsBundledPluginsReadableAndRootOwned(t *testing.T) {
 		"find /defaults/.openclaw/npm/projects -path \"*/node_modules/${plugin_package}\"",
 		"chown -R root:root \"${package_dir}\"",
 		"legacy_dir=\"/defaults/.openclaw/npm/node_modules/${plugin_package}\"",
+		"mkdir -p \"$(dirname \"${legacy_dir}\")\"",
+		"ln -s \"${package_dir}\" \"${legacy_dir}\"",
+		"test -d \"${legacy_dir}\"",
+		"chown -h root:root \"${legacy_dir}\"",
 		"chown -h root:root /defaults/.openclaw/npm/node_modules/openclaw",
 	}
 	for _, fragment := range required {
@@ -33,6 +37,13 @@ func TestImageKeepsBundledPluginsReadableAndRootOwned(t *testing.T) {
 	rootOwnership := strings.Index(dockerfile, "chown -R root:root")
 	if abcOwnership < 0 || rootOwnership < 0 || rootOwnership < abcOwnership {
 		t.Error("bundled plugin root ownership must be applied after the default abc ownership")
+	}
+
+	packageLookup := strings.Index(dockerfile, "package_dir=\"$(find /defaults/.openclaw/npm/projects")
+	legacyLink := strings.Index(dockerfile, "ln -s \"${package_dir}\" \"${legacy_dir}\"")
+	legacyValidation := strings.Index(dockerfile, "test -d \"${legacy_dir}\"")
+	if packageLookup < 0 || legacyLink < packageLookup || legacyValidation < legacyLink {
+		t.Error("legacy plugin links must be created from a discovered project payload and validated")
 	}
 
 	runScript, err := os.ReadFile("../clawmanager-agent/scripts/clawmanager-agent-run")

@@ -86,13 +86,22 @@ HOME=/defaults openclaw plugins install <package-spec>
 
 如果 channel 的 `peerDependencies` 包含 `openclaw`，只在实例 npm 根目录创建 peer 链接并不总是有效。
 
-Node 会先解析插件符号链接的真实路径。共享模式下，插件真实路径位于：
+Node 会先解析插件符号链接的真实路径。OpenClaw 7.1 的共享插件真实路径位于隔离 project：
+
+```text
+/defaults/.openclaw/npm/projects/<project-id>/node_modules/<channel-package>
+```
+
+为兼容 5.4 工作区中已经持久化的绝对符号链接，新镜像还必须提供旧入口：
 
 ```text
 /defaults/.openclaw/npm/node_modules/<channel-package>
+  -> /defaults/.openclaw/npm/projects/<project-id>/node_modules/<channel-package>
 ```
 
-因此 Node 会从 `/defaults/...` 向上寻找 `openclaw`，不会回到实例 npm 根目录。共享 npm 根目录必须存在：
+已有真实目录不得覆盖；构建时必须检查软连接最终解析为目录。这样旧实例不需要复制插件，也不需要修改自己的 `~/.openclaw/npm/node_modules`。
+
+插件从 project 的真实路径向上解析依赖，不会回到实例 npm 根目录。每个 project 内应包含自己的 `openclaw` peer 链接，同时共享 npm 根目录继续保留：
 
 ```text
 /defaults/.openclaw/npm/node_modules/openclaw
@@ -111,6 +120,7 @@ Node 会先解析插件符号链接的真实路径。共享模式下，插件真
 - `/defaults/.openclaw/npm` 下文件对其他 UID 可读、目录可遍历。
 - 共享的第三方 channel package 使用受信任的 root 所有权。
 - 符号链接本身和目标路径均可访问。
+- 5.4 legacy package 路径能够解析到 7.1 project package。
 
 新增预装 channel 后，要把它的 package 目录加入 Dockerfile 的 root ownership 处理。不要把共享目录 `chown` 给某个实例 UID；那会让其他实例失败，也会造成实例间所有权争用。
 
@@ -135,6 +145,7 @@ ClawManager Lite 在 gateway HTTP 健康检查通过后即可报告实例可用�
 - `/defaults` 权限允许任意实例 UID 读取和遍历。
 - 共享 package 为受信任所有者。
 - 所需 peer 链接目标存在。
+- 每个预装 channel 的 `/defaults/.openclaw/npm/node_modules/<channel-package>` 是可解析的兼容软连接。
 - `openclaw plugins list` 不出现 stale、ownership、permission 或 module resolution 错误。
 
 ### 5.2 单实例验证

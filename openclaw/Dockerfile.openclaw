@@ -55,6 +55,18 @@ COPY --from=node-runtime /usr/local /usr/local
 
 RUN npm install -g openclaw@2026.7.1-2
 
+COPY openclaw/patches/patch_memory_core_startup_migration.mjs /usr/local/share/openclaw/patches/patch_memory_core_startup_migration.mjs
+COPY openclaw/patches/test_memory_core_startup_migration.mjs /usr/local/share/openclaw/patches/test_memory_core_startup_migration.mjs
+RUN node /usr/local/share/openclaw/patches/patch_memory_core_startup_migration.mjs --patch \
+  && node /usr/local/share/openclaw/patches/patch_memory_core_startup_migration.mjs --verify \
+  && node /usr/local/share/openclaw/patches/test_memory_core_startup_migration.mjs
+
+COPY openclaw/patches/patch_legacy_task_sidecar_startup_migration.mjs /usr/local/share/openclaw/patches/patch_legacy_task_sidecar_startup_migration.mjs
+COPY openclaw/patches/test_legacy_task_sidecar_startup_migration.mjs /usr/local/share/openclaw/patches/test_legacy_task_sidecar_startup_migration.mjs
+RUN node /usr/local/share/openclaw/patches/patch_legacy_task_sidecar_startup_migration.mjs --patch \
+  && node /usr/local/share/openclaw/patches/patch_legacy_task_sidecar_startup_migration.mjs --verify \
+  && node /usr/local/share/openclaw/patches/test_legacy_task_sidecar_startup_migration.mjs
+
 COPY openclaw/patches/patch_browser_proxy_navigation.mjs /usr/local/share/openclaw/patches/patch_browser_proxy_navigation.mjs
 COPY openclaw/patches/test_browser_proxy_navigation.mjs /usr/local/share/openclaw/patches/test_browser_proxy_navigation.mjs
 COPY openclaw/patches/test_browser_proxy_navigation_integration.mjs /usr/local/share/openclaw/patches/test_browser_proxy_navigation_integration.mjs
@@ -113,7 +125,12 @@ RUN sed -i 's/\r$//' /etc/services.d/openclaw-agent/run \
       test -n "${package_dir}"; \
       chown -R root:root "${package_dir}"; \
       legacy_dir="/defaults/.openclaw/npm/node_modules/${plugin_package}"; \
-      if [ -e "${legacy_dir}" ]; then chown -R root:root "${legacy_dir}"; fi; \
+      mkdir -p "$(dirname "${legacy_dir}")"; \
+      if [ ! -e "${legacy_dir}" ] && [ ! -L "${legacy_dir}" ]; then \
+        ln -s "${package_dir}" "${legacy_dir}"; \
+      fi; \
+      test -d "${legacy_dir}"; \
+      chown -h root:root "${legacy_dir}"; \
     done \
   && chown -h root:root /defaults/.openclaw/npm/node_modules/openclaw \
   && node /usr/local/share/openclaw/patches/test_redis_team_plugin_hooks.mjs \

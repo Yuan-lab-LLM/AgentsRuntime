@@ -15,4 +15,3 @@ if pgrep -u "$(id -u)" -f '/opt/workbuddy/(electron|start\.sh)' >/dev/null 2>&1;
 fi
 
 exec /opt/workbuddy/start.sh "$@"
-
