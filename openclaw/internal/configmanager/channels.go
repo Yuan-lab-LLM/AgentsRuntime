@@ -74,6 +74,7 @@ func applyChannelOverrides(cfg map[string]any, opts channelOverrides) error {
 	collectSupportedChannelIdsFromStartupMetadata(opts.BundledExtensionsDir, supported)
 	collectSupportedChannelIds(opts.BundledExtensionsDir, supported)
 	collectSupportedChannelIds(opts.UserExtensionsDir, supported)
+	collectSupportedChannelIdsFromNPMProjects(opts.ActiveConfigDir, supported)
 	collectSupportedChannelIdsFromRegistry(opts.PluginRegistryPath, opts.DefaultsDir, opts.ActiveConfigDir, supported)
 
 	existing := ensureObject(cfg, "channels")
@@ -295,6 +296,34 @@ func collectSupportedChannelIds(rootDir string, out map[string]struct{}) {
 			continue
 		}
 		collectSupportedChannelIdsFromManifestCandidates([]string{manifestPath}, out)
+	}
+}
+
+// collectSupportedChannelIdsFromNPMProjects discovers plugins installed by
+// newer OpenClaw releases. Those releases place npm plugins under isolated
+// projects and may not create plugins/installs.json, so registry-only
+// discovery would incorrectly discard an otherwise valid managed channel.
+func collectSupportedChannelIdsFromNPMProjects(activeConfigDir string, out map[string]struct{}) {
+	if activeConfigDir == "" {
+		return
+	}
+	projectsDir := filepath.Join(activeConfigDir, "npm", "projects")
+	info, err := os.Stat(projectsDir)
+	if err != nil || !info.IsDir() {
+		return
+	}
+	if err := filepath.WalkDir(projectsDir, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			log.Printf("configmanager: walk npm plugin path %s: %v", path, err)
+			return nil
+		}
+		if entry.IsDir() || entry.Name() != pluginManifestName {
+			return nil
+		}
+		collectSupportedChannelIdsFromManifestCandidates([]string{path}, out)
+		return nil
+	}); err != nil {
+		log.Printf("configmanager: walk npm projects dir %s: %v", projectsDir, err)
 	}
 }
 

@@ -372,6 +372,50 @@ func TestChannelsMergeAcceptsRegistryInstalledNPMChannels(t *testing.T) {
 	}
 }
 
+func TestChannelsMergeAcceptsNPMProjectWithoutRegistry(t *testing.T) {
+	root := t.TempDir()
+	configRoot := filepath.Join(root, "config", ".openclaw")
+	configPath := filepath.Join(configRoot, "openclaw.json")
+	wecomDir := filepath.Join(
+		configRoot,
+		"npm", "projects", "wecom-project", "node_modules", "@wecom", "wecom-openclaw-plugin",
+	)
+	if err := os.MkdirAll(wecomDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wecomDir, "openclaw.plugin.json"), []byte(`{"id":"wecom-openclaw-plugin","channels":["wecom"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(sampleOpenClawConfig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("CLAWMANAGER_OPENCLAW_CHANNELS_JSON", `{"wecom":{"enabled":true}}`)
+	t.Setenv("CLAWMANAGER_LLM_MODEL", "")
+	t.Setenv("CLAWMANAGER_LLM_BASE_URL", "")
+	unsetEnvForTest(t, "CLAWMANAGER_LLM_API_KEY")
+	unsetEnvForTest(t, "OPENAI_API_KEY")
+
+	manager := New(appconfig.Config{
+		OpenClawConfigPath:           configPath,
+		OpenClawBundledExtensionsDir: t.TempDir(),
+		OpenClawExtensionsDir:        filepath.Join(configRoot, "extensions"),
+	}, nil, nil)
+	if err := manager.NormalizeActiveConfig(); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := readConfigForTest(t, configPath)
+	channels := nestedMapForTest(t, cfg, "channels")
+	if _, ok := channels["wecom"]; !ok {
+		t.Fatalf("expected npm-project wecom channel to be preserved, got %#v", channels)
+	}
+	plugin := nestedMapForTest(t, cfg, "plugins", "entries", "wecom-openclaw-plugin")
+	if plugin["enabled"] != true {
+		t.Fatalf("expected wecom plugin enabled, got %#v", plugin["enabled"])
+	}
+}
+
 func TestChannelsMergeAcceptsOpenClawStartupMetadataChannels(t *testing.T) {
 	root := t.TempDir()
 	configPath := filepath.Join(root, "openclaw.json")
