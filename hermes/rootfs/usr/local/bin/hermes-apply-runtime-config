@@ -1701,6 +1701,35 @@ def apply_redis_team_config(hermes_home, data):
     platforms_cfg["redis_team"] = redis_team_cfg
     data["platforms"] = platforms_cfg
 
+    # The isolated Team gateway is leader-mediated by ClawManager. Give it the
+    # execution tools a Worker needs, but do not expose competing orchestration
+    # systems (Todo/Kanban/Delegation/Messaging) that create redundant model
+    # iterations and bypass the Team assignment ledger.
+    platform_toolsets = data.get("platform_toolsets")
+    if not isinstance(platform_toolsets, dict):
+        platform_toolsets = {}
+    platform_toolsets["redis_team"] = [
+        "redis_team",
+        "file",
+        "terminal",
+        "code_execution",
+        "web",
+        "browser",
+        "vision",
+        "no_mcp",
+    ]
+    data["platform_toolsets"] = platform_toolsets
+
+    if truthy_env("CLAWMANAGER_HERMES_TEAM_WORKER_PROFILE"):
+        agent_cfg = data.get("agent")
+        if not isinstance(agent_cfg, dict):
+            agent_cfg = {}
+        disabled_toolsets = agent_cfg.get("disabled_toolsets")
+        if not isinstance(disabled_toolsets, list):
+            disabled_toolsets = []
+        agent_cfg["disabled_toolsets"] = unique_nonempty([*disabled_toolsets, "kanban"])
+        data["agent"] = agent_cfg
+
     persist_bootstrap_payload(hermes_home, "redis-team", record)
     return record
 

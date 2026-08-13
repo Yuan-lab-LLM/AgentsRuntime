@@ -104,6 +104,7 @@ RUN set -eux; \
     rm -rf /root/.cache /root/.npm /tmp/*
 
 COPY --from=clawmanager-agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent
+COPY hermes/patches/hermes-agent/apply_team_completion_stop.py /tmp/apply_team_completion_stop.py
 # Package the canonical adapter directly so the image and its contract tests
 # cannot drift through a second copied source tree.
 COPY plugins/hermes-redis-team/ /tmp/hermes-vendor-plugins/redis_team/
@@ -112,6 +113,9 @@ COPY hermes/rootfs/ /
 ENV SHELL=/bin/bash
 
 RUN set -eux; \
+    /usr/local/lib/hermes-agent/venv/bin/python /tmp/apply_team_completion_stop.py \
+        /usr/local/lib/hermes-agent/agent/conversation_loop.py; \
+    rm -f /tmp/apply_team_completion_stop.py; \
     hermes_python="$(readlink -f /usr/local/lib/hermes-agent/venv/bin/python)"; \
     hermes_python_root="$(dirname "$(dirname "${hermes_python}")")"; \
     hermes_new_python_root="/opt/uv/python/$(basename "${hermes_python_root}")"; \

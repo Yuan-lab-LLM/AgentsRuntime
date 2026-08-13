@@ -167,6 +167,50 @@ class HermesRedisTeamContractTests(unittest.TestCase):
 
         asyncio.run(run_test())
 
+    def test_team_send_accepts_message_alias_and_rejects_conflicting_text(self):
+        async def run_test():
+            with tempfile.TemporaryDirectory() as tmp:
+                settings = self.settings(Path(tmp))
+                adapter.ensure_team_dirs(settings)
+                adapter._persist_active_envelope(
+                    settings,
+                    {"taskId": "team-42-task-1", "rootTaskId": "team-42-task-1"},
+                )
+
+                class FakeRedis:
+                    def __init__(self, *_args, **_kwargs):
+                        pass
+
+                    async def connect(self):
+                        return None
+
+                    async def command(self, *_args):
+                        return "1-0"
+
+                    def close(self):
+                        pass
+
+                with mock.patch.object(adapter, "load_settings", return_value=settings), mock.patch.object(
+                    adapter, "AsyncRedisClient", FakeRedis
+                ):
+                    accepted = json.loads(await adapter._tool_team_send({
+                        "recipient": "auditor",
+                        "message": "Review the current result.",
+                        "assignmentId": "review-1",
+                    }))
+                    conflict = json.loads(await adapter._tool_team_send({
+                        "to": "auditor",
+                        "text": "one",
+                        "prompt": "two",
+                    }))
+                self.assertTrue(accepted["ok"])
+                self.assertEqual(accepted["sent"]["text"], "Review the current result.")
+                self.assertFalse(conflict["ok"])
+                self.assertTrue(conflict["retryable"])
+                self.assertEqual(conflict["code"], "conflicting_team_message")
+
+        asyncio.run(run_test())
+
     def test_business_delivery_uses_complete_ledger_without_trusting_agent_revision(self):
         settings = adapter.RedisTeamSettings(
             enabled=True,
@@ -303,8 +347,140 @@ class HermesRedisTeamContractTests(unittest.TestCase):
         self.assertIn("turn_outcome_v1", adapter.PROTOCOL_CAPABILITIES)
         self.assertIn("immediate_recheck_v1", adapter.PROTOCOL_CAPABILITIES)
         self.assertIn("assignment_lifecycle_v1", adapter.PROTOCOL_CAPABILITIES)
+        self.assertIn("assignment_activity_v2", adapter.PROTOCOL_CAPABILITIES)
+        self.assertIn("terminal_tool_stop_v1", adapter.PROTOCOL_CAPABILITIES)
         self.assertIn("team_artifact_preview_v1", adapter.PROTOCOL_CAPABILITIES)
         self.assertIn("team_artifact_preview_v2", adapter.PROTOCOL_CAPABILITIES)
+
+    def test_register_installs_fail_open_runtime_observation_hooks(self):
+        class Context:
+            def __init__(self):
+                self.hooks = {}
+
+            def register_hook(self, name, callback):
+                self.hooks[name] = callback
+
+            def register_tool(self, **_kwargs):
+                pass
+
+            def register_platform(self, **_kwargs):
+                pass
+
+        context = Context()
+        adapter.register(context)
+        self.assertEqual(
+            set(context.hooks),
+            {"pre_api_request", "post_api_request", "pre_tool_call", "post_tool_call"},
+        )
+
+    def test_team_tool_schema_failure_is_retained_by_post_tool_hook(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.settings(Path(tmp))
+            adapter.ensure_team_dirs(settings)
+            adapter._begin_turn_observation(
+                settings,
+                {
+                    "messageId": "schema-failure-turn",
+                    "rootTaskId": "team-42-task-1",
+                    "assignmentId": "dev-1",
+                    "revision": 1,
+                },
+                context_only=False,
+            )
+            with mock.patch.object(adapter, "load_settings", return_value=settings):
+                adapter._hook_pre_tool_call(
+                    tool_name="team_send",
+                    task_id="team-42-task-1",
+                    turn_id="turn-1",
+                )
+                adapter._hook_post_tool_call(
+                    tool_name="team_send",
+                    task_id="team-42-task-1",
+                    turn_id="turn-1",
+                    status="error",
+                    error_message="tool schema rejected arguments",
+                    result=json.dumps({
+                        "ok": False,
+                        "retryable": True,
+                        "error": "tool schema rejected arguments",
+                    }),
+                )
+            observation = adapter._read_json(adapter._turn_observation_path(settings))
+            self.assertEqual(observation["lastTool"]["toolName"], "team_send")
+            self.assertTrue(observation["lastTool"]["failed"])
+            self.assertTrue(observation["lastTool"]["retryable"])
+
+    def test_artifact_read_is_paginated_and_observed(self):
+        async def run_test():
+            with tempfile.TemporaryDirectory() as tmp:
+                settings = self.settings(Path(tmp))
+                adapter.ensure_team_dirs(settings)
+                target = settings.shared_path / "artifacts" / "large.txt"
+                target.write_text("abcdefghij", encoding="utf-8")
+                adapter._begin_turn_observation(
+                    settings,
+                    {
+                        "messageId": "artifact-turn",
+                        "rootTaskId": "team-42-task-1",
+                        "assignmentId": "dev-1",
+                        "revision": 1,
+                    },
+                    context_only=False,
+                )
+                with mock.patch.object(adapter, "load_settings", return_value=settings):
+                    first = json.loads(await adapter._tool_team_artifact_read({
+                        "scope": "team",
+                        "path": "/team/artifacts/large.txt",
+                        "maxBytes": 4,
+                    }))
+                    second = json.loads(await adapter._tool_team_artifact_read({
+                        "scope": "team",
+                        "path": "/team/artifacts/large.txt",
+                        "offset": first["artifact"]["nextOffset"],
+                        "maxBytes": 6,
+                    }))
+                self.assertEqual(first["artifact"]["content"], "abcd")
+                self.assertTrue(first["artifact"]["truncated"])
+                self.assertEqual(first["artifact"]["nextOffset"], 4)
+                self.assertEqual(second["artifact"]["content"], "efghij")
+                self.assertFalse(second["artifact"]["truncated"])
+                observation = adapter._read_json(adapter._turn_observation_path(settings))
+                self.assertEqual(observation["lastToolName"], "team_artifact_read")
+                self.assertIsNone(observation["lastTool"])
+
+        asyncio.run(run_test())
+
+    def test_progress_blocked_is_nonterminal_waiting(self):
+        async def run_test():
+            with tempfile.TemporaryDirectory() as tmp:
+                settings = self.settings(Path(tmp))
+                adapter.ensure_team_dirs(settings)
+                adapter._persist_active_envelope(settings, {
+                    "messageId": "wait-turn",
+                    "taskId": "team-42-task-1",
+                    "rootTaskId": "team-42-task-1",
+                    "assignmentId": "dev-1",
+                    "revision": 1,
+                })
+                published = []
+
+                async def capture(_settings, event, payload):
+                    published.append((event, payload))
+
+                with mock.patch.object(adapter, "load_settings", return_value=settings), mock.patch.object(
+                    adapter, "_publish_event", capture
+                ):
+                    result = json.loads(await adapter._tool_team_update_progress({
+                        "status": "blocked",
+                        "summary": "Waiting for dependency dev-0",
+                    }))
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["status"]["availability"], "busy")
+                self.assertEqual(result["status"]["runtimeStatus"], "waiting")
+                self.assertEqual(published[0][1]["status"], "waiting")
+                self.assertEqual(published[0][1]["runtimeStatus"], "waiting")
+
+        asyncio.run(run_test())
 
     def test_managed_startup_identity_loads_from_environment(self):
         with mock.patch.dict(

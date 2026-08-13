@@ -246,6 +246,7 @@ start_team_gateway() {
         export HERMES_GATEWAY_BUSY_INPUT_MODE="${HERMES_TEAM_BUSY_INPUT_MODE:-queue}"
         export HERMES_GATEWAY_BUSY_TEXT_MODE="${HERMES_TEAM_BUSY_TEXT_MODE:-queue}"
         export HERMES_GATEWAY_BUSY_ACK_ENABLED="${HERMES_TEAM_BUSY_ACK_ENABLED:-false}"
+        export CLAWMANAGER_HERMES_TEAM_WORKER_PROFILE=true
         export CLAWMANAGER_TEAM_READY_FILE="${CLAWMANAGER_TEAM_READY_FILE:-${HERMES_HOME}/runtime/redis-team.ready.json}"
         mkdir -p \
             "${HERMES_HOME}" \

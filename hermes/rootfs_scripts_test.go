@@ -32,6 +32,7 @@ func TestDashboardGatewayScriptStartsRedisTeamConsumerWhenAutorunEnabled(t *test
 		`HERMES_GATEWAY_BUSY_INPUT_MODE="${HERMES_TEAM_BUSY_INPUT_MODE:-queue}"`,
 		`HERMES_GATEWAY_BUSY_TEXT_MODE="${HERMES_TEAM_BUSY_TEXT_MODE:-queue}"`,
 		`HERMES_GATEWAY_BUSY_ACK_ENABLED="${HERMES_TEAM_BUSY_ACK_ENABLED:-false}"`,
+		`CLAWMANAGER_HERMES_TEAM_WORKER_PROFILE=true`,
 		"hermes gateway run --accept-hooks --no-supervise",
 		`wait -n "${wait_pids[@]}"`,
 	} {
@@ -88,6 +89,61 @@ func TestDockerfilePackagesCanonicalRedisTeamAdapter(t *testing.T) {
 	}
 	if strings.Contains(dockerfile, "COPY hermes/vendor-plugins/redis_team/") {
 		t.Fatal("Dockerfile still packages the stale vendor mirror")
+	}
+}
+
+func TestDockerfileAppliesVersionLockedTeamCompletionStopPatch(t *testing.T) {
+	data, err := os.ReadFile("Dockerfile")
+	if err != nil {
+		t.Fatalf("read Dockerfile: %v", err)
+	}
+	dockerfile := string(data)
+	for _, want := range []string{
+		"apply_team_completion_stop.py",
+		"/usr/local/lib/hermes-agent/agent/conversation_loop.py",
+	} {
+		if !strings.Contains(dockerfile, want) {
+			t.Fatalf("Dockerfile missing Hermes completion stop patch %q", want)
+		}
+	}
+	patch, err := os.ReadFile(filepath.Join("patches", "hermes-agent", "apply_team_completion_stop.py"))
+	if err != nil {
+		t.Fatalf("read Team completion stop patch: %v", err)
+	}
+	for _, want := range []string{
+		"clawmanager-team-completion-stop-v1",
+		`_team_result_message.get("name") != "team_complete_task"`,
+		`_team_result_payload.get("ok") is True`,
+		`== "accepted"`,
+		`_turn_exit_reason = "team_completion_accepted"`,
+	} {
+		if !strings.Contains(string(patch), want) {
+			t.Fatalf("Hermes completion stop patch missing %q", want)
+		}
+	}
+}
+
+func TestApplyRuntimeConfigScopesTeamWorkerToolsets(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("rootfs", "usr", "local", "bin", "hermes-apply-runtime-config"))
+	if err != nil {
+		t.Fatalf("read hermes-apply-runtime-config: %v", err)
+	}
+	script := string(data)
+	for _, want := range []string{
+		`platform_toolsets["redis_team"]`,
+		`"redis_team"`,
+		`"file"`,
+		`"terminal"`,
+		`"code_execution"`,
+		`"web"`,
+		`"browser"`,
+		`"vision"`,
+		`truthy_env("CLAWMANAGER_HERMES_TEAM_WORKER_PROFILE")`,
+		`unique_nonempty([*disabled_toolsets, "kanban"])`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("hermes-apply-runtime-config missing Team toolset contract %q", want)
+		}
 	}
 }
 
