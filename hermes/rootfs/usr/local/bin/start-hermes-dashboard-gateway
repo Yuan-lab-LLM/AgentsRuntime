@@ -229,7 +229,6 @@ prepare_team_startup_state() {
 start_team_gateway() {
     echo "Preparing Hermes Redis Team consumer: member=${CLAWMANAGER_TEAM_MEMBER_ID} dashboard_port=${port} team_worker_port=${team_worker_port}"
     (
-        dashboard_hermes_home="${HERMES_HOME}"
         team_worker_home="${HERMES_TEAM_WORKER_HOME:-${HOME}/.clawmanager-team-worker}"
         export HOME="${team_worker_home}"
         export HERMES_HOME="${team_worker_home}/.hermes"
@@ -255,11 +254,6 @@ start_team_gateway() {
             "${XDG_CONFIG_HOME}" \
             "${XDG_DATA_HOME}" \
             "$(dirname "${CLAWMANAGER_TEAM_READY_FILE}")"
-        for managed_identity in SOUL.md AGENTS.md team.json team-introduction.md; do
-            if [ -f "${dashboard_hermes_home}/${managed_identity}" ] && [ ! -e "${HERMES_HOME}/${managed_identity}" ]; then
-                cp "${dashboard_hermes_home}/${managed_identity}" "${HERMES_HOME}/${managed_identity}"
-            fi
-        done
         prepare_managed_bundled_skills "${HERMES_HOME}"
         /usr/local/bin/hermes-apply-runtime-config
         cd "${team_worker_home}"
@@ -270,10 +264,49 @@ start_team_gateway() {
     return 0
 }
 
+initialize_native_session_store() {
+    # The Dashboard and redis_team gateway share Hermes' native Team profile.
+    # Initialize/migrate the SQLite store once before either process starts so
+    # two first-use connections cannot race while enabling WAL mode.
+    PYTHONPATH="/usr/local/lib/hermes-agent${PYTHONPATH:+:${PYTHONPATH}}" python - <<'PY'
+import os
+from pathlib import Path
+
+from hermes_state import SessionDB
+
+db = SessionDB(Path(os.environ["HERMES_HOME"]) / "state.db")
+db.close()
+PY
+}
+
 start_instance_agent
 
 if should_start_team_gateway; then
     team_gateway_required="true"
+    instance_hermes_home="${HERMES_HOME}"
+    team_worker_home="${HERMES_TEAM_WORKER_HOME:-${HOME}/.clawmanager-team-worker}"
+    team_hermes_home="${team_worker_home}/.hermes"
+    mkdir -p "${team_hermes_home}"
+    for managed_identity in .env config.yaml SOUL.md AGENTS.md team.json team-introduction.md; do
+        if [ -f "${instance_hermes_home}/${managed_identity}" ] && [ ! -e "${team_hermes_home}/${managed_identity}" ]; then
+            cp "${instance_hermes_home}/${managed_identity}" "${team_hermes_home}/${managed_identity}"
+        fi
+    done
+    # A Team-assigned Hermes Lite instance exposes the Team Worker's native
+    # profile in the existing Dashboard. This lets redis_team tasks and
+    # instance-desktop chats share Hermes' own state/session behavior without
+    # copying SQLite data or patching the GUI. Non-Team instances keep the
+    # ordinary profile selected above.
+    export HOME="${team_worker_home}"
+    export HERMES_HOME="${team_hermes_home}"
+    export XDG_CACHE_HOME="${team_worker_home}/.cache"
+    export XDG_CONFIG_HOME="${team_worker_home}/.config"
+    export XDG_DATA_HOME="${team_worker_home}/.local/share"
+    export NPM_CONFIG_CACHE="${XDG_CACHE_HOME}/npm"
+    export UV_CACHE_DIR="${XDG_CACHE_HOME}/uv"
+    mkdir -p "${NPM_CONFIG_CACHE}" "${UV_CACHE_DIR}" "${XDG_CONFIG_HOME}" "${XDG_DATA_HOME}"
+    /usr/local/bin/hermes-apply-runtime-config
+    initialize_native_session_store
     prepare_team_startup_state
 fi
 

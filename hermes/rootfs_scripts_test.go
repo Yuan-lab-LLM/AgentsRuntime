@@ -28,7 +28,8 @@ func TestDashboardGatewayScriptStartsRedisTeamConsumerWhenAutorunEnabled(t *test
 		`[ "${team_worker_port}" -eq "${port}" ]`,
 		`[ "${team_worker_port}" -gt 65535 ]`,
 		`/usr/local/bin/hermes-apply-runtime-config`,
-		`for managed_identity in SOUL.md AGENTS.md team.json team-introduction.md`,
+		`for managed_identity in .env config.yaml SOUL.md AGENTS.md team.json team-introduction.md`,
+		`export HERMES_HOME="${team_hermes_home}"`,
 		`HERMES_GATEWAY_BUSY_INPUT_MODE="${HERMES_TEAM_BUSY_INPUT_MODE:-queue}"`,
 		`HERMES_GATEWAY_BUSY_TEXT_MODE="${HERMES_TEAM_BUSY_TEXT_MODE:-queue}"`,
 		`HERMES_GATEWAY_BUSY_ACK_ENABLED="${HERMES_TEAM_BUSY_ACK_ENABLED:-false}"`,
@@ -120,6 +121,41 @@ func TestDockerfileAppliesVersionLockedTeamCompletionStopPatch(t *testing.T) {
 		if !strings.Contains(string(patch), want) {
 			t.Fatalf("Hermes completion stop patch missing %q", want)
 		}
+	}
+}
+
+func TestTeamAssignedDashboardSelectsNativeTeamWorkerProfile(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("rootfs", "usr", "local", "bin", "start-hermes-dashboard-gateway"))
+	if err != nil {
+		t.Fatalf("read dashboard gateway script: %v", err)
+	}
+	script := string(data)
+	teamBranch := strings.Index(script, "if should_start_team_gateway; then")
+	dashboardStart := strings.LastIndex(script, `echo "Starting Hermes dashboard gateway`)
+	if teamBranch < 0 || dashboardStart < 0 || teamBranch > dashboardStart {
+		t.Fatal("Team profile selection must happen before the Dashboard starts")
+	}
+	teamSetup := script[teamBranch:dashboardStart]
+	for _, want := range []string{
+		`team_hermes_home="${team_worker_home}/.hermes"`,
+		`for managed_identity in .env config.yaml SOUL.md AGENTS.md team.json team-introduction.md`,
+		`export HOME="${team_worker_home}"`,
+		`export HERMES_HOME="${team_hermes_home}"`,
+		`export XDG_CACHE_HOME="${team_worker_home}/.cache"`,
+		`/usr/local/bin/hermes-apply-runtime-config`,
+		`initialize_native_session_store`,
+		`prepare_team_startup_state`,
+	} {
+		if !strings.Contains(teamSetup, want) {
+			t.Fatalf("Team-assigned Dashboard profile setup missing %q", want)
+		}
+	}
+	if !strings.Contains(script, `SessionDB(Path(os.environ["HERMES_HOME"]) / "state.db")`) {
+		t.Fatal("Team profile must initialize Hermes' native session store before concurrent consumers start")
+	}
+	if strings.Contains(script, "CLAWMANAGER_HERMES_TEAM_SESSION_DB") ||
+		strings.Contains(script, "clawmanager-team-sessions-v1") {
+		t.Fatal("Dashboard must use Hermes' native Team Worker profile, not a parallel session projection")
 	}
 }
 
