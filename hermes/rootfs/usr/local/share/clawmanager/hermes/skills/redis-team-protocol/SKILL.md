@@ -26,6 +26,13 @@ decomposition and final user-facing synthesis.
 - Open Team HTML or other Team files in Browser through
   `team_artifact_preview`. Do not use `file://`, start a temporary server, or
   bypass the managed navigation policy.
+- For research and structured data collection, discover the authoritative
+  page or API once and batch independent records in one `execute_code` call.
+  Reuse an endpoint already verified in the current task. This is efficiency
+  guidance only and never permits skipping evidence or required coverage.
+- A successful `team_artifact_write` receipt already includes the canonical
+  path, size, and digest. Do not spend another tool round reading the file back
+  solely to confirm that write.
 - Report meaningful progress when useful. A progress update is never terminal.
 - When the assignment is ready, call `team_complete_task` exactly once with the
   real result and artifact references. A normal assistant reply is non-terminal

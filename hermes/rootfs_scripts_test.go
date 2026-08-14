@@ -155,12 +155,15 @@ func TestDockerfileAppliesVersionLockedTeamLiveSessionsPatchBeforeWebBuild(t *te
 	for _, want := range []string{
 		"clawmanager-team-live-session-checkpoint-v1",
 		"clawmanager-team-live-session-poll-v1",
+		"clawmanager-team-session-owner-v1",
 		`!= "redis_team"`,
 		"_last_flushed_db_idx",
 		"agent._checkpoint_session(messages, conversation_history)",
 		`session.source !== "redis_team"`,
 		"setTimeout(() => void loadLiveMessages(false), 1500)",
 		"clearTimeout(timer)",
+		"redis_team_turn_exit",
+		"_clawmanager_external_redis_team",
 	} {
 		if !strings.Contains(patchSource, want) {
 			t.Fatalf("Hermes live Team session patch missing %q", want)

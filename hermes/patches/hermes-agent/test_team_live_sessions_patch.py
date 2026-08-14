@@ -10,9 +10,10 @@ import apply_team_live_sessions as patch
 class TeamLiveSessionsPatchTest(unittest.TestCase):
     def make_fixture(self, root: Path) -> None:
         (root / "agent").mkdir(parents=True)
+        (root / "tui_gateway").mkdir(parents=True)
         (root / "web" / "src" / "pages").mkdir(parents=True)
         (root / "run_agent.py").write_text(
-            patch.RUN_AGENT_METHOD_ANCHOR,
+            patch.RUN_AGENT_METHOD_ANCHOR + patch.RUN_AGENT_FINALIZE_ANCHOR,
             encoding="utf-8",
         )
         (root / "agent" / "conversation_loop.py").write_text(
@@ -36,6 +37,17 @@ class TeamLiveSessionsPatchTest(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        (root / "tui_gateway" / "server.py").write_text(
+            "\n".join(
+                [
+                    patch.TUI_FINALIZE_ANCHOR,
+                    patch.TUI_RESUME_ANCHOR,
+                    patch.TUI_RESUME_INIT_ANCHOR,
+                    patch.TUI_PROMPT_ANCHOR,
+                ]
+            ),
+            encoding="utf-8",
+        )
 
     def test_applies_scoped_runtime_and_web_patches_idempotently(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -49,6 +61,7 @@ class TeamLiveSessionsPatchTest(unittest.TestCase):
                     root / "run_agent.py",
                     root / "agent" / "conversation_loop.py",
                     root / "web" / "src" / "pages" / "SessionsPage.tsx",
+                    root / "tui_gateway" / "server.py",
                 )
             }
             patch.apply(root)
@@ -64,11 +77,16 @@ class TeamLiveSessionsPatchTest(unittest.TestCase):
                 ),
                 3,
             )
+            self.assertIn("redis_team_turn_exit", first[root / "run_agent.py"])
             web = first[root / "web" / "src" / "pages" / "SessionsPage.tsx"]
             self.assertIn(patch.WEB_MARKER, web)
             self.assertIn('session.source !== "redis_team"', web)
             self.assertIn("clearTimeout(timer)", web)
             self.assertIn("followTailRef", web)
+            tui = first[root / "tui_gateway" / "server.py"]
+            self.assertIn(patch.TUI_MARKER, tui)
+            self.assertIn("external_redis_team", tui)
+            self.assertIn("_clawmanager_tui_wrote", tui)
             for path, content in first.items():
                 self.assertEqual(path.read_text(encoding="utf-8"), content)
 

@@ -710,12 +710,19 @@ def _artifact_path(
             / _safe_name(assignment_id)
         )
         canonical_candidate = settings.shared_path / relative
-        if _trim(args.get("path")).replace("\\", "/").startswith("/team/"):
+        root_relative = root.relative_to(settings.shared_path)
+        raw_path = _trim(args.get("path")).replace("\\", "/")
+        canonical_relative = relative == root_relative or root_relative in relative.parents
+        if raw_path.startswith("/team/") or canonical_relative:
             try:
                 canonical_candidate.relative_to(root)
             except ValueError as exc:
                 raise ValueError("Canonical Team artifact path is outside the active member scope") from exc
             candidate = canonical_candidate
+        elif relative.parts and relative.parts[0] in {"artifacts", "results"}:
+            raise ValueError(
+                "Member artifact path must be assignment-relative or the exact canonical current-assignment path"
+            )
         else:
             candidate = root / relative
     elif scope == "team":
@@ -982,11 +989,19 @@ async def _tool_team_artifact_write(args: dict[str, Any], **_kwargs) -> str:
     try:
         effective_args = _normalize_validation_artifact_write_args(settings, args)
         target = _artifact_path(settings, effective_args, default_scope="member", write=True)
-        _atomic_write_text(target, str(args.get("content") or ""))
+        content = str(args.get("content") or "")
+        _atomic_write_text(target, content)
         return _team_tool_json_result(
             settings,
             "team_artifact_write",
-            {"ok": True, "artifact": {"path": canonical_artifact_ref(settings, target), "bytes": target.stat().st_size}},
+            {
+                "ok": True,
+                "artifact": {
+                    "path": canonical_artifact_ref(settings, target),
+                    "bytes": target.stat().st_size,
+                    "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                },
+            },
         )
     except Exception as exc:
         return _team_tool_json_result(settings, "team_artifact_write", {"ok": False, "error": str(exc)})
@@ -4254,7 +4269,14 @@ def register(ctx) -> None:
     ctx.register_hook("post_tool_call", _hook_post_tool_call)
     artifact_path_properties = {
         "scope": {"type": "string", "enum": ["member", "team"]},
-        "path": {"type": "string", "description": "Current-Team path; traversal and symlinks are rejected"},
+        "path": {
+            "type": "string",
+            "description": (
+                "For member writes prefer an assignment-relative path such as report.md. "
+                "An exact canonical /team/... path returned by these tools is also accepted; "
+                "do not prepend either form to the other. Traversal and symlinks are rejected."
+            ),
+        },
         "rootTaskId": {"type": "string"},
         "assignmentId": {"type": "string"},
     }
@@ -4263,7 +4285,11 @@ def register(ctx) -> None:
         toolset="redis_team",
         schema={
             "name": "team_artifact_write",
-            "description": "Atomically write a UTF-8 artifact inside the current Team workspace.",
+            "description": (
+                "Atomically write a UTF-8 artifact inside the current Team workspace. "
+                "The success result includes the canonical path, byte count, and sha256; "
+                "do not read the file back only to confirm the write."
+            ),
             "parameters": {
                 "type": "object",
                 "additionalProperties": False,
@@ -4512,7 +4538,12 @@ def register(ctx) -> None:
             "message as delegated Worker work. Read the task context and "
             "/team/team.json when available. Prefer team_artifact_write/read/list/mkdir "
             "for shared files and use team_artifact_preview before opening a Team file "
-            "in Browser; never use file:// or start a temporary server. Validation is "
+            "in Browser; never use file:// or start a temporary server. For research or "
+            "data collection, discover the authoritative page/API once, then batch independent "
+            "records in one execute_code call instead of alternating one model turn per item. "
+            "Reuse endpoints already verified in the current task, and treat a successful "
+            "team_artifact_write receipt as proof of the write instead of reading it back. "
+            "This is efficiency guidance, never a reason to skip required evidence or delivery. Validation is "
             "assignment-specific: production-only assignments produce and hand off artifacts "
             "without tests, while assignments explicitly designated by the Leader as test, "
             "review, or evidence work validate normally regardless of the member role. "

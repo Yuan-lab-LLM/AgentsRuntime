@@ -123,7 +123,13 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 	} else {
 		auth["mode"] = "trusted-proxy"
 		delete(auth, "token")
-		if strings.TrimSpace(configStringValue(auth["password"])) == "" {
+		if managedPassword, managed := managedOpenClawGatewayPassword(req); managed {
+			// ClawManager-managed Lite instances use the same per-instance
+			// credential for the Gateway process and its local Browser client.
+			// Reconcile persisted legacy values here so a recreated instance
+			// cannot start the two sides with different passwords.
+			auth["password"] = managedPassword
+		} else if strings.TrimSpace(configStringValue(auth["password"])) == "" {
 			auth["password"] = openClawTrustedProxyDefaultPassword
 		}
 		trustedProxy := ensureObject(auth, "trustedProxy")
@@ -198,6 +204,12 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 		return fmt.Errorf("stat openclaw cron dir: %w", err)
 	}
 	return nil
+}
+
+func managedOpenClawGatewayPassword(req gateway.CreateGatewayRequest) (string, bool) {
+	value, ok := requestEnvValue(req, "CLAWMANAGER_INSTANCE_TOKEN")
+	value = strings.TrimSpace(value)
+	return value, ok && value != ""
 }
 
 // configureManagedOpenClawBrowser supplies the safe Lite runtime defaults that

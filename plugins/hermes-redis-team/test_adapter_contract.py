@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import importlib.util
 import json
 import os
@@ -93,6 +94,9 @@ class HermesRedisTeamContractTests(unittest.TestCase):
         self.assertIn("review, or evidence work", source)
         self.assertIn("never block delivery", source)
         self.assertIn("call team_complete_task", source)
+        self.assertIn("batch independent", source)
+        self.assertIn("one execute_code call", source)
+        self.assertIn("never a reason to skip required evidence", source)
 
     def test_assignment_validation_guidance_is_contract_driven_and_role_agnostic(self):
         developer = adapter.RedisTeamSettings(
@@ -701,6 +705,22 @@ class HermesRedisTeamContractTests(unittest.TestCase):
                 adapter.canonical_artifact_ref(settings, target),
                 "/team/artifacts/team-42-task-7/members/developer/dev-1/result.md",
             )
+            canonical_without_prefix = adapter._artifact_path(
+                settings,
+                {
+                    "path": "artifacts/team-42-task-7/members/developer/dev-1/result.md",
+                },
+                default_scope="member",
+                write=True,
+            )
+            self.assertEqual(canonical_without_prefix, target)
+            with self.assertRaisesRegex(ValueError, "assignment-relative"):
+                adapter._artifact_path(
+                    settings,
+                    {"path": "artifacts/team-42-task-7/result.md"},
+                    default_scope="member",
+                    write=True,
+                )
             with self.assertRaisesRegex(ValueError, "traversal"):
                 adapter._artifact_path(
                     settings,
@@ -708,6 +728,38 @@ class HermesRedisTeamContractTests(unittest.TestCase):
                     default_scope="member",
                     write=True,
                 )
+
+    def test_artifact_write_receipt_is_sufficient_without_readback(self):
+        async def run_test():
+            with tempfile.TemporaryDirectory() as tmp:
+                settings = self.settings(Path(tmp))
+                adapter.ensure_team_dirs(settings)
+                adapter._persist_active_envelope(
+                    settings,
+                    {
+                        "rootTaskId": "team-42-task-7",
+                        "assignmentId": "dev-1",
+                        "taskId": "team-42-task-7",
+                    },
+                )
+                with mock.patch.object(adapter, "load_settings", return_value=settings):
+                    result = json.loads(
+                        await adapter._tool_team_artifact_write(
+                            {"path": "result.md", "content": "complete"}
+                        )
+                    )
+                self.assertTrue(result["ok"])
+                self.assertEqual(
+                    result["artifact"]["path"],
+                    "/team/artifacts/team-42-task-7/members/developer/dev-1/result.md",
+                )
+                self.assertEqual(result["artifact"]["bytes"], len("complete"))
+                self.assertEqual(
+                    result["artifact"]["sha256"],
+                    hashlib.sha256(b"complete").hexdigest(),
+                )
+
+        asyncio.run(run_test())
 
     def test_preview_uses_same_persistent_managed_url_contract_as_openclaw(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1269,6 +1321,7 @@ class HermesRedisTeamContractTests(unittest.TestCase):
                     message_id=context["messageId"],
                     source=types.SimpleNamespace(chat_id=context["taskId"]),
                 )
+
                 await instance.on_processing_complete(event, adapter.ProcessingOutcome.SUCCESS)
 
             asyncio.run(run_test())

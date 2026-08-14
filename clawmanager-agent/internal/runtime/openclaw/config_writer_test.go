@@ -280,6 +280,35 @@ func TestWriteOpenClawGatewayConfigPreservesExplicitTrustedProxyPassword(t *test
 	}
 }
 
+func TestWriteOpenClawGatewayConfigReconcilesManagedTrustedProxyPassword(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "openclaw", "user-45", "instance-652")
+	configPath := filepath.Join(workspace, "home", ".openclaw", "openclaw.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"gateway":{"auth":{"password":"stale-password"}}}`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	req := CreateGatewayRequest{
+		InstanceID: 652,
+		UserID:     45,
+		UID:        200652,
+		GID:        200652,
+		Environment: map[string]string{
+			"CLAWMANAGER_INSTANCE_TOKEN": "instance-652-secret",
+		},
+	}
+	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace, 20003); err != nil {
+		t.Fatalf("WriteGatewayConfig() error = %v", err)
+	}
+
+	auth := objectAt(t, objectAt(t, readOpenClawConfigForTest(t, configPath), "gateway"), "auth")
+	if auth["password"] != "instance-652-secret" {
+		t.Fatalf("gateway.auth.password = %#v, want managed instance token", auth["password"])
+	}
+}
+
 func TestWriteOpenClawGatewayConfigPreservesExplicitBrowserConfig(t *testing.T) {
 	workspace := filepath.Join(t.TempDir(), "openclaw", "user-45", "instance-65")
 	configPath := filepath.Join(workspace, "home", ".openclaw", "openclaw.json")
