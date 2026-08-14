@@ -124,6 +124,50 @@ func TestDockerfileAppliesVersionLockedTeamCompletionStopPatch(t *testing.T) {
 	}
 }
 
+func TestDockerfileAppliesVersionLockedTeamLiveSessionsPatchBeforeWebBuild(t *testing.T) {
+	data, err := os.ReadFile("Dockerfile")
+	if err != nil {
+		t.Fatalf("read Dockerfile: %v", err)
+	}
+	dockerfile := string(data)
+	completionRunIndex := strings.Index(dockerfile, "/usr/local/lib/hermes-agent/venv/bin/python /tmp/apply_team_completion_stop.py")
+	patchRunIndex := strings.Index(dockerfile, "/usr/local/lib/hermes-agent/venv/bin/python /tmp/apply_team_live_sessions.py")
+	webBuildIndex := strings.Index(dockerfile, "npm run build -w web")
+	if completionRunIndex < 0 || patchRunIndex < 0 || webBuildIndex < 0 ||
+		completionRunIndex > patchRunIndex || patchRunIndex > webBuildIndex {
+		t.Fatal("Hermes live Team session patch must run before the Dashboard web build")
+	}
+	for _, want := range []string{
+		"COPY hermes/patches/hermes-agent/apply_team_live_sessions.py",
+		"/usr/local/lib/hermes-agent/venv/bin/python /tmp/apply_team_live_sessions.py",
+		"/usr/local/lib/hermes-agent",
+	} {
+		if !strings.Contains(dockerfile, want) {
+			t.Fatalf("Dockerfile missing Hermes live Team session patch %q", want)
+		}
+	}
+
+	patchData, err := os.ReadFile(filepath.Join("patches", "hermes-agent", "apply_team_live_sessions.py"))
+	if err != nil {
+		t.Fatalf("read Team live session patch: %v", err)
+	}
+	patchSource := string(patchData)
+	for _, want := range []string{
+		"clawmanager-team-live-session-checkpoint-v1",
+		"clawmanager-team-live-session-poll-v1",
+		`!= "redis_team"`,
+		"_last_flushed_db_idx",
+		"agent._checkpoint_session(messages, conversation_history)",
+		`session.source !== "redis_team"`,
+		"setTimeout(() => void loadLiveMessages(false), 1500)",
+		"clearTimeout(timer)",
+	} {
+		if !strings.Contains(patchSource, want) {
+			t.Fatalf("Hermes live Team session patch missing %q", want)
+		}
+	}
+}
+
 func TestTeamAssignedDashboardSelectsNativeTeamWorkerProfile(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join("rootfs", "usr", "local", "bin", "start-hermes-dashboard-gateway"))
 	if err != nil {
