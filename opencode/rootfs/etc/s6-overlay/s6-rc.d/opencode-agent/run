@@ -27,4 +27,18 @@ mkdir -p \
 
 /usr/local/bin/opencode-apply-runtime-config || true
 
+# A Pro desktop runs OpenCode and its terminal as abc.  The agent launches
+# OpenCode Web as a child, so keeping this service as root leaves root-owned
+# logs in the persistent volume and blocks the terminal client on later use.
+if [ "${CLAWMANAGER_RUNTIME_TYPE:-}" = "desktop" ] && command -v s6-setuidgid >/dev/null 2>&1; then
+  chown -R abc:abc \
+    "${CLAWMANAGER_AGENT_PERSISTENT_DIR:-/config}/opencode-agent" \
+    "${OPENCODE_CONFIG_DIR}" \
+    "${XDG_CACHE_HOME}" \
+    "${XDG_CONFIG_HOME}" \
+    "${XDG_DATA_HOME}" \
+    2>/dev/null || true
+  exec s6-setuidgid abc /usr/local/bin/clawmanager-agent
+fi
+
 exec /usr/local/bin/clawmanager-agent

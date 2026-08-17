@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.7
 
 FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS clawmanager-agent-builder
 

@@ -8,6 +8,20 @@ fi
 
 /usr/local/bin/opencode-apply-runtime-config || true
 
+# A persistent /config volume may contain files created by an older image that
+# ran OpenCode as root. Repair ownership on every Pro boot before handing the
+# process to the KDE user, otherwise OpenCode cannot append its log file.
+if id abc >/dev/null 2>&1; then
+  mkdir -p /config/.cache /config/.config /config/.local/share/opencode/log /config/workspace "${OPENCODE_CONFIG_DIR:-/config/.opencode}"
+  chown -R abc:abc \
+    /config/.cache \
+    /config/.config \
+    /config/.local \
+    /config/workspace \
+    "${OPENCODE_CONFIG_DIR:-/config/.opencode}" \
+    2>/dev/null || true
+fi
+
 # The Pro terminal and desktop session run as abc.  Starting the web server as
 # root creates root-owned OpenCode logs under /config and makes the terminal
 # client fail with PermissionDenied on its next launch.

@@ -22,13 +22,28 @@ fi
 # OpenCode resolves a non-project working directory to the global root (/),
 # which leaves the Web UI with an empty session pane. Each managed instance
 # gets its own lightweight Git worktree instead.
-project_path="${CLAWMANAGER_PROJECT_PATH:-${CLAWMANAGER_WORKSPACE_PATH:-}}"
-if [ -n "${project_path}" ]; then
-  mkdir -p "${project_path}"
-  if command -v git >/dev/null 2>&1 && [ ! -d "${project_path}/.git" ]; then
-    git -C "${project_path}" init --quiet || true
-  fi
-  cd "${project_path}"
+# The managed workspace is only a container for uploaded projects and skills.
+# Init-container exports are not inherited by the main desktop container, so
+# calculate the default project here instead of relying on its temporary env.
+workspace_path="${CLAWMANAGER_PROJECT_PATH:-${CLAWMANAGER_WORKSPACE_PATH:-/config/workspace}}"
+workspace_path="$(realpath -m "${workspace_path}")"
+project_path="${CLAWMANAGER_DEFAULT_PROJECT_PATH:-${workspace_path%/}/project}"
+project_path="$(realpath -m "${project_path}")"
+
+# A project path originates from the control plane.  Treat it as untrusted at
+# the image boundary so a malformed override cannot make OpenCode browse the
+# container's configuration, credentials, or host-mounted paths.
+case "${project_path}" in
+  "${workspace_path}"|"${workspace_path}"/*) ;;
+  *)
+    echo "OpenCode project path must stay within ${workspace_path}: ${project_path}" >&2
+    exit 64
+    ;;
+esac
+
+mkdir -p "${project_path}"
+if command -v git >/dev/null 2>&1 && [ ! -d "${project_path}/.git" ]; then
+  git -C "${project_path}" init --quiet || true
 fi
 
 if [ -z "${OPENCODE_SERVER_PASSWORD:-}" ] && [ "${host}" != "127.0.0.1" ] && [ "${host}" != "::1" ] && [ "${host}" != "localhost" ]; then
@@ -39,4 +54,10 @@ if [ -n "${OPENCODE_SERVER_PASSWORD:-}" ]; then
   export OPENCODE_SERVER_USERNAME="${OPENCODE_SERVER_USERNAME:-opencode}"
 fi
 
-exec /usr/local/bin/opencode web --hostname "${host}" --port "${port}"
+if [ -n "${project_path}" ]; then
+  cd "${project_path}"
+fi
+# `opencode web` also calls xdg-open, which creates a normal Chromium window.
+# Pro launches its own app-mode Chromium from start-opencode-terminal, so use
+# the headless server command here to keep exactly one desktop window.
+exec /usr/local/bin/opencode serve --hostname "${host}" --port "${port}"

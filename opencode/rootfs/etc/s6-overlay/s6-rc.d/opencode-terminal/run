@@ -19,6 +19,13 @@ if ! command -v s6-setuidgid >/dev/null 2>&1; then
   exec sleep infinity
 fi
 
+# Chromium is started as the desktop user. A persistent /config volume may
+# contain a Crashpad profile left by an older root-launched browser, which
+# makes Chromium abort before showing OpenCode. Repair only Chromium's own
+# profile here; workspace and OpenCode data are intentionally untouched.
+mkdir -p /config/.config/chromium
+chown -R abc:abc /config/.config/chromium 2>/dev/null || true
+
 exec s6-setuidgid abc env \
   HOME=/config \
   DISPLAY=:1 \

@@ -20,4 +20,8 @@ case "${OPENCODE_PRO_WEB_AUTH:-false}" in
   *) unset OPENCODE_SERVER_USERNAME OPENCODE_SERVER_PASSWORD ;;
 esac
 
+# The desktop launch helper opens a directory-scoped Web URL once this local
+# server is ready. Do not create a synthetic session here: project paths can
+# contain arbitrary UTF-8 and the Web route already provides a correct new
+# session view for the selected directory.
 exec /usr/local/bin/start-opencode-web
