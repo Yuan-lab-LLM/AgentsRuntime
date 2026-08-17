@@ -233,6 +233,78 @@ func populateSharedOpenClawNPM(source, target string) error {
 			}
 			continue
 		}
+		if entry.Name() == "projects" {
+			if err := populateSharedNPMProjects(sourcePath, targetPath); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := copyOpenClawNPMRootEntry(sourcePath, targetPath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// populateSharedNPMProjects supports OpenClaw 2026.7.1's isolated managed npm
+// layout. Project metadata remains instance-owned so OpenClaw can update its
+// lock and retention state, while the image-provided packages are linked in
+// the same way as packages from the legacy npm/node_modules layout.
+func populateSharedNPMProjects(source, target string) error {
+	info, err := os.Stat(source)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("source is not a directory: %s", source)
+	}
+	if err := os.MkdirAll(target, info.Mode().Perm()); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(source)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		sourcePath := filepath.Join(source, entry.Name())
+		targetPath := filepath.Join(target, entry.Name())
+		if !entry.IsDir() {
+			if err := copyOpenClawNPMRootEntry(sourcePath, targetPath); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := populateSharedNPMProject(sourcePath, targetPath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func populateSharedNPMProject(source, target string) error {
+	info, err := os.Stat(source)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("source is not a directory: %s", source)
+	}
+	if err := os.MkdirAll(target, info.Mode().Perm()); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(source)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		sourcePath := filepath.Join(source, entry.Name())
+		targetPath := filepath.Join(target, entry.Name())
+		if entry.Name() == "node_modules" {
+			if err := populateSharedNodeModules(sourcePath, targetPath); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := copyOpenClawNPMRootEntry(sourcePath, targetPath); err != nil {
 			return err
 		}

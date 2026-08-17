@@ -158,7 +158,7 @@
           "enabled": false
         },
         "browser": {
-          "enabled": false
+          "enabled": true
         },
         "phone-control": {
           "enabled": false

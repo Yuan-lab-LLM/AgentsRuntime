@@ -150,7 +150,7 @@ func TestGatewayEnvKeepsExplicitHermesDashboardBasicAuth(t *testing.T) {
 		Environment: map[string]string{
 			"HERMES_DASHBOARD_BASIC_AUTH_USERNAME": "admin",
 			"HERMES_DASHBOARD_BASIC_AUTH_PASSWORD": "explicit-password",
-			"CLAWMANAGER_INSTANCE_TOKEN":          "igt_should_not_override",
+			"CLAWMANAGER_INSTANCE_TOKEN":           "igt_should_not_override",
 		},
 	}
 	workspacePath := "/workspaces/hermes/user-45/instance-71"

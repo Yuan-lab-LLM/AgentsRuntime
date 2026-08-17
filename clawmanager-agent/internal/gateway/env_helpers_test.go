@@ -303,3 +303,48 @@ func TestOpenClawGatewayEnvIsolatesInstancePaths(t *testing.T) {
 		})
 	}
 }
+
+func TestOpenClawGatewayEnvUsesManagedInstancePasswordForLocalTools(t *testing.T) {
+	req := CreateGatewayRequest{
+		AgentType:  "openclaw",
+		UserID:     45,
+		InstanceID: 123,
+		Environment: map[string]string{
+			"CLAWMANAGER_INSTANCE_TOKEN": "instance-123-secret",
+			"OPENCLAW_GATEWAY_PASSWORD":  "unmanaged-override",
+			"OPENCLAW_GATEWAY_TOKEN":     "stale-token",
+		},
+	}
+	env := OpenClawGatewayEnv(
+		[]string{"OPENCLAW_GATEWAY_PASSWORD=base-password"},
+		Config{RuntimeType: "openclaw", GatewayAuthMode: "trusted-proxy"},
+		req,
+		filepath.Join("/workspaces", "openclaw", "user-45", "instance-123"),
+		20123,
+	)
+	if got := envValue(env, "OPENCLAW_GATEWAY_PASSWORD"); got != "instance-123-secret" {
+		t.Fatalf("OPENCLAW_GATEWAY_PASSWORD = %q, want managed instance token", got)
+	}
+	if got := envValue(env, "OPENCLAW_GATEWAY_TOKEN"); got != "" {
+		t.Fatalf("OPENCLAW_GATEWAY_TOKEN = %q, want unset in trusted-proxy mode", got)
+	}
+}
+
+func TestOpenClawGatewayEnvDoesNotChangeTokenAuthContract(t *testing.T) {
+	req := CreateGatewayRequest{Environment: map[string]string{
+		"CLAWMANAGER_INSTANCE_TOKEN": "instance-secret",
+	}}
+	env := OpenClawGatewayEnv(
+		nil,
+		Config{RuntimeType: "openclaw", GatewayAuthMode: "token", GatewayToken: "gateway-token"},
+		req,
+		filepath.Join("/workspaces", "openclaw", "user-1", "instance-2"),
+		20002,
+	)
+	if got := envValue(env, "OPENCLAW_GATEWAY_TOKEN"); got != "gateway-token" {
+		t.Fatalf("OPENCLAW_GATEWAY_TOKEN = %q, want configured token", got)
+	}
+	if got := envValue(env, "OPENCLAW_GATEWAY_PASSWORD"); got != "" {
+		t.Fatalf("OPENCLAW_GATEWAY_PASSWORD = %q, want unset for token auth", got)
+	}
+}

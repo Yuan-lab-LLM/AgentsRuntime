@@ -40,7 +40,6 @@ var openClawDefaultDeniedNodeCommands = []string{
 var openClawDefaultDisabledPlugins = []string{
 	"bonjour",
 	"acpx",
-	"browser",
 	"phone-control",
 	"talk-voice",
 	"device-pair",
@@ -96,6 +95,7 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 	}
 	configureManagedOpenClawBrowser(config, req, port)
 	mergeOpenClawLiteDefaults(config)
+	reconcileOpenClawBrowserPlugin(config)
 	if err := mergeOpenClawChannelsFromRequest(config, req); err != nil {
 		return err
 	}
@@ -231,6 +231,26 @@ func configureManagedOpenClawBrowser(config map[string]any, req gateway.CreateGa
 	browser["extraArgs"] = managedOpenClawBrowserArgs(browser["extraArgs"], proxyURL)
 	ssrfPolicy := ensureObject(browser, "ssrfPolicy")
 	ssrfPolicy["dangerouslyAllowPrivateNetwork"] = true
+	// Do not add a hostnameAllowlist here. In OpenClaw it is an exclusive
+	// navigation allowlist, not an additive DNS exception. The version-locked
+	// image patch recognizes only ClawManager's signature-derived interactive
+	// Preview host while keeping ordinary destinations on the upstream path.
+}
+
+// reconcileOpenClawBrowserPlugin keeps the 2026.7.1 pluginized Browser tool
+// aligned with the long-standing browser.enabled runtime setting. Without
+// this, an upgraded instance can launch Chromium but silently lose the Browser
+// tool because older managed defaults explicitly disabled the plugin entry.
+func reconcileOpenClawBrowserPlugin(config map[string]any) {
+	browser := ensureObject(config, "browser")
+	enabled, ok := browser["enabled"].(bool)
+	if !ok {
+		return
+	}
+	plugins := ensureObject(config, "plugins")
+	entries := ensureObject(plugins, "entries")
+	entry := ensureObject(entries, "browser")
+	entry["enabled"] = enabled
 }
 
 func managedOpenClawBrowserProxy(req gateway.CreateGatewayRequest) (string, bool) {
@@ -679,6 +699,20 @@ func configWithRequestLLMEnv(cfg gateway.Config, req gateway.CreateGatewayReques
 		}
 		resolved.LLMModelIDs = modelIDs
 	}
+	if raw, ok := requestEnvValue(req, "CLAWMANAGER_LLM_REASONING"); ok && strings.TrimSpace(raw) != "" {
+		reasoning, err := parseLLMReasoning(raw)
+		if err != nil {
+			return gateway.Config{}, err
+		}
+		resolved.LLMReasoning = reasoning
+	}
+	if raw, ok := requestEnvValue(req, "CLAWMANAGER_LLM_REASONING_CONTROL"); ok && strings.TrimSpace(raw) != "" {
+		controls, err := parseLLMReasoningControl(raw)
+		if err != nil {
+			return gateway.Config{}, err
+		}
+		resolved.LLMReasoningControl = controls
+	}
 	return resolved, nil
 }
 
@@ -720,13 +754,22 @@ func mergeOpenClawLLMConfig(config map[string]any, cfg gateway.Config) {
 		provider["auth"] = "api-key"
 	}
 	if len(cfg.LLMModelIDs) > 0 {
-		provider["models"] = buildOpenClawProviderModels(provider["models"], cfg.LLMModelIDs)
+		provider["models"] = buildOpenClawProviderModels(provider["models"], cfg.LLMModelIDs, cfg.LLMReasoning, cfg.LLMReasoningControl)
 
 		agents := ensureObject(config, "agents")
 		defaults := ensureObject(agents, "defaults")
 		model := ensureObject(defaults, "model")
-		model["primary"] = qualifiedOpenClawModelID(openClawAutoProviderName, cfg.LLMModelIDs[0])
+		primaryModel := qualifiedOpenClawModelID(openClawAutoProviderName, cfg.LLMModelIDs[0])
+		model["primary"] = primaryModel
 		defaults["models"] = buildOpenClawAgentModels(defaults["models"], openClawAutoProviderName, cfg.LLMModelIDs)
+		// OpenClaw 2026.7.1 auto-discovers a built-in OpenAI image fallback when
+		// imageModel is unset. ClawManager also exports OPENAI_* compatibility
+		// aliases, so that fallback can look configured even though the user did
+		// not enable it. Keep image calls on the managed provider while preserving
+		// an explicit custom image model.
+		if rawImageModel, exists := defaults["imageModel"]; !exists || rawImageModel == nil {
+			defaults["imageModel"] = map[string]any{"primary": primaryModel}
+		}
 	}
 	normalizeOpenClawProviderAuthContracts(config)
 }
@@ -755,22 +798,48 @@ func normalizeOpenClawProviderAuthContracts(config map[string]any) {
 	}
 }
 
-func buildOpenClawProviderModels(existing any, modelIDs []string) []any {
+func buildOpenClawProviderModels(existing any, modelIDs []string, reasoningByID map[string]bool, reasoningControlByID map[string]string) []any {
 	byID := indexOpenClawModelsByID(existing)
 	models := make([]any, 0, len(modelIDs))
 	for _, id := range modelIDs {
 		if current, ok := byID[id]; ok {
 			cloned := cloneOpenClawMap(current)
 			cloned["id"] = id
+			if reasoning, managed := reasoningByID[id]; managed {
+				cloned["reasoning"] = reasoning
+			}
+			applyOpenClawReasoningControlCompat(cloned, reasoningByID[id], reasoningControlByID[id])
 			if strings.EqualFold(id, "auto") || strings.TrimSpace(configStringValue(cloned["name"])) == "" {
 				cloned["name"] = displayOpenClawModelName(id)
 			}
 			models = append(models, cloned)
 			continue
 		}
-		models = append(models, defaultOpenClawProviderModel(id))
+		model := defaultOpenClawProviderModel(id, reasoningByID[id])
+		applyOpenClawReasoningControlCompat(model, reasoningByID[id], reasoningControlByID[id])
+		models = append(models, model)
 	}
 	return models
+}
+
+func applyOpenClawReasoningControlCompat(model map[string]any, enabled bool, control string) {
+	if model == nil || control != "deepseek-thinking" {
+		return
+	}
+	if !enabled {
+		return
+	}
+	compat, _ := model["compat"].(map[string]any)
+	if compat == nil {
+		compat = map[string]any{}
+		model["compat"] = compat
+	}
+	compat["supportsReasoningEffort"] = true
+	compat["supportedReasoningEfforts"] = []any{"high", "max"}
+	compat["reasoningEffortMap"] = map[string]any{
+		"off": "none", "minimal": "high", "low": "high", "medium": "high",
+		"high": "high", "xhigh": "max", "max": "max",
+	}
 }
 
 func indexOpenClawModelsByID(existing any) map[string]map[string]any {
@@ -808,11 +877,11 @@ func buildOpenClawAgentModels(existing any, providerName string, modelIDs []stri
 	return models
 }
 
-func defaultOpenClawProviderModel(id string) map[string]any {
+func defaultOpenClawProviderModel(id string, reasoning bool) map[string]any {
 	return map[string]any{
 		"id":        id,
 		"name":      displayOpenClawModelName(id),
-		"reasoning": false,
+		"reasoning": reasoning,
 		"input": []any{
 			"text",
 		},

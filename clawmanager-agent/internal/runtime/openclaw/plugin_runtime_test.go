@@ -186,6 +186,85 @@ func TestSeedOpenClawPluginRuntimeCopyModeKeepsIndependentNPMFiles(t *testing.T)
 	}
 }
 
+func TestSeedOpenClawPluginRuntimeSupportsIsolatedNPMProjects(t *testing.T) {
+	root := t.TempDir()
+	defaultsRoot := filepath.Join(root, "defaults", ".openclaw")
+	projectName := "openclaw-feishu-dc69f44688"
+	projectRoot := filepath.Join(defaultsRoot, "npm", "projects", projectName)
+	feishuSource := filepath.Join(projectRoot, "node_modules", "@openclaw", "feishu")
+	if err := os.MkdirAll(feishuSource, 0o755); err != nil {
+		t.Fatalf("mkdir isolated npm plugin: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(feishuSource, "index.js"), []byte("isolated-project-plugin"), 0o644); err != nil {
+		t.Fatalf("write isolated npm plugin: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(projectRoot, "package.json"), []byte(`{"private":true}`), 0o644); err != nil {
+		t.Fatalf("write isolated npm project metadata: %v", err)
+	}
+
+	pluginsSource := filepath.Join(defaultsRoot, "plugins")
+	if err := os.MkdirAll(pluginsSource, 0o755); err != nil {
+		t.Fatalf("mkdir plugin registry: %v", err)
+	}
+	registry := map[string]any{
+		"installRecords": map[string]any{
+			"feishu": map[string]any{
+				"installPath": filepath.ToSlash(feishuSource),
+			},
+		},
+	}
+	registryData, err := json.Marshal(registry)
+	if err != nil {
+		t.Fatalf("marshal plugin registry: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pluginsSource, "installs.json"), registryData, 0o644); err != nil {
+		t.Fatalf("write plugin registry: %v", err)
+	}
+
+	if runtime.GOOS == "windows" {
+		// Windows test runners commonly cannot create symlinks without an
+		// elevated token. Copy mode still exercises the new projects layout.
+		t.Setenv(openClawNPMRuntimeModeEnv, openClawNPMRuntimeModeCopy)
+	}
+	activeRoot := filepath.Join(root, "active", ".openclaw")
+	if err := seedOpenClawPluginRuntimeFrom(defaultsRoot, CreateGatewayRequest{}, activeRoot); err != nil {
+		t.Fatalf("seedOpenClawPluginRuntimeFrom() error = %v", err)
+	}
+
+	feishuTarget := filepath.Join(activeRoot, "npm", "projects", projectName, "node_modules", "@openclaw", "feishu")
+	if got, err := os.ReadFile(filepath.Join(feishuTarget, "index.js")); err != nil {
+		t.Fatalf("read isolated npm plugin: %v", err)
+	} else if string(got) != "isolated-project-plugin" {
+		t.Fatalf("isolated npm plugin = %q, want image content", got)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Lstat(feishuTarget)
+		if err != nil {
+			t.Fatalf("stat shared isolated npm plugin: %v", err)
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("shared isolated npm plugin mode = %v, want symlink", info.Mode())
+		}
+	}
+	projectMetadata := filepath.Join(activeRoot, "npm", "projects", projectName, "package.json")
+	if info, err := os.Lstat(projectMetadata); err != nil {
+		t.Fatalf("stat isolated npm project metadata: %v", err)
+	} else if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("isolated npm project metadata mode = %v, want instance-owned file", info.Mode())
+	}
+
+	copiedRegistry, err := os.ReadFile(filepath.Join(activeRoot, "plugins", "installs.json"))
+	if err != nil {
+		t.Fatalf("read copied plugin registry: %v", err)
+	}
+	if strings.Contains(string(copiedRegistry), filepath.ToSlash(defaultsRoot)+"/") {
+		t.Fatal("copied isolated-project registry still references defaults root")
+	}
+	if !strings.Contains(string(copiedRegistry), filepath.ToSlash(feishuTarget)) {
+		t.Fatal("copied isolated-project registry does not reference instance plugin path")
+	}
+}
+
 func TestSeedOpenClawPluginRuntimeRejectsUnknownNPMMode(t *testing.T) {
 	t.Setenv(openClawNPMRuntimeModeEnv, "unexpected")
 	defaultsRoot := filepath.Join(t.TempDir(), "defaults", ".openclaw")

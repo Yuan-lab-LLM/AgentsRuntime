@@ -15,7 +15,9 @@ COPY openclaw/cmd ./cmd
 COPY openclaw/internal ./internal
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /out/openclaw-agent ./cmd/openclaw-agent
 
-FROM node:22-bookworm-slim AS node-runtime
+FROM node:22-bookworm-slim@sha256:53ada149d435c38b14476cb57e4a7da73c15595aba79bd6971b547ceb6d018bf AS node-runtime
+
+RUN test "$(node --version)" = "v22.23.1"
 
 FROM lscr.io/linuxserver/webtop:ubuntu-kde
 
@@ -51,7 +53,28 @@ RUN set -eux; \
 
 COPY --from=node-runtime /usr/local /usr/local
 
-RUN npm install -g openclaw@v2026.5.4
+RUN npm install -g openclaw@2026.7.1-2
+
+COPY openclaw/patches/patch_memory_core_startup_migration.mjs /usr/local/share/openclaw/patches/patch_memory_core_startup_migration.mjs
+COPY openclaw/patches/test_memory_core_startup_migration.mjs /usr/local/share/openclaw/patches/test_memory_core_startup_migration.mjs
+RUN node /usr/local/share/openclaw/patches/patch_memory_core_startup_migration.mjs --patch \
+  && node /usr/local/share/openclaw/patches/patch_memory_core_startup_migration.mjs --verify \
+  && node /usr/local/share/openclaw/patches/test_memory_core_startup_migration.mjs
+
+COPY openclaw/patches/patch_legacy_task_sidecar_startup_migration.mjs /usr/local/share/openclaw/patches/patch_legacy_task_sidecar_startup_migration.mjs
+COPY openclaw/patches/test_legacy_task_sidecar_startup_migration.mjs /usr/local/share/openclaw/patches/test_legacy_task_sidecar_startup_migration.mjs
+RUN node /usr/local/share/openclaw/patches/patch_legacy_task_sidecar_startup_migration.mjs --patch \
+  && node /usr/local/share/openclaw/patches/patch_legacy_task_sidecar_startup_migration.mjs --verify \
+  && node /usr/local/share/openclaw/patches/test_legacy_task_sidecar_startup_migration.mjs
+
+COPY openclaw/patches/patch_browser_proxy_navigation.mjs /usr/local/share/openclaw/patches/patch_browser_proxy_navigation.mjs
+COPY openclaw/patches/test_browser_proxy_navigation.mjs /usr/local/share/openclaw/patches/test_browser_proxy_navigation.mjs
+COPY openclaw/patches/test_browser_proxy_navigation_integration.mjs /usr/local/share/openclaw/patches/test_browser_proxy_navigation_integration.mjs
+COPY openclaw/patches/test_redis_team_plugin_hooks.mjs /usr/local/share/openclaw/patches/test_redis_team_plugin_hooks.mjs
+RUN node /usr/local/share/openclaw/patches/patch_browser_proxy_navigation.mjs --patch \
+  && node /usr/local/share/openclaw/patches/patch_browser_proxy_navigation.mjs --verify \
+  && node /usr/local/share/openclaw/patches/test_browser_proxy_navigation.mjs \
+  && node /usr/local/share/openclaw/patches/test_browser_proxy_navigation_integration.mjs
 
 COPY plugins/openclaw-redis-team/ /tmp/openclaw-redis-team/
 COPY openclaw/defaults-template/.config /defaults/.config
@@ -84,19 +107,33 @@ RUN sed -i 's/\r$//' /etc/services.d/openclaw-agent/run \
   && redis_team_tgz="$(find /tmp/openclaw-plugin-pack -maxdepth 1 -name '*.tgz' -print -quit)" \
   && test -n "${redis_team_tgz}" \
   && HOME=/defaults openclaw plugins install "${redis_team_tgz}" \
-  && HOME=/defaults openclaw plugins install @dingtalk-real-ai/dingtalk-connector \
-  && HOME=/defaults openclaw plugins install @wecom/wecom-openclaw-plugin@beta \
-  && HOME=/defaults openclaw plugins install @openclaw/feishu@2026.5.4 \
+  && HOME=/defaults openclaw plugins install @dingtalk-real-ai/dingtalk-connector@0.8.24 \
+  && HOME=/defaults openclaw plugins install @wecom/wecom-openclaw-plugin@2026.7.2-beta.1 \
+  && HOME=/defaults openclaw plugins install @openclaw/feishu@2026.7.1 \
+  && cd / \
   && rm -rf /tmp/openclaw-redis-team /tmp/openclaw-plugin-pack \
   && chown -R abc:abc /defaults/.openclaw \
   && chmod 0755 /defaults /defaults/.openclaw \
   && chmod -R a+rX /defaults/.openclaw/npm \
+  && mkdir -p /defaults/.openclaw/npm/node_modules \
   && ln -s /usr/local/lib/node_modules/openclaw /defaults/.openclaw/npm/node_modules/openclaw \
-  && chown -R root:root \
-    /defaults/.openclaw/npm/node_modules/@dingtalk-real-ai/dingtalk-connector \
-    /defaults/.openclaw/npm/node_modules/@openclaw/feishu \
-    /defaults/.openclaw/npm/node_modules/@wecom/wecom-openclaw-plugin \
+  && for plugin_package in \
+    @dingtalk-real-ai/dingtalk-connector \
+    @openclaw/feishu \
+    @wecom/wecom-openclaw-plugin; do \
+      package_dir="$(find /defaults/.openclaw/npm/projects -path "*/node_modules/${plugin_package}" -type d -print -quit)"; \
+      test -n "${package_dir}"; \
+      chown -R root:root "${package_dir}"; \
+      legacy_dir="/defaults/.openclaw/npm/node_modules/${plugin_package}"; \
+      mkdir -p "$(dirname "${legacy_dir}")"; \
+      if [ ! -e "${legacy_dir}" ] && [ ! -L "${legacy_dir}" ]; then \
+        ln -s "${package_dir}" "${legacy_dir}"; \
+      fi; \
+      test -d "${legacy_dir}"; \
+      chown -h root:root "${legacy_dir}"; \
+    done \
   && chown -h root:root /defaults/.openclaw/npm/node_modules/openclaw \
+  && node /usr/local/share/openclaw/patches/test_redis_team_plugin_hooks.mjs \
   && chown -R abc:abc /defaults/.config \
   && mkdir -p /var/lib/openclaw-agent /var/lib/clawmanager-agent /var/log/openclaw-agent /etc/openclaw-agent
 

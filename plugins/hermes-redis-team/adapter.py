@@ -36,11 +36,13 @@ WIRE_SCHEMA_VERSION = 1
 PROTOCOL_VERSION = 4
 PROTOCOL_CAPABILITIES = [
     "completion_ack_v1",
-    "automatic_turn_completion_v2",
+    "explicit_completion_receipt_v1",
+    "turn_end_monitor_v1",
     "assignment_lifecycle_v1",
     "assignment_heartbeat_v1",
     "durable_turn_facts_v1",
     "team_artifact_preview_v1",
+    "team_artifact_preview_v2",
     "review_contract_v1",
     "validation_contract_v2",
 ]
@@ -415,15 +417,66 @@ def _artifact_path(
             / _safe_name(settings.member_id)
             / _safe_name(assignment_id)
         )
-        candidate = root / relative
+        canonical_candidate = settings.shared_path / relative
+        if _trim(args.get("path")).replace("\\", "/").startswith("/team/"):
+            try:
+                canonical_candidate.relative_to(root)
+            except ValueError as exc:
+                raise ValueError("Canonical Team artifact path is outside the active member scope") from exc
+            candidate = canonical_candidate
+        else:
+            candidate = root / relative
     elif scope == "team":
-        if write and "leader" not in settings.role.lower() and "leader" not in settings.member_id.lower():
-            raise ValueError("Only the Team Leader may write team-scoped artifacts")
         candidate = settings.shared_path / relative
+        if write and "leader" not in settings.role.lower() and "leader" not in settings.member_id.lower():
+            active = _load_active_envelope(settings)
+            root_task_id = _trim(active.get("rootTaskId") or active.get("taskId"))
+            assignment_id = _trim(active.get("assignmentId") or active.get("workId"))
+            allowed_root = (
+                settings.shared_path
+                / "results"
+                / _safe_name(root_task_id)
+                / "reviews"
+                / _safe_name(assignment_id)
+            )
+            if not _assigned_validation_writer(settings, active):
+                raise ValueError("Only the Team Leader or assigned validator may write this team-scoped artifact")
+            try:
+                candidate.relative_to(allowed_root)
+            except ValueError as exc:
+                raise ValueError("Canonical Team artifact path is outside the active validation scope") from exc
     else:
         raise ValueError("Team artifact scope must be member or team")
     _assert_no_symlink_traversal(shared_root, candidate)
     return candidate
+
+
+def _normalize_validation_artifact_write_args(
+    settings: RedisTeamSettings,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    active = _load_active_envelope(settings)
+    if not _assigned_validation_writer(settings, active):
+        return args
+    root_task_id = _trim(active.get("rootTaskId") or active.get("taskId"))
+    assignment_id = _trim(active.get("assignmentId") or active.get("workId"))
+    raw = _trim(args.get("path")).replace("\\", "/")
+    relative = raw[len("/team/") :] if raw.startswith("/team/") else raw
+    prefix = f"results/{_safe_name(root_task_id)}/reviews/"
+    if not root_task_id or not assignment_id or not relative.startswith(prefix):
+        return args
+    remainder = relative[len(prefix) :]
+    parts = remainder.split("/", 1)
+    if len(parts) != 2 or not parts[0] or not parts[1] or ".." in parts[1].split("/"):
+        return args
+    normalized = dict(args)
+    normalized["scope"] = "team"
+    normalized["kind"] = "review"
+    normalized["path"] = (
+        f"/team/results/{_safe_name(root_task_id)}/reviews/"
+        f"{_safe_name(assignment_id)}/{parts[1]}"
+    )
+    return normalized
 
 
 def canonical_artifact_ref(settings: RedisTeamSettings, path: Path) -> str:
@@ -452,6 +505,117 @@ def validate_artifact_refs(settings: RedisTeamSettings, refs: Optional[list[str]
     return validated
 
 
+def _assigned_validation_writer(settings: RedisTeamSettings, envelope: dict[str, Any]) -> bool:
+    role = settings.role.lower()
+    member = settings.member_id.lower()
+    return bool(
+        "review" in role
+        or "qa" in role
+        or "review" in member
+        or member == "qa"
+        or envelope.get("validationAssignment")
+        or envelope.get("validation_assignment")
+        or _trim(
+            envelope.get("validationTargetAssignmentId")
+            or envelope.get("validation_target_assignment_id")
+            or envelope.get("reviewedAssignmentId")
+            or envelope.get("reviewed_assignment_id")
+        )
+    )
+
+
+def _explicit_validation_assignment(envelope: dict[str, Any]) -> bool:
+    return bool(
+        _truthy(envelope.get("validationAssignment") or envelope.get("validation_assignment"), False)
+        or _trim(
+            envelope.get("validationTargetAssignmentId")
+            or envelope.get("validation_target_assignment_id")
+            or envelope.get("reviewedAssignmentId")
+            or envelope.get("reviewed_assignment_id")
+        )
+    )
+
+
+def _assignment_validation_guidance(settings: RedisTeamSettings, envelope: dict[str, Any]) -> str:
+    if _explicit_validation_assignment(envelope):
+        return (
+            "Validation ownership: this assignment is test/review/evidence work. "
+            "Perform the validation requested by the Leader normally; validation is assignment-specific "
+            "and may be distributed across several members regardless of role name."
+        )
+    if _truthy(envelope.get("reviewRequired") or envelope.get("review_required"), False) or _truthy(
+        envelope.get("validationRequired") or envelope.get("validation_required"), False
+    ):
+        return (
+            "Validation ownership: this is production-only work with independent validation downstream. "
+            "Produce and hand off the requested artifact without running syntax checks, tests, Browser "
+            "acceptance, or another validation pass. Tools remain available for implementation and focused "
+            "debugging; always hand off a usable result or an exact blocker."
+        )
+    if _assigned_validation_writer(settings, envelope):
+        return (
+            "Validation ownership: this legacy assignment has a validation-oriented member role but no "
+            "explicit validation contract. Perform only the validation requested in the assignment; future "
+            "assignments should use validationAssignment so ownership does not depend on role names."
+        )
+    return (
+        "Validation ownership: follow the Leader's assignment scope instead of inferring testing duties "
+        "from your role. Production-only work should produce and hand off the artifact without tests or "
+        "acceptance checks. Only perform validation when this assignment explicitly asks for test, review, "
+        "or evidence work. This guidance must never block delivery."
+    )
+
+
+def _canonicalize_reviewer_completion_report(
+    settings: RedisTeamSettings,
+    envelope: dict[str, Any],
+    result_markdown: str,
+    explicit_refs: Optional[list[str]],
+) -> list[str]:
+    root_task_id = _trim(envelope.get("rootTaskId") or envelope.get("taskId"))
+    assignment_id = _trim(envelope.get("assignmentId") or envelope.get("workId"))
+    if not root_task_id or not assignment_id or not _assigned_validation_writer(settings, envelope):
+        return []
+    text_refs = re.findall(r"/team/[^\s`'\"<>()[\]{}]+", result_markdown or "")
+    member_prefix = (
+        f"/team/artifacts/{_safe_name(root_task_id)}/members/"
+        f"{_safe_name(settings.member_id)}/{_safe_name(assignment_id)}/"
+    )
+    candidates: list[str] = []
+    for raw in [*(explicit_refs or []), *text_refs]:
+        ref = _trim(raw).rstrip(".,;:!?锛岋紱锛氥€傦紒")
+        ref = ref.rstrip("，。；：、！？")
+        if not ref.startswith(member_prefix) or Path(ref).suffix.lower() not in {".md", ".txt", ".json"}:
+            continue
+        if ref not in candidates:
+            candidates.append(ref)
+    if not candidates:
+        return []
+    mirrored: list[str] = []
+    try:
+        for candidate in candidates[:16]:
+            source = settings.shared_path / _artifact_relative_path(candidate)
+            if not source.is_file():
+                continue
+            destination = (
+                settings.shared_path
+                / "results"
+                / _safe_name(root_task_id)
+                / "reviews"
+                / _safe_name(assignment_id)
+                / source.name
+            )
+            _assert_no_symlink_traversal(settings.shared_path, source)
+            _assert_no_symlink_traversal(settings.shared_path, destination)
+            _atomic_write_text(destination, source.read_text(encoding="utf-8"))
+            canonical = canonical_artifact_ref(settings, destination)
+            if canonical not in mirrored:
+                mirrored.append(canonical)
+    except Exception:
+        pass
+    return mirrored
+
+
 def artifact_metadata(settings: RedisTeamSettings, refs: Optional[list[str]]) -> list[dict[str, Any]]:
     metadata: list[dict[str, Any]] = []
     for canonical in validate_artifact_refs(settings, refs):
@@ -467,10 +631,65 @@ def artifact_metadata(settings: RedisTeamSettings, refs: Optional[list[str]]) ->
     return metadata
 
 
+def _artifact_read_path_with_fallback(settings: RedisTeamSettings, args: dict[str, Any]) -> Path:
+    target = _artifact_path(settings, args, default_scope="team")
+    if target.is_file():
+        return target
+    raw = _trim(args.get("path")).replace("\\", "/")
+    relative = raw[len("/team/") :] if raw.startswith("/team/") else raw
+    parts = [part for part in relative.split("/") if part]
+    requested_root = parts[1] if len(parts) > 2 and parts[0] in {"results", "artifacts"} else ""
+    active = _load_active_envelope(settings)
+    active_root = _trim(active.get("rootTaskId") or active.get("taskId"))
+    root_task_id = _safe_name(requested_root or active_root)
+    if not root_task_id or (requested_root and active_root and _safe_name(active_root) != root_task_id):
+        return target
+    basename = target.name
+    allowed_roots = (
+        settings.shared_path / "results" / root_task_id,
+        settings.shared_path / "artifacts" / root_task_id,
+    )
+    referenced: list[Path] = []
+    for ref in [*(active.get("artifactRefs") or []), *(active.get("contextRefs") or [])]:
+        try:
+            candidate = settings.shared_path / _artifact_relative_path(ref)
+            if candidate.name != basename or not candidate.is_file():
+                continue
+            if not any(candidate == root or root in candidate.parents for root in allowed_roots):
+                continue
+            _assert_no_symlink_traversal(settings.shared_path, candidate)
+            if candidate not in referenced:
+                referenced.append(candidate)
+        except Exception:
+            continue
+    if len(referenced) == 1:
+        return referenced[0]
+    if len(referenced) > 1:
+        return target
+
+    matches: list[Path] = []
+    inspected = 0
+    for root in allowed_roots:
+        if not root.is_dir():
+            continue
+        for candidate in root.rglob("*"):
+            inspected += 1
+            if inspected > 128:
+                return target
+            if candidate.is_symlink() or not candidate.is_file() or candidate.name != basename:
+                continue
+            _assert_no_symlink_traversal(settings.shared_path, candidate)
+            matches.append(candidate)
+            if len(matches) > 1:
+                return target
+    return matches[0] if len(matches) == 1 else target
+
+
 async def _tool_team_artifact_write(args: dict[str, Any], **_kwargs) -> str:
     settings = load_settings(None)
     try:
-        target = _artifact_path(settings, args, default_scope="member", write=True)
+        effective_args = _normalize_validation_artifact_write_args(settings, args)
+        target = _artifact_path(settings, effective_args, default_scope="member", write=True)
         _atomic_write_text(target, str(args.get("content") or ""))
         return json.dumps(
             {"ok": True, "artifact": {"path": canonical_artifact_ref(settings, target), "bytes": target.stat().st_size}},
@@ -483,7 +702,7 @@ async def _tool_team_artifact_write(args: dict[str, Any], **_kwargs) -> str:
 async def _tool_team_artifact_read(args: dict[str, Any], **_kwargs) -> str:
     settings = load_settings(None)
     try:
-        target = _artifact_path(settings, args, default_scope="team")
+        target = _artifact_read_path_with_fallback(settings, args)
         max_bytes = min(MAX_ARTIFACT_BYTES, max(1, int(args.get("maxBytes") or 256 * 1024)))
         if not target.is_file():
             raise ValueError("Team artifact is not a file")
@@ -570,7 +789,13 @@ def _preview_url(settings: RedisTeamSettings, target: Path) -> str:
         if signed_prefix
         else "_"
     )
-    payload = f"team-preview-v1\n{settings.team_id}\n{signed_prefix}"
+    interactive = target.suffix.lower() == ".html"
+    mode = "interactive" if interactive else ""
+    payload = (
+        f"team-preview-v2\n{mode}\n{settings.team_id}\n{signed_prefix}"
+        if interactive
+        else f"team-preview-v1\n{settings.team_id}\n{signed_prefix}"
+    )
     signature = (
         base64.urlsafe_b64encode(
             hmac.new(settings.team_token.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).digest()
@@ -578,6 +803,14 @@ def _preview_url(settings: RedisTeamSettings, target: Path) -> str:
         .decode("ascii")
         .rstrip("=")
     )
+    if interactive:
+        # Start on the resolvable managed service. ClawManager validates this
+        # signed bootstrap URL before redirecting the Browser to the isolated
+        # per-directory origin used for interactive state.
+        return (
+            f"{parsed.scheme}://{parsed.netloc}/v2/interactive/"
+            f"{quote(settings.team_id, safe='')}/{encoded_prefix}/{signature}/{quote(parts[-1], safe='')}"
+        )
     return (
         f"{parsed.scheme}://{parsed.netloc}/v1/"
         f"{quote(settings.team_id, safe='')}/{encoded_prefix}/{signature}/{quote(parts[-1], safe='')}"
@@ -1261,6 +1494,234 @@ async def _observe_late_completion(
     )
 
 
+async def _propose_completion(
+    settings: RedisTeamSettings,
+    envelope: dict[str, Any],
+    *,
+    status: str,
+    summary: str,
+    result_markdown: str,
+    artifact_refs: Optional[list[str]] = None,
+    explicit: bool,
+    review_verdict: str = "",
+    reviewed_assignment_id: str = "",
+    reviewed_revision: Optional[int] = None,
+    reviewed_artifact_refs: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    if not settings.valid:
+        raise ValueError("Redis Team env is incomplete")
+    status = _trim(status).lower()
+    if status not in {"succeeded", "failed", "cancelled"}:
+        raise ValueError("completion status must be succeeded, failed or cancelled")
+    task_id = _trim(envelope.get("taskId") or envelope.get("rootTaskId"))
+    if not task_id:
+        raise ValueError("active task identity is unavailable")
+    canonical_review_refs = _canonicalize_reviewer_completion_report(
+        settings,
+        envelope,
+        result_markdown,
+        artifact_refs,
+    )
+    normalized_artifact_refs = [*(artifact_refs or []), *canonical_review_refs]
+    result = write_task_result(
+        settings,
+        task_id,
+        envelope=envelope,
+        status=status,
+        summary=summary,
+        result_markdown=result_markdown,
+        artifact_refs=normalized_artifact_refs,
+    )
+    completion_id = _completion_id(settings, envelope)
+    attempt_id = f"attempt_{uuid.uuid4().hex}"
+    artifact_meta = artifact_metadata(settings, result["artifactRefs"])
+    reviewed_refs = validate_artifact_refs(settings, reviewed_artifact_refs)
+    reviewed_meta = artifact_metadata(settings, reviewed_refs)
+    result_content_hash = hashlib.sha256(
+        (result_markdown + "\n" + "\n".join(result["artifactRefs"])).encode("utf-8")
+    ).hexdigest()
+    completion = _task_event(
+        settings,
+        "completion_proposed",
+        envelope,
+        {
+            "completionId": completion_id,
+            "attemptId": attempt_id,
+            # Business completion is emitted only by the explicit completion
+            # tool. A finished model turn without that receipt remains running
+            # and is handled by the out-of-band Monitor.
+            "completionSource": COMPLETION_SOURCE,
+            "explicitCompletion": True,
+            "agentInvokedCompletionTool": explicit or None,
+            "assignmentResultOnly": True,
+            "rootTaskTerminal": False,
+            "status": status,
+            "availability": "idle" if status == "succeeded" else "blocked",
+            "runtimeStatus": "completion_pending",
+            "workflowFinal": False,
+            "finalAnswerReady": False,
+            "summary": summary,
+            "result": result_markdown,
+            "resultMarkdown": result_markdown,
+            "artifactRefs": result["artifactRefs"],
+            "artifactMetadata": artifact_meta,
+            "resultContentHash": result_content_hash,
+            "reviewVerdict": review_verdict or None,
+            "reviewedAssignmentId": reviewed_assignment_id or None,
+            "reviewedRevision": reviewed_revision,
+            "reviewedArtifactRefs": reviewed_refs,
+            "reviewedArtifactMetadata": reviewed_meta,
+            "visibleToChat": False,
+            "chatPolicy": "hidden",
+        },
+    )
+    redis = AsyncRedisClient(settings.redis_url)
+    try:
+        await redis.connect()
+        published = await _publish_once(
+            redis,
+            settings,
+            _completion_attempt_key(settings, completion_id, attempt_id),
+            completion,
+        )
+        acknowledgement = await _completion_ack(redis, settings, completion_id, attempt_id)
+    finally:
+        redis.close()
+    decision = _trim((acknowledgement or {}).get("decision")).lower() or "submitted"
+    runtime_status = "completion_pending"
+    availability = "busy"
+    if decision == "accepted":
+        runtime_status = status
+        availability = "idle" if status == "succeeded" else "blocked"
+    elif decision == "rejected":
+        runtime_status = "running"
+        availability = "busy"
+    active = _load_active_envelope(settings)
+    if _trim(active.get("taskId") or active.get("rootTaskId")) == task_id:
+        active["completionDecision"] = decision
+        active["completionId"] = completion_id
+        if explicit:
+            active["explicitCompletionSubmitted"] = True
+        if decision == "accepted":
+            active["terminal"] = True
+            active["terminalStatus"] = status
+            active["completedAt"] = _now_iso()
+        elif decision == "rejected":
+            active["terminal"] = False
+            active["terminalStatus"] = ""
+        _persist_active_envelope(settings, active)
+    if decision in {"submitted", "deferred"}:
+        asyncio.create_task(
+            _observe_late_completion(
+                settings,
+                completion_id,
+                attempt_id,
+                task_id,
+                status,
+                summary,
+                result["artifactRefs"],
+            )
+        )
+    write_local_status(
+        settings,
+        {
+            "availability": availability,
+            "runtimeStatus": runtime_status,
+            "currentTaskId": task_id,
+            "currentAssignmentId": envelope.get("assignmentId") or envelope.get("workId"),
+            "progress": 100 if decision == "accepted" else 99,
+            "lastSummary": _trim((acknowledgement or {}).get("reason")) or summary,
+            "artifactRefs": result["artifactRefs"],
+        },
+    )
+    return {
+        "ok": True,
+        **result,
+        **published,
+        "completionId": completion_id,
+        "attemptId": attempt_id,
+        "decision": decision,
+        "acknowledgement": acknowledgement,
+    }
+
+
+async def _publish_event(settings: RedisTeamSettings, event: str, payload: dict[str, Any]) -> None:
+    if not settings.valid:
+        return
+    redis = AsyncRedisClient(settings.redis_url)
+    try:
+        await redis.connect()
+        await xadd_json(redis, events_key(settings), event_for(settings, event, payload))
+    finally:
+        redis.close()
+
+
+async def _tool_team_send(args: dict[str, Any], **_kwargs) -> str:
+    settings = load_settings(None)
+    if not settings.valid:
+        return json.dumps({"error": "Redis Team env is incomplete"}, ensure_ascii=False)
+    to = _trim(args.get("to"))
+    text = _trim(args.get("text") or args.get("prompt"))
+    if not to or not text:
+        return json.dumps({"error": "to and text are required"}, ensure_ascii=False)
+    active = _load_active_envelope(settings)
+    task_id = _trim(args.get("taskId")) or _trim(active.get("taskId") or active.get("rootTaskId"))
+    message = {
+        "v": WIRE_SCHEMA_VERSION,
+        "protocolVersion": PROTOCOL_VERSION,
+        "messageId": f"msg_{uuid.uuid4().hex}",
+        "teamId": settings.team_id,
+        "from": settings.member_id,
+        "to": to,
+        "intent": _trim(args.get("intent")) or "send",
+        "taskId": task_id,
+        "rootTaskId": _trim(active.get("rootTaskId") or task_id),
+        "rootMessageId": _trim(active.get("rootMessageId")),
+        "workId": _trim(args.get("workId")) or _trim(active.get("assignmentId") or active.get("workId")),
+        "assignmentId": _trim(args.get("assignmentId")) or _trim(active.get("assignmentId") or active.get("workId")),
+        "phaseId": _trim(args.get("phaseId")) or _trim(active.get("phaseId")),
+        "revision": int(args.get("revision") or active.get("revision") or 1),
+        "required": _truthy(args.get("required"), True),
+        "reviewRequired": _truthy(args.get("reviewRequired") or args.get("review_required"), False),
+        "validationRequired": _truthy(args.get("validationRequired") or args.get("validation_required"), False),
+        "validationAssignment": _truthy(args.get("validationAssignment") or args.get("validation_assignment"), False),
+        "validationTargetAssignmentId": _trim(
+            args.get("validationTargetAssignmentId")
+            or args.get("reviewedAssignmentId")
+        ),
+        "validationTargetRevision": int(
+            args.get("validationTargetRevision")
+            or args.get("reviewedRevision")
+            or 0
+        ),
+        "dependsOn": [
+            _trim(value)
+            for value in (args.get("dependsOn") if isinstance(args.get("dependsOn"), list) else [])
+            if _trim(value)
+        ],
+        "title": _trim(args.get("title")) or "Team Message",
+        "text": text,
+        "contextRefs": args.get("contextRefs") if isinstance(args.get("contextRefs"), list) else [],
+        "ttlSeconds": args.get("ttlSeconds") if isinstance(args.get("ttlSeconds"), int) else 3600,
+        "priority": _trim(args.get("priority")) or "normal",
+        "metadata": args.get("metadata") if isinstance(args.get("metadata"), dict) else {},
+        "createdAt": _now_iso(),
+    }
+    redis = AsyncRedisClient(settings.redis_url)
+    try:
+        await redis.connect()
+        redis_id = await xadd_json(redis, inbox_key(settings, to), message)
+        await xadd_json(
+            redis,
+            events_key(settings),
+            event_for(settings, "outbound", {"messageId": message["messageId"], "to": to}),
+        )
+    finally:
+        redis.close()
+    message["redisId"] = redis_id
+    return json.dumps({"ok": True, "sent": message}, ensure_ascii=False)
+
+
 def _substantive_final_text(value: Any) -> bool:
     text = _trim(value)
     if len(text) < 12:
@@ -1499,7 +1960,9 @@ async def _tool_team_update_progress(args: dict[str, Any], **_kwargs) -> str:
     if not settings.enabled:
         return json.dumps({"error": "Redis Team is disabled"}, ensure_ascii=False)
     active = _load_active_envelope(settings)
-    task_id = _trim(args.get("taskId")) or _trim(active.get("taskId") or active.get("rootTaskId"))
+    reported_task_id = _trim(args.get("taskId"))
+    active_task_id = _trim(active.get("rootTaskId") or active.get("taskId"))
+    task_id = active_task_id or reported_task_id
     status_text = _trim(args.get("status"))
     summary = _trim(args.get("summary"))
     if not task_id or not status_text:
@@ -1525,6 +1988,7 @@ async def _tool_team_update_progress(args: dict[str, Any], **_kwargs) -> str:
         "phaseId": active.get("phaseId"),
         "revision": active.get("revision") or 1,
         "eventKind": _trim(args.get("eventKind")) or "worker_progress",
+        "reportedTaskId": reported_task_id if reported_task_id and reported_task_id != task_id else None,
     }
     await _publish_event(settings, "task_progress", progress_payload)
     return json.dumps({"ok": True, "status": status}, ensure_ascii=False)
@@ -1535,7 +1999,9 @@ async def _tool_team_complete_task(args: dict[str, Any], **_kwargs) -> str:
     if not settings.enabled:
         return json.dumps({"error": "Redis Team is disabled"}, ensure_ascii=False)
     active = _load_active_envelope(settings)
-    task_id = _trim(args.get("taskId")) or _trim(active.get("taskId") or active.get("rootTaskId"))
+    reported_task_id = _trim(args.get("taskId"))
+    active_task_id = _trim(active.get("rootTaskId") or active.get("taskId"))
+    task_id = active_task_id or reported_task_id
     status_text = _trim(args.get("status")).lower()
     summary = _trim(args.get("summary"))
     if not task_id or not status_text or not summary:
@@ -1545,7 +2011,10 @@ async def _tool_team_complete_task(args: dict[str, Any], **_kwargs) -> str:
             {"error": "status must be succeeded, failed or cancelled"},
             ensure_ascii=False,
         )
-    active["taskId"] = task_id
+    if reported_task_id and reported_task_id != task_id:
+        active["reportedTaskId"] = reported_task_id
+    active["taskId"] = active.get("taskId") or task_id
+    active["rootTaskId"] = active.get("rootTaskId") or task_id
     _persist_active_envelope(settings, active)
     try:
         result = await _propose_completion(
@@ -2054,11 +2523,11 @@ class RedisTeamAdapter(BasePlatformAdapter):
                 "replyTo": reply_to,
                 "eventKind": "agent_narrative",
                 "messageKind": "narrative",
-                # An explicit completion can be accepted before Hermes emits
-                # its final assistant body. Keep that one delivery visible;
-                # later callbacks for the terminal turn are audit-only.
-                "chatPolicy": "visible" if not terminal_callback or terminal_delivery_visible else "hidden",
-                "visibleToChat": not terminal_callback or terminal_delivery_visible,
+                # Raw Hermes assistant prose remains audit telemetry. Team chat is
+                # reserved for explicit plans, progress, handoffs, blockers, reviews,
+                # and structured completion results.
+                "chatPolicy": "hidden",
+                "visibleToChat": False,
                 "nonAuthoritative": True,
                 "stateEffect": "none",
                 "contentHash": content_hash,
@@ -2268,6 +2737,11 @@ class RedisTeamAdapter(BasePlatformAdapter):
         )
         if not accepted and not terminal:
             return False
+        # Non-terminal Monitor envelopes must reach the model so it can continue,
+        # report an exact blocker, or submit a ready result. Mechanical replies are
+        # safe only after the assignment is already terminal.
+        if not terminal:
+            return False
 
         metadata = envelope.get("metadata") if isinstance(envelope.get("metadata"), dict) else {}
         check_id = _trim(metadata.get("checkId") or metadata.get("check_id") or envelope.get("messageId"))
@@ -2408,8 +2882,8 @@ class RedisTeamAdapter(BasePlatformAdapter):
                 write_local_status(
                     self.settings,
                     {
-                        "availability": "blocked",
-                        "runtimeStatus": "blocked",
+                        "availability": "busy",
+                        "runtimeStatus": "running",
                         "currentTaskId": task_id,
                         "progress": 99,
                         "lastSummary": _short_text(response) or "Completion was rejected",
@@ -2426,24 +2900,14 @@ class RedisTeamAdapter(BasePlatformAdapter):
                         "lastSummary": _short_text(response) or "Completion submitted",
                     },
                 )
-            elif _substantive_final_text(response):
-                await _propose_completion(
-                    self.settings,
-                    envelope,
-                    status="succeeded",
-                    summary=_short_text(response, 500),
-                    result_markdown=response,
-                    explicit=False,
-                    automatic_turn_result=True,
-                )
             else:
                 write_local_status(
                     self.settings,
                     {
                         "availability": "busy",
-                        "runtimeStatus": "running",
+                        "runtimeStatus": "awaiting_completion_receipt",
                         "currentTaskId": task_id,
-                        "lastSummary": _short_text(response) or "Turn finished without a final result",
+                        "lastSummary": _short_text(response) or "Turn finished without an explicit completion receipt",
                     },
                 )
                 if self._redis:
@@ -2456,8 +2920,15 @@ class RedisTeamAdapter(BasePlatformAdapter):
                             envelope,
                             {
                                 "messageId": message_id,
-                                "summary": "Turn finished without a substantive final result",
+                                "summary": "Turn finished without an explicit completion receipt",
+                                "status": "running",
+                                "availability": "busy",
+                                "runtimeStatus": "awaiting_completion_receipt",
                                 "stateEffect": "none",
+                                "nonAuthoritative": True,
+                                "rootTaskTerminal": False,
+                                "activeTurnFinished": True,
+                                "resultMarkdown": response or None,
                                 "visibleToChat": False,
                                 "chatPolicy": "hidden",
                             },
@@ -2833,30 +3304,32 @@ class RedisTeamAdapter(BasePlatformAdapter):
                 events_key(self.settings),
                 _task_event(
                     self.settings,
-                    "task_failed",
+                    "task_progress",
                     envelope,
                     {
-                        "status": "failed",
+                        "status": "running",
+                        "availability": "busy",
+                        "runtimeStatus": "retryable_error",
                         "summary": error,
                         "error": error,
                         "completionSource": "runtime_dispatch_error",
                         "explicitCompletion": False,
+                        "eventKind": "assignment_attempt_failed",
+                        "failureDomain": "runtime_adapter",
+                        "retryable": True,
+                        "stateEffect": "none",
+                        "nonAuthoritative": True,
+                        "rootTaskTerminal": False,
+                        "visibleToChat": False,
+                        "chatPolicy": "hidden",
                     },
                 ),
             )
-            identity = _assignment_identity(envelope)
-            active = _load_active_envelope(self.settings)
-            if _assignment_identity(active) == identity:
-                active["terminal"] = True
-                active["terminalStatus"] = "failed"
-                active["completedAt"] = _now_iso()
-                _persist_active_envelope(self.settings, active)
-            self._active_assignments.pop(identity, None)
             write_local_status(
                 self.settings,
                 {
-                    "availability": "blocked",
-                    "runtimeStatus": "failed",
+                    "availability": "busy",
+                    "runtimeStatus": "retryable_error",
                     "currentTaskId": envelope["taskId"],
                     "currentAssignmentId": envelope.get("assignmentId") or envelope.get("workId"),
                     "lastSummary": error,
@@ -3002,9 +3475,10 @@ class RedisTeamAdapter(BasePlatformAdapter):
                 text += f"- Current member artifact root: {member_artifact_root}\n"
             text += (
                 "- The Runtime inherits these IDs for Team tools; omit optional IDs instead of inventing replacements.\n"
-                "- A substantive final response is submitted automatically. Use team_complete_task for explicit "
-                "failure/cancellation, review metadata, or when you need to control final result fields.\n"
+                "- When the assigned work is ready, call team_complete_task once with the actual result. "
+                "If the call is missed, end the turn normally; ClawManager Monitor will send a separate reminder without treating prose as completion.\n"
             )
+            text += f"- {_assignment_validation_guidance(self.settings, envelope)}\n"
 
         event = MessageEvent(
             text=text,
@@ -3317,6 +3791,21 @@ def register(ctx) -> None:
                     "assignmentId": {"type": "string"},
                     "phaseId": {"type": "string"},
                     "revision": {"type": "integer"},
+                    "required": {"type": "boolean"},
+                    "reviewRequired": {
+                        "type": "boolean",
+                        "description": "Set true on production-only work with downstream validation; tell the producer to hand off without self-testing",
+                    },
+                    "validationRequired": {"type": "boolean"},
+                    "validationAssignment": {
+                        "type": "boolean",
+                        "description": "Marks this as test/review/evidence work; any member role may validate and several validators may run in parallel",
+                    },
+                    "validationTargetAssignmentId": {"type": "string"},
+                    "validationTargetRevision": {"type": "integer"},
+                    "reviewedAssignmentId": {"type": "string"},
+                    "reviewedRevision": {"type": "integer"},
+                    "dependsOn": {"type": "array", "items": {"type": "string"}},
                     "title": {"type": "string"},
                     "contextRefs": {"type": "array", "items": {"type": "string"}},
                     "ttlSeconds": {"type": "integer"},
@@ -3428,11 +3917,14 @@ def register(ctx) -> None:
             "message as delegated Worker work. Read the task context and "
             "/team/team.json when available. Prefer team_artifact_write/read/list/mkdir "
             "for shared files and use team_artifact_preview before opening a Team file "
-            "in Browser; never use file:// or start a temporary server. A substantive "
-            "final response is automatically submitted for control-plane validation, "
-            "so do not repeat it only to satisfy a tool sequence. Use team_complete_task "
-            "when reporting failure, cancellation, review metadata, or an explicit final "
-            "result. Missing optional Team metadata is not a reason to stop. Never write "
+            "in Browser; never use file:// or start a temporary server. Validation is "
+            "assignment-specific: production-only assignments produce and hand off artifacts "
+            "without tests, while assignments explicitly designated by the Leader as test, "
+            "review, or evidence work validate normally regardless of the member role. "
+            "These instructions never block delivery and tools remain available for required "
+            "implementation or validation work. When work is ready, call team_complete_task "
+            "once with the actual result; automatic final-turn submission is only a compatibility "
+            "fallback. Missing optional Team metadata is not a reason to stop. Never write "
             "Team tokens, API keys, or Redis credentials into Team files or logs."
         ),
     )

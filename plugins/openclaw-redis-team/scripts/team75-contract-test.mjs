@@ -8,7 +8,7 @@ const distPath = path.resolve(import.meta.dirname, "..", "dist", "index.js");
 const source = (await fs.readFile(distPath, "utf8"))
   .replace('import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";', 'const definePluginEntry = (entry) => entry;')
   .replace('import { dispatchInboundDirectDmWithRuntime } from "openclaw/plugin-sdk/direct-dm";', 'const dispatchInboundDirectDmWithRuntime = async () => ({});');
-const testSource = source + "\nexport { normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, shouldUseAssistantSessionFallback, activeMemberRouting, mergeActiveTurnFacts, normalizeRedisTeamTarget, resolveRedisTeamTarget, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, verificationTargetUrl, reviewerBrowserToolDecision, browserToolCallFailed, rootWorkflowStateIsTerminal, previewUrlForTeamArtifact };\n";
+const testSource = source + "\nexport { createRuntime, normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, assignmentAttemptFailedEvent, isIncompleteTurnDelivery, activeMemberRouting, mergeActiveTurnFacts, normalizeRedisTeamTarget, resolveRedisTeamTarget, normalizeTeamSendParams, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, inferCanonicalArtifactWriteContract, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, lateNarrativeProjectionMeta, normalizeAssistantSessionText, assistantSessionNarrativesForProjection, verificationTargetUrl, reviewerBrowserToolDecision, reviewerBrowserToolResultDecision, reviewerBrowserGuardKey, browserVerificationForCompletion, mergeBrowserVerificationState, browserToolCallFailed, browserToolResultUrl, teamProcessToolDecision, assignmentHasIndependentReview, rootWorkflowStateIsTerminal, previewUrlForTeamArtifact, sessionToolOutcome, readLastToolOutcomeFromDispatch, latestRuntimeSessionActivity, completionProposalProvenance, validationRevisionDirectory, equivalentActiveAssignment, equivalentWorkflowAttempt };\n";
 const pluginModule = await import(`data:text/javascript;base64,${Buffer.from(testSource).toString("base64")}`);
 const plugin = pluginModule.default;
 
@@ -23,6 +23,7 @@ process.env.CLAWMANAGER_BROWSER_PROXY_URL = "http://clawmanager-egress-proxy.cla
 
 function createHarness(memberId, role) {
   const registered = new Map();
+  const hooks = new Map();
   const config = {
     channels: {
       "redis-team": {
@@ -44,9 +45,13 @@ function createHarness(memberId, role) {
     registerTool(tool) {
       registered.set(tool.name, tool);
     },
-    on() {},
+    on(name, handler) {
+      if (!hooks.has(name)) hooks.set(name, []);
+      hooks.get(name).push(handler);
+    },
     registerChannel() {},
   });
+  registered.hooks = hooks;
   return registered;
 }
 
@@ -90,6 +95,245 @@ function resultContentHash(content, refs) {
 
 try {
   await fs.mkdir(shared, { recursive: true });
+	const hookHarness = createHarness("hook-member", "developer");
+	const beforeToolHooks = hookHarness.hooks.get("before_tool_call") || [];
+	const afterToolHooks = hookHarness.hooks.get("after_tool_call") || [];
+	assert.ok(beforeToolHooks.length > 0, "the real plugin entry registers before_tool_call");
+	assert.ok(afterToolHooks.length > 0, "the real plugin entry registers after_tool_call");
+	for (const toolName of [
+		"read",
+		"exec",
+		"team_artifact_write",
+		"team_artifact_read",
+		"team_artifact_list",
+		"team_send",
+		"team_update_progress",
+		"team_complete_task",
+		"browser",
+	]) {
+		const event = {
+			toolName,
+			params: toolName === "exec"
+				? { command: "pwd" }
+				: toolName === "browser"
+					? { action: "status" }
+					: {},
+		};
+		for (const hook of beforeToolHooks) await hook(event, { sessionKey: "agent:main:test" });
+		for (const hook of afterToolHooks) await hook({ ...event, result: { ok: true } }, { sessionKey: "agent:main:test" });
+	}
+
+	const previousHome = process.env.HOME;
+	try {
+		const activityHome = path.join(root, "activity-home");
+		const sessionsDir = path.join(activityHome, ".openclaw", "agents", "main", "sessions");
+		await fs.mkdir(sessionsDir, { recursive: true });
+		process.env.HOME = activityHome;
+		const sessionFile = path.join(sessionsDir, "real-openclaw-shape.jsonl");
+		const startedAt = Date.now() - 1000;
+		const assistantAt = new Date().toISOString();
+		const resultAt = new Date(Date.now() + 1).toISOString();
+		await fs.writeFile(sessionFile, [
+			JSON.stringify({
+				type: "message",
+				id: "assistant-real-shape",
+				timestamp: assistantAt,
+				message: {
+					role: "assistant",
+					content: [
+						{ type: "text", text: "正在写入协作计划。" },
+						{ type: "toolCall", id: "call-real-shape", name: "team_artifact_write", arguments: {} },
+					],
+				},
+			}),
+			JSON.stringify({
+				type: "message",
+				id: "tool-result-real-shape",
+				timestamp: resultAt,
+				message: {
+					role: "toolResult",
+					toolCallId: "call-real-shape",
+					toolName: "team_artifact_write",
+					content: [{ type: "text", text: "tool failed" }],
+					isError: true,
+				},
+			}),
+		].join("\n") + "\n", "utf8");
+		const completedActivity = await pluginModule.latestRuntimeSessionActivity(startedAt);
+		assert.equal(completedActivity.lastActivityKind, "tool_result", "camelCase OpenClaw toolResult is observed");
+		assert.equal(completedActivity.lastAssistantText, "正在写入协作计划。");
+		assert.equal(completedActivity.lastToolName, "team_artifact_write");
+		assert.equal(completedActivity.lastToolFailed, true);
+		assert.equal(completedActivity.pendingToolName, "");
+
+		await fs.appendFile(sessionFile, JSON.stringify({
+			type: "message",
+			id: "assistant-pending-real-shape",
+			timestamp: new Date(Date.now() + 2).toISOString(),
+			message: {
+				role: "assistant",
+				content: [
+					{ type: "text", text: "现在派发任务。" },
+					{ type: "toolCall", id: "call-pending", name: "team_send", arguments: {} },
+				],
+			},
+		}) + "\n", "utf8");
+		const pendingActivity = await pluginModule.latestRuntimeSessionActivity(startedAt);
+		assert.equal(pendingActivity.lastActivityKind, "tool_call", "camelCase OpenClaw toolCall is observed");
+		assert.equal(pendingActivity.pendingToolName, "team_send");
+		assert.equal(pendingActivity.lastAssistantText, "现在派发任务。");
+		assert.equal(pendingActivity.lastToolName, "team_artifact_write", "the last completed tool remains factual");
+	} finally {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+	}
+
+	const liveRuntime = pluginModule.createRuntime({ config: {}, logger: { warn() {} } });
+	const liveNarratives = [];
+	const liveEmitter = async (text, source, media, meta) => {
+		liveNarratives.push({ text, source, media, meta });
+		return true;
+	};
+	const liveEnvelope = {
+		teamId: "75",
+		memberId: "developer",
+		role: "developer",
+		taskId: "team-75-task-live",
+		rootTaskId: "team-75-task-live",
+		messageId: "msg-live",
+		assignmentId: "dev-live",
+	};
+	await liveRuntime.withActiveEnvelope(
+		liveEnvelope,
+		async () => liveRuntime.withNarrativeProjection(liveEnvelope, liveEmitter, async () => {
+			liveRuntime.observeAssistantSessionMessage({
+				message: {
+					id: "assistant-live-1",
+					role: "assistant",
+					timestamp: new Date().toISOString(),
+					content: [
+						{ type: "text", text: "正在读取产物并开始检查。" },
+						{ type: "tool_use", name: "team_artifact_read" },
+					],
+				},
+			}, { sessionKey: "redis-team:75:developer" });
+			liveRuntime.observeAssistantSessionMessage({
+				message: { id: "assistant-live-2", role: "assistant", content: [{ type: "text", text: "NO_REPLY" }] },
+			}, { sessionKey: "redis-team:75:developer" });
+			await liveRuntime.flushAssistantSessionNarratives();
+		}),
+		{ teamId: "75", memberId: "developer", role: "developer", sharedDir: shared },
+	);
+	assert.equal(liveNarratives.length, 1, "live projection emits visible assistant text but not NO_REPLY");
+	assert.equal(liveNarratives[0].text, "正在读取产物并开始检查。");
+	assert.equal(liveNarratives[0].source, "before_message_write");
+	assert.equal(liveNarratives[0].meta.sourceRecordId, "assistant-live-1");
+	const concurrentNarratives = { first: [], second: [] };
+	const concurrentEnvelope = (suffix) => ({
+		...liveEnvelope,
+		taskId: `team-75-task-${suffix}`,
+		rootTaskId: `team-75-task-${suffix}`,
+		messageId: `msg-${suffix}`,
+		assignmentId: `dev-${suffix}`,
+	});
+	await Promise.all([
+		liveRuntime.withNarrativeProjection(
+			concurrentEnvelope("first"),
+			async (text) => { concurrentNarratives.first.push(text); return true; },
+			async () => {
+				await Promise.resolve();
+				liveRuntime.observeAssistantSessionMessage({
+					message: { id: "assistant-first", role: "assistant", content: [{ type: "text", text: "first task update" }] },
+				});
+			},
+		),
+		liveRuntime.withNarrativeProjection(
+			concurrentEnvelope("second"),
+			async (text) => { concurrentNarratives.second.push(text); return true; },
+			async () => {
+				liveRuntime.observeAssistantSessionMessage({
+					message: { id: "assistant-second", role: "assistant", content: [{ type: "text", text: "second task update" }] },
+				});
+				await Promise.resolve();
+			},
+		),
+	]);
+	assert.deepEqual(concurrentNarratives.first, ["first task update"], "concurrent tasks keep the first narrative isolated");
+	assert.deepEqual(concurrentNarratives.second, ["second task update"], "concurrent tasks keep the second narrative isolated");
+	const crossTeamNarratives = { first: [], second: [] };
+	let releaseCrossTeamFirst;
+	let releaseCrossTeamSecond;
+	const crossTeamFirstEnvelope = { ...concurrentEnvelope("cross-first"), teamId: "75" };
+	const crossTeamSecondEnvelope = { ...concurrentEnvelope("cross-second"), teamId: "76" };
+	const crossTeamFirst = liveRuntime.withNarrativeProjection(
+		crossTeamFirstEnvelope,
+		async (text) => { crossTeamNarratives.first.push(text); return true; },
+		async () => new Promise((resolve) => { releaseCrossTeamFirst = resolve; }),
+	);
+	const crossTeamSecond = liveRuntime.withNarrativeProjection(
+		crossTeamSecondEnvelope,
+		async (text) => { crossTeamNarratives.second.push(text); return true; },
+		async () => new Promise((resolve) => { releaseCrossTeamSecond = resolve; }),
+	);
+	await Promise.resolve();
+	liveRuntime.observeAssistantSessionMessage({
+		sessionKey: "agent:main:redis-team:group:76",
+		message: { id: "assistant-team-76", role: "assistant", content: [{ type: "text", text: "team 76 update" }] },
+	});
+	releaseCrossTeamFirst();
+	releaseCrossTeamSecond();
+	await Promise.all([crossTeamFirst, crossTeamSecond]);
+	assert.deepEqual(crossTeamNarratives.first, [], "a detached hook never crosses into another Team");
+	assert.deepEqual(crossTeamNarratives.second, ["team 76 update"], "a detached hook binds by exact Team session");
+	const detachedNarratives = [];
+	let releaseDetachedProjection;
+	const detachedProjection = liveRuntime.withNarrativeProjection(
+		concurrentEnvelope("detached"),
+		async (text) => { detachedNarratives.push(text); return true; },
+		async () => new Promise((resolve) => { releaseDetachedProjection = resolve; }),
+	);
+	await Promise.resolve();
+	liveRuntime.observeAssistantSessionMessage({
+		message: { id: "assistant-detached", role: "assistant", content: [{ type: "text", text: "detached hook update" }] },
+	}, { sessionKey: "redis-team:75:developer:detached" });
+	releaseDetachedProjection();
+	await detachedProjection;
+	assert.deepEqual(
+		detachedNarratives,
+		["detached hook update"],
+		"a detached OpenClaw transcript hook binds to the only active projection",
+	);
+	const ambiguousNarratives = { first: [], second: [] };
+	let releaseAmbiguousFirst;
+	let releaseAmbiguousSecond;
+	const ambiguousFirst = liveRuntime.withNarrativeProjection(
+		concurrentEnvelope("ambiguous-first"),
+		async (text) => { ambiguousNarratives.first.push(text); return true; },
+		async () => new Promise((resolve) => { releaseAmbiguousFirst = resolve; }),
+	);
+	const ambiguousSecond = liveRuntime.withNarrativeProjection(
+		concurrentEnvelope("ambiguous-second"),
+		async (text) => { ambiguousNarratives.second.push(text); return true; },
+		async () => new Promise((resolve) => { releaseAmbiguousSecond = resolve; }),
+	);
+	await Promise.resolve();
+	liveRuntime.observeAssistantSessionMessage({
+		message: { id: "assistant-ambiguous", role: "assistant", content: [{ type: "text", text: "must not cross-deliver" }] },
+	}, { sessionKey: "redis-team:75:unknown-session" });
+	releaseAmbiguousFirst();
+	releaseAmbiguousSecond();
+	await Promise.all([ambiguousFirst, ambiguousSecond]);
+	assert.deepEqual(ambiguousNarratives, { first: [], second: [] }, "an ambiguous detached hook stays fail-soft");
+	assert.deepEqual(
+		pluginModule.completionProposalProvenance({ automaticTurnResult: true }),
+		{ completionSource: "team_complete_task", explicitCompletion: true },
+		"completion proposal provenance is reserved for the explicit completion tool",
+	);
+	assert.deepEqual(
+		pluginModule.completionProposalProvenance({}),
+		{ completionSource: "team_complete_task", explicitCompletion: true },
+		"the explicit completion tool keeps its original provenance",
+	);
   await fs.writeFile(path.join(shared, "team.json"), JSON.stringify({
     version: 1,
     teamId: "75",
@@ -106,6 +350,39 @@ try {
     "# Team 启动介绍\n\nLeader coordinates the Developer.\n",
     "utf8",
   );
+	const fastTeamSend = await pluginModule.normalizeTeamSendParams(
+		{ teamId: "75", memberId: "leader", sharedDir: shared },
+		{ to: "developer", text: "Implement the page." },
+		null,
+	);
+	assert.deepEqual(fastTeamSend.params, { to: "developer", text: "Implement the page." });
+	const aliasedTeamSend = await pluginModule.normalizeTeamSendParams(
+		{ teamId: "75", memberId: "leader", sharedDir: shared },
+		{ recipient: "developer", message: "Implement the page." },
+		null,
+	);
+	assert.equal(aliasedTeamSend.params.to, "developer");
+	assert.equal(aliasedTeamSend.params.text, "Implement the page.");
+	const replyTeamSend = await pluginModule.normalizeTeamSendParams(
+		{ teamId: "75", memberId: "developer", sharedDir: shared },
+		{ text: "The implementation is ready." },
+		{ from: "leader", assignmentId: "dev-01" },
+	);
+	assert.equal(replyTeamSend.params.to, "leader", "an authenticated assignment sender is a safe reply target");
+	const ambiguousTeamSend = await pluginModule.normalizeTeamSendParams(
+		{ teamId: "75", memberId: "leader", sharedDir: shared },
+		{ text: "Start the next assignment." },
+		{ from: "clawmanager", rootTaskId: "team-75-task-149" },
+	);
+	assert.equal(ambiguousTeamSend.error.code, "ambiguous_team_target");
+	assert.equal(ambiguousTeamSend.error.sent, false);
+	assert.deepEqual(ambiguousTeamSend.error.candidates, ["developer"]);
+	const conflictingTeamSend = await pluginModule.normalizeTeamSendParams(
+		{ teamId: "75", memberId: "leader", sharedDir: shared },
+		{ to: "developer", recipient: "leader", text: "Do not dispatch this." },
+		null,
+	);
+	assert.equal(conflictingTeamSend.error.code, "conflicting_team_target");
   const leaderContextEnvelope = pluginModule.normalizeEnvelope({
     teamId: "75",
     from: "clawmanager",
@@ -149,22 +426,295 @@ try {
   assert.equal(browserEnvelope.reviewedAssignmentId, "dev-01");
   assert.equal(browserEnvelope.reviewedRevision, 2);
   assert.equal(browserEnvelope.verificationUrl, "https://example.com/review");
-  for (let index = 0; index < 4; index += 1) {
+	for (const action of ["status", "start"]) {
+		const preparation = pluginModule.reviewerBrowserToolDecision(
+			browserEnvelope,
+			{ toolName: "browser", params: { action } },
+			browserState,
+			1000,
+		);
+		assert.notEqual(preparation.block, true);
+		assert.equal(browserState.startedAt, undefined, `${action} must not start the review budget`);
+	}
+	pluginModule.reviewerBrowserToolDecision(
+		browserEnvelope,
+		{ toolName: "browser", params: { action: "open", url: "https://example.com/review" } },
+		browserState,
+    1001,
+  );
+  assert.equal(browserState.startedAt, undefined, "the budget starts only after a successful open");
+  assert.deepEqual(
+    pluginModule.lateNarrativeProjectionMeta(true),
+    { lateProjection: true, suppressedAfterTerminal: true, terminalDelivery: false },
+    "ordinary session reconciliation prose must be hidden after terminal delivery",
+  );
+  assert.deepEqual(
+    pluginModule.lateNarrativeProjectionMeta(false),
+    { lateProjection: true, suppressedAfterTerminal: false, terminalDelivery: false },
+    "pre-terminal recovery may retain real narrative without affecting workflow state",
+  );
+  const visibleLeaderReply = "Development dispatched; waiting for the worker result.";
+  assert.equal(pluginModule.normalizeAssistantSessionText("NO_REPLY"), "");
+  assert.equal(pluginModule.normalizeAssistantSessionText("Redis Team task completed"), "");
+  assert.equal(
+    pluginModule.normalizeAssistantSessionText("The phrase Redis Team task completed is a Runtime control placeholder."),
+    "The phrase Redis Team task completed is a Runtime control placeholder.",
+    "only the standalone Runtime control reply is hidden",
+  );
+  assert.equal(
+    pluginModule.normalizeAssistantSessionText(`${visibleLeaderReply}\n\nNO_REPLY`),
+    visibleLeaderReply,
+    "the raw session copy must hash like OpenClaw's normalized callback",
+  );
+  assert.equal(
+    pluginModule.normalizeAssistantSessionText("OpenClaw uses NO_REPLY as its silent token."),
+    "OpenClaw uses NO_REPLY as its silent token.",
+    "ordinary prose discussing the token must remain visible",
+  );
+  const sessionNarratives = [
+    { text: "internal setup" },
+    { text: visibleLeaderReply },
+  ];
+  assert.deepEqual(
+    pluginModule.assistantSessionNarrativesForProjection(sessionNarratives, true, false),
+    [],
+    "a successful delivery callback owns visible projection",
+  );
+  assert.deepEqual(
+    pluginModule.assistantSessionNarrativesForProjection(sessionNarratives, false, false),
+    [sessionNarratives[1]],
+    "callback-free compatibility recovery must project only the latest narrative",
+  );
+  assert.deepEqual(
+    pluginModule.assistantSessionNarrativesForProjection(sessionNarratives, false, true),
+    [],
+    "terminal completion owns final delivery and old process prose must not replay afterward",
+  );
+  const guardEnvelope = {
+    rootTaskId: "team-75-task-150",
+    assignmentId: "review-150",
+  };
+  const openGuardKey = pluginModule.reviewerBrowserGuardKey(
+    guardEnvelope,
+    { toolName: "browser", params: { action: "open", url: "http://managed.example/preview" } },
+    { runId: "run-150" },
+  );
+  const snapshotGuardKey = pluginModule.reviewerBrowserGuardKey(
+    guardEnvelope,
+    { toolName: "browser", params: { action: "snapshot", targetId: "target-150" } },
+    { runId: "run-150" },
+  );
+  assert.equal(
+    openGuardKey,
+    snapshotGuardKey,
+    "Browser guard state must survive actions that omit the navigation URL",
+  );
+	pluginModule.reviewerBrowserToolResultDecision(
+		browserEnvelope,
+		{ toolName: "browser", params: { action: "open", url: "https://example.com/review" }, result: { status: "ok" } },
+		browserState,
+		1002,
+	);
+	assert.equal(browserState.startedAt, 1002);
+	const managedBrowserState = {};
+	const managedPreviewUrl = "http://clawmanager-egress-proxy.clawmanager-hxc-peer-system.svc.cluster.local:3128/v2/interactive/75/_/signature/index.html";
+	pluginModule.reviewerBrowserToolDecision(
+		browserEnvelope,
+		{ toolName: "browser", params: { action: "open", url: managedPreviewUrl } },
+		managedBrowserState,
+		1010,
+	);
+	pluginModule.reviewerBrowserToolResultDecision(
+		browserEnvelope,
+		{ toolName: "browser", params: { action: "open", url: managedPreviewUrl }, result: { status: "ok" } },
+		managedBrowserState,
+		1011,
+	);
+	pluginModule.reviewerBrowserToolResultDecision(
+		browserEnvelope,
+		{ toolName: "browser", params: { action: "snapshot" }, result: { status: "ok" } },
+		managedBrowserState,
+		1012,
+	);
+	assert.deepEqual(
+		pluginModule.browserVerificationForCompletion(browserEnvelope, managedBrowserState),
+		{
+			verificationMode: "managed_browser",
+			browserVerification: {
+				status: "verified",
+				source: "runtime_tool_events",
+				managedPreview: true,
+				opened: true,
+				inspected: true,
+				targetHash: undefined,
+				evidenceIncomplete: undefined,
+			},
+		},
+		"only successful managed Browser tool events may produce a managed-browser verification fact",
+	);
+	const navigateBrowserState = {};
+	const isolatedPreviewUrl = "http://p-abcdefghijklmnop.clawmanager-team-preview.invalid/v2/interactive/75/_/signature/index.html";
+	const navigateDecision = pluginModule.reviewerBrowserToolDecision(
+		browserEnvelope,
+		{ toolName: "browser", params: { action: "navigate", url: managedPreviewUrl } },
+		navigateBrowserState,
+		1020,
+	);
+	assert.notEqual(navigateDecision.block, true, "normal Browser navigate must establish a target instead of being treated as inspect-before-open");
+	pluginModule.reviewerBrowserToolResultDecision(
+		browserEnvelope,
+		{ toolName: "browser", params: { action: "navigate", url: managedPreviewUrl }, result: { url: isolatedPreviewUrl, targetId: "target-nav" } },
+		navigateBrowserState,
+		1021,
+	);
+	pluginModule.reviewerBrowserToolResultDecision(
+		browserEnvelope,
+		{ toolName: "browser", params: { action: "snapshot" }, result: { status: "ok" } },
+		navigateBrowserState,
+		1022,
+	);
+	assert.equal(navigateBrowserState.targetUrl, isolatedPreviewUrl, "redirected Preview origin is retained as the verified target");
+	assert.equal(navigateBrowserState.managedPreviewOpened, true);
+	assert.equal(navigateBrowserState.managedPreviewInspected, true);
+	assert.equal(
+		pluginModule.browserToolResultUrl({ result: { details: { url: isolatedPreviewUrl } } }),
+		isolatedPreviewUrl,
+		"persisted Browser tool results recover the final URL even when after_tool_call delivery is detached",
+	);
+	const activeBrowserEnvelope = {
+		...browserEnvelope,
+		teamId: "75",
+		memberId: "reviewer",
+		role: "reviewer",
+		rootTaskId: "team-75-task-149",
+		messageId: "reviewer-browser-turn",
+		assignmentId: "review-149",
+	};
+	const activeBrowserResult = await liveRuntime.withActiveEnvelope(
+		activeBrowserEnvelope,
+		async () => {
+			const state = {};
+			liveRuntime.beforeBrowserToolCall(
+				{ toolName: "browser", params: { action: "open", url: managedPreviewUrl } },
+				state,
+				1020,
+			);
+			await liveRuntime.afterBrowserToolCall(
+				{ toolName: "browser", params: { action: "open", url: managedPreviewUrl }, result: { status: "ok" } },
+				state,
+				1021,
+			);
+			await liveRuntime.afterBrowserToolCall(
+				{ toolName: "browser", params: { action: "evaluate" }, result: { status: "ok" } },
+				state,
+				1022,
+			);
+		},
+		{ teamId: "75", memberId: "reviewer", role: "reviewer", sharedDir: shared },
+	);
+	assert.equal(activeBrowserResult.browserVerification.managedPreviewOpened, true);
+	assert.equal(activeBrowserResult.browserVerification.managedPreviewInspected, true);
+	assert.equal(activeBrowserResult.browserVerification.lastSuccessfulAction, "evaluate");
+	let detachedBrowserState;
+	await liveRuntime.withActiveEnvelope(
+		activeBrowserEnvelope,
+		async () => {
+			detachedBrowserState = {};
+			liveRuntime.beforeBrowserToolCall(
+				{ toolName: "browser", params: { action: "open", url: managedPreviewUrl } },
+				detachedBrowserState,
+				1030,
+			);
+		},
+		{ teamId: "75", memberId: "reviewer", role: "reviewer", sharedDir: shared },
+	);
+	await liveRuntime.afterBrowserToolCall(
+		{ toolName: "browser", params: { action: "open", url: managedPreviewUrl }, result: { status: "ok" } },
+		detachedBrowserState,
+		1031,
+	);
+	await liveRuntime.afterBrowserToolCall(
+		{ toolName: "browser", params: { action: "snapshot" }, result: { status: "ok" } },
+		detachedBrowserState,
+		1032,
+	);
+	assert.equal(detachedBrowserState.verification.managedPreviewOpened, true);
+	assert.equal(detachedBrowserState.verification.managedPreviewInspected, true, "detached after_tool_call keeps the immutable assignment binding");
+	assert.equal(
+		pluginModule.browserVerificationForCompletion(browserEnvelope, {}).verificationMode,
+		"static_only",
+		"a Reviewer may still complete after static review without claiming Browser verification",
+	);
+	assert.equal(
+		pluginModule.browserVerificationForCompletion(browserEnvelope, { evidenceIncomplete: true }).verificationMode,
+		"unknown",
+		"lost Browser evidence must not be misreported as a factual static-only review",
+	);
+  for (let index = 0; index < 10; index += 1) {
     const decision = pluginModule.reviewerBrowserToolDecision(
       browserEnvelope,
-      { toolName: "browser", params: { action: index === 1 ? "open" : "snapshot", url: index === 1 ? "https://example.com/review" : undefined } },
+			{ toolName: "browser", params: { action: "snapshot" } },
       browserState,
-      1000 + index,
+			1003 + index,
     );
     assert.notEqual(decision.block, true);
+		pluginModule.reviewerBrowserToolResultDecision(
+			browserEnvelope,
+			{ toolName: "browser", params: { action: "snapshot" }, result: { status: "ok" } },
+			browserState,
+			1003 + index,
+		);
   }
   const exhaustedBrowser = pluginModule.reviewerBrowserToolDecision(
     browserEnvelope,
     { toolName: "browser", params: { action: "snapshot" } },
     browserState,
-    1005,
+		1008,
   );
   assert.equal(exhaustedBrowser.block, true);
+	const elasticState = {};
+	pluginModule.reviewerBrowserToolDecision(
+		browserEnvelope,
+		{ toolName: "browser", params: { action: "open", url: "https://example.com/review" } },
+		elasticState,
+		3000,
+	);
+	pluginModule.reviewerBrowserToolResultDecision(
+		browserEnvelope,
+		{ toolName: "browser", params: { action: "open", url: "https://example.com/review" }, result: { status: "ok" } },
+		elasticState,
+		3001,
+	);
+	pluginModule.reviewerBrowserToolDecision(
+		browserEnvelope,
+		{ toolName: "browser", params: { action: "evaluate" } },
+		elasticState,
+		3002,
+	);
+	pluginModule.reviewerBrowserToolResultDecision(
+		browserEnvelope,
+		{ toolName: "browser", params: { action: "evaluate" }, error: "SyntaxError: unexpected token" },
+		elasticState,
+		3003,
+	);
+	assert.equal(elasticState.calls, 0, "a recoverable Browser error must not consume successful evidence budget");
+	assert.notEqual(
+		pluginModule.reviewerBrowserToolDecision(
+			browserEnvelope,
+			{ toolName: "browser", params: { action: "evaluate" } },
+			elasticState,
+			3004,
+		).block,
+		true,
+		"one corrected Browser call remains available",
+	);
+	pluginModule.reviewerBrowserToolResultDecision(
+		browserEnvelope,
+		{ toolName: "browser", params: { action: "evaluate" }, result: { status: "ok" } },
+		elasticState,
+		3005,
+	);
+	assert.equal(elasticState.calls, 1);
   assert.equal(pluginModule.browserToolCallFailed({
     result: {
       content: [{ type: "text", text: JSON.stringify({ status: "error", tool: "browser", error: "navigation blocked" }) }],
@@ -173,6 +723,101 @@ try {
   assert.equal(pluginModule.browserToolCallFailed({
     result: { content: [{ type: "text", text: JSON.stringify({ status: "ok", title: "Rendered" }) }] },
   }), false);
+	for (const command of [
+		"python3 -m http.server 8765",
+		"pkill -f remote-debugging-port=9222",
+		"chromium --headless --remote-debugging-port=9222",
+		"fuser 8765/tcp -k",
+	]) {
+		assert.equal(
+			pluginModule.teamProcessToolDecision(null, { toolName: "exec", params: { command } }).block,
+			true,
+			`dangerous over-testing command must be blocked: ${command}`,
+		);
+	}
+	assert.notEqual(
+		pluginModule.teamProcessToolDecision(
+			{ instanceMode: "pro", role: "reviewer" },
+			{ toolName: "exec", params: { command: "chromium --headless --remote-debugging-port=9222" } },
+		).block,
+		true,
+		"an isolated Pro instance may use an explicitly assigned local Browser harness",
+	);
+	assert.equal(
+		pluginModule.teamProcessToolDecision(
+			{ instanceMode: "pro", role: "reviewer" },
+			{ toolName: "exec", params: { command: "pkill chromium" } },
+		).block,
+		true,
+		"broad process termination remains unsafe even in an isolated instance",
+	);
+	for (const command of ["npm test", "npm run dev", "ps -ef", "kill 12345", "python3 scripts/check.py"]) {
+		assert.notEqual(
+			pluginModule.teamProcessToolDecision(null, { toolName: "exec", params: { command } }).block,
+			true,
+			`normal project verification must remain available: ${command}`,
+		);
+	}
+	for (const command of [
+		"chromium --headless file:///team/results/index.html",
+		"npx playwright test verify.spec.js",
+		"node -e \"require('puppeteer').launch()\"",
+		"npm install puppeteer",
+		"pip install selenium",
+	]) {
+		assert.notEqual(
+			pluginModule.teamProcessToolDecision({ role: "reviewer" }, { toolName: "exec", params: { command } }).block,
+			true,
+			`an explicitly assigned validator must not be role-blocked from required validation tooling: ${command}`,
+		);
+	}
+	for (const command of ["npm test", "npm run build", "python3 scripts/check.py", "rg puppeteer package.json"]) {
+		assert.notEqual(
+			pluginModule.teamProcessToolDecision({ role: "reviewer" }, { toolName: "exec", params: { command } }).block,
+			true,
+			`Reviewer source review and existing project checks must remain available: ${command}`,
+		);
+	}
+	assert.notEqual(
+		pluginModule.teamProcessToolDecision({ role: "developer" }, {
+			toolName: "exec",
+			params: { command: "chromium --headless file:///workspace/index.html" },
+		}).block,
+		true,
+		"ordinary Developers must not inherit the Reviewer-only Browser bypass guard",
+	);
+	assert.equal(pluginModule.assignmentHasIndependentReview({ role: "developer", reviewRequired: true }), true);
+	assert.equal(pluginModule.assignmentHasIndependentReview({ role: "reviewer", reviewRequired: true }), true);
+	assert.equal(pluginModule.assignmentHasIndependentReview({ role: "developer", validationAssignment: true }), false);
+	assert.notEqual(
+		pluginModule.teamProcessToolDecision(
+			{ role: "developer", reviewRequired: true },
+			{ toolName: "exec", params: { command: "npm install puppeteer" } },
+		).block,
+		true,
+		"validation ownership is soft guidance and must not hard-block an implementation tool call",
+	);
+	assert.notEqual(
+		pluginModule.teamProcessToolDecision(
+			{ role: "developer", validationAssignment: true, validationTargetAssignmentId: "dev-01" },
+			{ toolName: "exec", params: { command: "npm install puppeteer" } },
+		).block,
+		true,
+		"an explicit member-owned validation assignment must remain available regardless of role",
+	);
+	assert.deepEqual(
+		pluginModule.mergeBrowserVerificationState(
+			{ managedPreviewOpened: true, managedPreviewInspected: true, lastSuccessfulAction: "snapshot" },
+			{ managedPreviewOpened: false, managedPreviewInspected: false, lastFailureAction: "evaluate" },
+		),
+		{
+			managedPreviewOpened: true,
+			managedPreviewInspected: true,
+			lastSuccessfulAction: "snapshot",
+			lastFailureAction: "evaluate",
+		},
+		"a later Browser failure must not erase earlier successful evidence",
+	);
   assert.deepEqual(
     pluginModule.normalizePhaseDispositions([
       { phaseId: "phase-2", decision: "skipped", reason: "Phase 1 fully satisfied the goal." },
@@ -192,31 +837,45 @@ try {
     assert.notEqual(developerBrowser.block, true, "Developer Browser must not inherit the Reviewer budget");
   }
   const genericValidatorState = {};
-  for (let index = 0; index < 4; index += 1) {
+	const genericValidatorEnvelope = {
+		role: "domain-specialist",
+		validationAssignment: true,
+		validationTargetAssignmentId: "dev-01",
+		taskId: "team-75-task-149",
+	};
+	pluginModule.reviewerBrowserToolDecision(
+		genericValidatorEnvelope,
+		{ toolName: "browser", params: { action: "open", url: "https://example.com/review" } },
+		genericValidatorState,
+		3000,
+	);
+	pluginModule.reviewerBrowserToolResultDecision(
+		genericValidatorEnvelope,
+		{ toolName: "browser", params: { action: "open" }, result: { status: "ok" } },
+		genericValidatorState,
+		3001,
+	);
+  for (let index = 0; index < 10; index += 1) {
     const genericValidatorBrowser = pluginModule.reviewerBrowserToolDecision(
-      {
-        role: "domain-specialist",
-        validationAssignment: true,
-        validationTargetAssignmentId: "dev-01",
-        taskId: "team-75-task-149",
-      },
+			genericValidatorEnvelope,
       { toolName: "browser", params: { action: "snapshot" } },
       genericValidatorState,
-      3000 + index,
+			3002 + index,
     );
     assert.notEqual(genericValidatorBrowser.block, true);
+		pluginModule.reviewerBrowserToolResultDecision(
+			genericValidatorEnvelope,
+			{ toolName: "browser", params: { action: "snapshot" }, result: { status: "ok" } },
+			genericValidatorState,
+			3002 + index,
+		);
   }
   assert.equal(
     pluginModule.reviewerBrowserToolDecision(
-      {
-        role: "domain-specialist",
-        validationAssignment: true,
-        validationTargetAssignmentId: "dev-01",
-        taskId: "team-75-task-149",
-      },
+		genericValidatorEnvelope,
       { toolName: "browser", params: { action: "snapshot" } },
       genericValidatorState,
-      3005,
+		3007,
     ).block,
     true,
     "any assigned validator gets the brief Browser budget without reducing ordinary Worker Browser access",
@@ -248,6 +907,52 @@ try {
   assert.equal(turnFinished.completionRecoveryAttempt, 1);
   assert.equal(turnFinished.visibleToChat, false);
   assert.equal(turnFinished.chatPolicy, "hidden");
+  assert.equal(turnFinished.status, "running");
+  assert.equal(turnFinished.stateEffect, "none");
+  assert.equal(turnFinished.rootTaskTerminal, false);
+  const failedHandoffTurn = pluginModule.turnFinishedWithoutCompletionEvent(
+    { metadata: { completionRecoveryAttempt: 0 } },
+    {
+      fallbackText: "The team_send failed because the to field was missing. Let me resend with to: leader.",
+      assistantNarratives: [{ text: "The team_send failed because the to field was missing." }],
+      lastToolOutcome: { failed: true, toolName: "team_send", toolCallId: "call-team-send" },
+      browserVerification: {
+        verificationMode: "managed_browser",
+        browserVerification: { status: "verified", opened: true, inspected: true },
+      },
+    },
+  );
+  assert.equal(failedHandoffTurn.lastToolFailed, true);
+  assert.equal(failedHandoffTurn.completionContinuationRequired, true);
+  assert.equal(failedHandoffTurn.lastToolName, "team_send");
+  assert.equal(failedHandoffTurn.verificationMode, "managed_browser");
+  assert.match(failedHandoffTurn.resultMarkdown, /Let me resend/);
+  const toolCalls = new Map();
+  assert.equal(pluginModule.sessionToolOutcome({
+    message: { role: "assistant", content: [{ type: "tool_use", id: "call-1", name: "team_send" }] },
+  }, toolCalls), null);
+  assert.deepEqual(pluginModule.sessionToolOutcome({
+    id: "tool-result-1",
+    message: {
+      role: "tool",
+      content: [{ type: "tool_result", tool_use_id: "call-1", is_error: true, content: "missing required field: to" }],
+    },
+  }, toolCalls), {
+    failed: true,
+    toolName: "team_send",
+    toolCallId: "call-1",
+    sourceRecordId: "tool-result-1",
+  });
+  const incompleteAttempt = pluginModule.assignmentAttemptFailedEvent({ taskId: "team-75-task-150" });
+  assert.equal(incompleteAttempt.eventKind, "assignment_attempt_failed");
+  assert.equal(incompleteAttempt.stateEffect, "none");
+  assert.equal(incompleteAttempt.retryable, true);
+  assert.equal(incompleteAttempt.rootTaskTerminal, false);
+  assert.equal(pluginModule.isIncompleteTurnDelivery({
+    isError: true,
+    text: "Agent couldn't generate a response. Please try again.",
+  }), true);
+  assert.equal(pluginModule.isIncompleteTurnDelivery({ isError: true, text: "Unauthorized" }), false);
   assert.deepEqual(
     pluginModule.mergeActiveTurnFacts(
       { outbound: null, completionPending: false, artifactRefs: ["/team/a.md"] },
@@ -298,18 +1003,14 @@ try {
   );
   assert.equal(controlTarget.route, "control");
   assert.equal(controlTarget.completion, false);
-  assert.equal(
-    await pluginModule.shouldUseAssistantSessionFallback(
-      { teamId: "75", memberId: "leader", role: "leader", sharedDir: shared },
-      leaderContextEnvelope,
-      "A natural-language answer that did not call the completion tool.",
-    ),
-    true,
-    "a complete Leader turn must be submitted through the same completion proposal path",
-  );
-
   await seedActive("leader", "leader", "leader-final-synthesis");
   const leaderTools = createHarness("leader", "leader");
+	const missingTargetResult = toolResult(await leaderTools.get("team_send").execute("missing-target", {
+		text: "Assign the next task.",
+	}));
+	assert.equal(missingTargetResult.ok, false);
+	assert.equal(missingTargetResult.code, "ambiguous_team_target");
+	assert.equal(missingTargetResult.sent, false, "ambiguous repair must have zero transport side effects");
   const plan = toolResult(await leaderTools.get("team_artifact_write").execute("plan-write", {
     scope: "team",
     kind: "plan",
@@ -427,6 +1128,29 @@ try {
   const guidedPrompt = pluginModule.appendRedisTeamCompletionGuidance("Implement the page.", normalizedEnvelope);
   assert.match(guidedPrompt, /read these exact canonical paths/);
   assert.match(guidedPrompt, /\/team\/results\/team-75-task-150\/plan\/collaboration-plan\.md/);
+	assert.match(guidedPrompt, /call team_complete_task once/i);
+	assert.match(guidedPrompt, /Production-only work should produce and hand off the artifact without tests/i);
+	assert.match(guidedPrompt, /explicitly marked validationAssignment/i);
+	assert.match(guidedPrompt, /never blocks delivery/i);
+	const productionOnlyPrompt = pluginModule.appendRedisTeamCompletionGuidance("Implement the page.", {
+		...normalizedEnvelope,
+		reviewRequired: true,
+	});
+	assert.match(productionOnlyPrompt, /production-only work and independent validation is assigned downstream/i);
+	assert.match(productionOnlyPrompt, /without running syntax checks, tests, Browser acceptance/i);
+	const productionOnlyReviewerPrompt = pluginModule.appendRedisTeamCompletionGuidance("Implement the page.", {
+		...normalizedEnvelope,
+		role: "reviewer",
+		reviewRequired: true,
+	});
+	assert.match(productionOnlyReviewerPrompt, /production-only work and independent validation is assigned downstream/i);
+	const assignedValidatorPrompt = pluginModule.appendRedisTeamCompletionGuidance("Validate the page.", {
+		...normalizedEnvelope,
+		role: "domain-specialist",
+		validationAssignment: true,
+		validationTargetAssignmentId: "dev-01",
+	});
+	assert.match(assignedValidatorPrompt, /Code review policy/i);
   assert.deepEqual(
     pluginModule.canonicalTeamArtifactRefsFromText(
       { sharedDir: shared },
@@ -470,13 +1194,14 @@ try {
   assert.equal(preview.artifact.path, "/team/index.html");
   assert.match(
     preview.artifact.previewUrl,
-    /^http:\/\/clawmanager-egress-proxy\.clawmanager-hxc-peer-system\.svc\.cluster\.local:3128\/v1\/75\/_\/[A-Za-z0-9_-]+\/index\.html$/,
+    /^http:\/\/clawmanager-egress-proxy\.clawmanager-hxc-peer-system\.svc\.cluster\.local:3128\/v2\/interactive\/75\/_\/[A-Za-z0-9_-]+\/index\.html$/,
   );
+	assert.equal(new URL(preview.artifact.previewUrl).port, "3128", "interactive previews bootstrap through the resolvable managed proxy");
   assert.equal(new URL(preview.artifact.previewUrl).search, "", "preview links must not carry an expiry");
   process.env.CLAWMANAGER_TEAM_PREVIEW_ORIGIN = "http://clawmanager-team-preview.invalid";
   const legacyPreviewUrl = pluginModule.previewUrlForTeamArtifact(
     { teamId: "75", sharedDir: shared },
-    path.join(shared, "index.html"),
+    path.join(shared, "notes.txt"),
   );
   assert.equal(
     new URL(legacyPreviewUrl.url).hostname,
@@ -570,6 +1295,36 @@ try {
   assert.equal(review.ok, true);
   assert.equal(review.artifact.path, "/team/results/team-75-task-150/reviews/review-01/review-report.md");
   await fs.access(path.join(shared, "results", "team-75-task-150", "reviews", "review-01", "review-report.md"));
+  const inferredCanonicalReview = toolResult(await reviewerTools.get("team_artifact_write").execute("review-canonical", {
+    path: "/team/results/team-75-task-150/reviews/review-01/canonical-review-report.md",
+    content: "# Canonical review report\n\nPASS\n",
+  }));
+  assert.equal(
+    inferredCanonicalReview.artifact.path,
+    "/team/results/team-75-task-150/reviews/review-01/canonical-review-report.md",
+    "the active Reviewer canonical path must infer the non-blocking review contract",
+  );
+  const normalizedStaleReviewPath = toolResult(
+    await reviewerTools.get("team_artifact_write").execute("review-wrong-assignment", {
+      path: "/team/results/team-75-task-150/reviews/review-02/wrong-review-report.md",
+      content: "# Normalized stale path\n\nPASS\n",
+    }),
+  );
+  assert.equal(
+    normalizedStaleReviewPath.artifact.path,
+    "/team/results/team-75-task-150/reviews/review-01/wrong-review-report.md",
+    "a stale target/retry directory must normalize into the active validation assignment",
+  );
+  const normalizedReviewDirectory = toolResult(
+    await reviewerTools.get("team_artifact_mkdir").execute("review-mkdir-wrong-assignment", {
+      path: "/team/results/team-75-task-150/reviews/dev-01",
+    }),
+  );
+  assert.equal(
+    normalizedReviewDirectory.artifact.path,
+    "/team/results/team-75-task-150/reviews/review-01",
+    "review directory creation must use the same tolerant canonical lane as file writes",
+  );
   const legacyPrefixedReview = toolResult(await reviewerTools.get("team_artifact_write").execute("review-prefixed", {
     scope: "team",
     kind: "review",
@@ -581,6 +1336,96 @@ try {
     "/team/results/team-75-task-150/reviews/review-01/legacy-review-report.md",
     "kind=review must strip exactly one duplicated active assignment prefix",
   );
+	const legacyMemberReport = toolResult(await reviewerTools.get("team_artifact_write").execute("review-member-report", {
+		scope: "member",
+		path: "QA-REPORT.md",
+		content: "# QA Report\n\nPASS\n",
+	}));
+	assert.equal(
+		legacyMemberReport.artifact.path,
+		"/team/artifacts/team-75-task-150/members/reviewer/review-01/QA-REPORT.md",
+	);
+	const legacyMemberEvidence = toolResult(await reviewerTools.get("team_artifact_write").execute("review-member-evidence", {
+		scope: "member",
+		path: "EVIDENCE.json",
+		content: '{"pass":true}\n',
+	}));
+	const normalizedReviewCompletion = toolResult(await reviewerTools.get("team_complete_task").execute("review-complete", {
+		status: "succeeded",
+		summary: "\u5ba1\u6838\u5b8c\u6210",
+		resultMarkdown: `\u5ba1\u6838\u62a5\u544a\uff1a${legacyMemberReport.artifact.path}`,
+		artifactRefs: [legacyMemberReport.artifact.path, legacyMemberEvidence.artifact.path],
+	}));
+	assert.ok(
+		normalizedReviewCompletion.artifactRefs.includes("/team/results/team-75-task-150/reviews/review-01/QA-REPORT.md"),
+		"an explicitly referenced legacy member report must be copied to the canonical review root",
+	);
+	assert.ok(
+		normalizedReviewCompletion.artifactRefs.includes("/team/results/team-75-task-150/reviews/review-01/EVIDENCE.json"),
+		"multiple explicit review evidence files must mirror without creating a completion retry",
+	);
+	await fs.access(path.join(shared, "results", "team-75-task-150", "reviews", "review-01", "QA-REPORT.md"));
+  const tolerantReviewRead = toolResult(await reviewerTools.get("team_artifact_read").execute("review-read-stale-path", {
+    scope: "team",
+    path: "/team/results/team-75-task-150/reviews/old-review-assignment/QA-REPORT.md",
+  }));
+  assert.equal(tolerantReviewRead.ok, true);
+  assert.equal(
+    tolerantReviewRead.artifact.path,
+    "/team/results/team-75-task-150/reviews/review-01/QA-REPORT.md",
+    "a unique report in the current root work must remain readable through a stale assignment path",
+  );
+	await seedActive("reviewer", "reviewer", "review-01", {
+		revision: 2,
+		validationAssignment: true,
+		validationTargetAssignmentId: "dev-01",
+		validationTargetRevision: 2,
+	});
+	const revisionTwoReview = toolResult(await reviewerTools.get("team_artifact_write").execute("review-r2", {
+		scope: "team",
+		kind: "review",
+		path: "/team/results/team-75-task-150/reviews/review-01/review-r2.md",
+		content: "# Review revision 2\n\nPASS\n",
+	}));
+	assert.equal(
+		revisionTwoReview.artifact.path,
+		"/team/results/team-75-task-150/reviews/review-01/revisions/r2/review-r2.md",
+		"each validation revision must retain an independent canonical report directory",
+	);
+	const revisionTwoMemberReport = toolResult(await reviewerTools.get("team_artifact_write").execute("review-r2-member", {
+		scope: "member",
+		path: "QA-REPORT.md",
+		content: "# Review revision 2 member report\n\nPASS\n",
+	}));
+	assert.equal(
+		revisionTwoMemberReport.artifact.path,
+		"/team/artifacts/team-75-task-150/members/reviewer/review-01/revisions/r2/QA-REPORT.md",
+	);
+	await fs.writeFile(path.join(state, "teams", "75", "reviewer", "status.json"), JSON.stringify({
+		availability: "busy",
+		runtimeStatus: "running",
+		currentTaskId: "team-75-task-150",
+		currentAssignmentId: "review-01",
+		currentRevision: 2,
+		lastSeenAt: new Date().toISOString(),
+	}), "utf8");
+	const revisionTwoCompletion = toolResult(await reviewerTools.get("team_complete_task").execute("review-r2-complete", {
+		status: "succeeded",
+		summary: "Review revision 2 complete",
+		resultMarkdown: `Report: ${revisionTwoMemberReport.artifact.path}`,
+		artifactRefs: [revisionTwoMemberReport.artifact.path],
+	}));
+	assert.ok(
+		revisionTwoCompletion.artifactRefs.includes("/team/results/team-75-task-150/reviews/review-01/revisions/r2/QA-REPORT.md"),
+		"completion mirrors a tolerant member report into the same revision-specific canonical directory",
+	);
+	assert.equal(
+		pluginModule.validationRevisionDirectory(
+			{ memberId: "reviewer", role: "reviewer" },
+			{ revision: 3, validationAssignment: true },
+		),
+		path.join("revisions", "r3"),
+	);
   await seedActive("auditor", "domain-specialist", "audit-01", {
     validationAssignment: true,
     validationTargetAssignmentId: "dev-01",
@@ -598,6 +1443,25 @@ try {
     "/team/results/team-75-task-150/reviews/audit-01/validation-report.md",
     "an explicitly assigned validator must not depend on a Reviewer role name",
   );
+  const inferredGenericValidationReport = toolResult(await auditorTools.get("team_artifact_write").execute("audit-canonical", {
+    path: "/team/results/team-75-task-150/reviews/audit-01/canonical-validation-report.md",
+    content: "# Canonical validation report\n\nPASS\n",
+  }));
+  assert.equal(
+    inferredGenericValidationReport.artifact.path,
+    "/team/results/team-75-task-150/reviews/audit-01/canonical-validation-report.md",
+    "an assigned validator canonical path must infer review scope without relying on its role name",
+  );
+  await seedActive("developer", "developer", "dev-02");
+  const scopedDeveloperTools = createHarness("developer", "developer");
+  await assert.rejects(
+    () => scopedDeveloperTools.get("team_artifact_write").execute("developer-review-path", {
+      path: "/team/results/team-75-task-150/reviews/audit-01/developer-review.md",
+      content: "must not be written",
+    }),
+    /outside the active artifact scope/,
+    "a normal member must not inherit the validation writer path contract",
+  );
 
   await seedActive("leader", "leader", "review-01");
   const leaderIdentityTools = createHarness("leader", "leader");
@@ -613,14 +1477,136 @@ try {
     "Leader synthesis must not inherit the Reviewer's assignment identity",
   );
 
+  const staleWorkspaceEnvelope = pluginModule.normalizeEnvelope({
+    taskId: "team-28-task-64",
+    rootTaskId: "team-28-task-64",
+    to: "delivery-lead",
+    prompt: "Continue task 64; the conversation may still discuss team-28-task-63.",
+    workspaceContract: {
+      physicalSharedDir: "/workspaces/teams/user-1/team-28-shared",
+      taskRef: "team-28-task-63",
+      artifactRoot: "/team/artifacts/team-28-task-63",
+      extensionField: "preserved",
+    },
+    sharedWorkspace: {
+      physicalPath: "/workspaces/teams/user-1/team-28-shared",
+      taskWorkCanonicalRoot: "/team/work/team-28-task-63",
+    },
+  });
+  assert.equal(staleWorkspaceEnvelope.workspaceContract.taskRef, "team-28-task-64");
+  assert.equal(staleWorkspaceEnvelope.workspaceContract.artifactRoot, "/team/artifacts/team-28-task-64");
+  assert.equal(staleWorkspaceEnvelope.workspaceContract.extensionField, "preserved");
+  assert.equal(staleWorkspaceEnvelope.sharedWorkspace.taskWorkCanonicalRoot, "/team/work/team-28-task-64");
+  assert.match(staleWorkspaceEnvelope.text, /team-28-task-63/, "historical conversation text must remain intact");
+
+  const proseArtifactRefs = pluginModule.canonicalTeamArtifactRefsFromText(
+    { sharedDir: shared },
+    [
+      "/team/results/team-28-task-64/plan/collaboration-plan.md，随后派发任务",
+      "/team/artifacts/team-28-task-64/members/developer/dev-board/index.html（40786 字节）",
+      "/team/results/team-28-task-64/reviews/review-board/review-report.md（zh-CN），含结论",
+      "/team/results/team-28-task-64/reviews/review-board/，并继续",
+    ].join("\n"),
+    "team-28-task-64",
+  );
+  assert.deepEqual(proseArtifactRefs, [
+    "/team/results/team-28-task-64/plan/collaboration-plan.md",
+    "/team/artifacts/team-28-task-64/members/developer/dev-board/index.html",
+    "/team/results/team-28-task-64/reviews/review-board/review-report.md",
+  ]);
+
+  const inferredReviewDirectory = pluginModule.inferCanonicalArtifactWriteContract(
+    { memberId: "reviewer", role: "reviewer" },
+    { path: "/team/results/team-75-task-150/reviews/dev-01" },
+    {
+      rootTaskId: "team-75-task-150",
+      assignmentId: "review-01",
+      validationAssignment: true,
+      validationTargetAssignmentId: "dev-01",
+    },
+  );
+  assert.deepEqual(inferredReviewDirectory, {
+    path: "/team/results/team-75-task-150/reviews/review-01",
+    scope: "team",
+    kind: "review",
+  });
+
+  const monotonicPreviewUrl = "http://p-abcdefghijklmnop.clawmanager-team-preview.invalid/v2/interactive/test/index.html";
+  const openEvidence = pluginModule.reviewerBrowserToolResultDecision(
+    browserEnvelope,
+    { toolName: "browser", params: { action: "open", url: monotonicPreviewUrl }, result: { targetId: "target-1" } },
+    {},
+    1000,
+  );
+  assert.equal(openEvidence.managedPreviewOpened, true, "a successful open is evidence even if pending in-memory state was lost");
+  const laterSnapshotFailure = pluginModule.reviewerBrowserToolResultDecision(
+    browserEnvelope,
+    { toolName: "browser", params: { action: "snapshot" }, error: "ENOTFOUND" },
+    openEvidence,
+    1100,
+  );
+  const monotonicEvidence = pluginModule.mergeBrowserVerificationState(openEvidence, laterSnapshotFailure);
+  assert.equal(monotonicEvidence.managedPreviewOpened, true, "a later Browser error must not erase a successful open");
+  assert.equal(monotonicEvidence.managedPreviewInspected, undefined);
+
+	const freshStatusAt = new Date().toISOString();
+	assert.equal(pluginModule.equivalentActiveAssignment({
+		runtimeStatus: "running",
+		availability: "busy",
+		lastSeenAt: freshStatusAt,
+		currentTaskId: "team-75-task-150",
+		currentAssignmentId: "review-01",
+		currentRevision: 2,
+		currentValidationTargetAssignmentId: "dev-01",
+		currentValidationTargetRevision: 2,
+	}, {
+		rootTaskId: "team-75-task-150",
+		assignmentId: "review-01",
+		revision: 3,
+		validationTargetAssignmentId: "dev-01",
+		validationTargetRevision: 2,
+	}), true, "a newer duplicate request must not replace a healthy equivalent validation attempt");
+	assert.equal(pluginModule.equivalentActiveAssignment({
+		runtimeStatus: "running",
+		availability: "busy",
+		lastSeenAt: freshStatusAt,
+		currentTaskId: "team-75-task-old",
+		currentAssignmentId: "review-01",
+		currentRevision: 2,
+	}, {
+		rootTaskId: "team-75-task-150",
+		assignmentId: "review-01",
+		revision: 2,
+	}), false, "an active assignment from another root task must never suppress a new dispatch");
+	assert.ok(pluginModule.equivalentWorkflowAttempt({ assignments: {
+		"review-01": {
+			assignmentId: "review-01",
+			revision: 2,
+			status: "running",
+			validationTargetAssignmentId: "dev-01",
+			validationTargetRevision: 2,
+			updatedAt: freshStatusAt,
+		},
+	} }, {
+		assignmentId: "review-01",
+		revision: 3,
+		validationTargetAssignmentId: "dev-01",
+		validationTargetRevision: 2,
+	}), "the durable ledger must close the status-propagation race without creating another Work Item");
+
   assert.match(source, /function analyzeResponseLocale\(/);
   assert.doesNotMatch(source, /must use \$\{locale \|\| "zh-CN"\}/);
   assert.match(source, /workflowReminderIsStale/);
   assert.match(source, /ignored message post-processing failure after terminal assignment/);
-  assert.match(source, /automatic_turn_completion_v2/);
+  assert.doesNotMatch(source, /automatic_turn_completion_v2/);
+  assert.match(source, /explicit_completion_receipt_v1/);
+  assert.match(source, /turn_end_monitor_v1/);
   assert.match(source, /validation_contract_v2/);
 
   console.log("Team75 Redis Team contract test passed");
 } finally {
-  await fs.rm(root, { recursive: true, force: true });
+  // Windows may release handles created by the contract harness a moment after
+  // the final assertion. Retry transient ENOTEMPTY/EPERM cleanup failures so
+  // test status continues to reflect contract behavior rather than OS timing.
+  await fs.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }

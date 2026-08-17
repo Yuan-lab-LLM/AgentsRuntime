@@ -1,5 +1,0 @@
-{
-  "runtime": "windows-vm",
-  "context": ".",
-  "dockerfile": "./windows-vm/Dockerfile"
-}

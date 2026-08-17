@@ -51,6 +51,8 @@ type Config struct {
 	LLMAPIKey             string
 	LLMAPIKeySet          bool
 	LLMModelIDs           []string
+	LLMReasoning          map[string]bool
+	LLMReasoningControl   map[string]string
 	AgentDataDir          string
 	HeartbeatInterval     time.Duration
 	MetricsInterval       time.Duration

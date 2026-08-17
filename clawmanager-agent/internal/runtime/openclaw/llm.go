@@ -29,6 +29,30 @@ func parseLLMModelIDs(raw string) ([]string, error) {
 	return []string{raw}, nil
 }
 
+func parseLLMReasoning(raw string) (map[string]bool, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	settings := map[string]bool{}
+	if err := json.Unmarshal([]byte(raw), &settings); err != nil {
+		return nil, fmt.Errorf("parse CLAWMANAGER_LLM_REASONING: %w", err)
+	}
+	return settings, nil
+}
+
+func parseLLMReasoningControl(raw string) (map[string]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	settings := map[string]string{}
+	if err := json.Unmarshal([]byte(raw), &settings); err != nil {
+		return nil, fmt.Errorf("parse CLAWMANAGER_LLM_REASONING_CONTROL: %w", err)
+	}
+	return settings, nil
+}
+
 func parseDelimitedLLMModelIDs(raw string) []string {
 	parts := strings.Split(raw, ",")
 	values := make([]any, 0, len(parts))

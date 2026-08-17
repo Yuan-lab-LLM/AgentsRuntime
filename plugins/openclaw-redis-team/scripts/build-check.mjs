@@ -11,6 +11,15 @@ const manifest = JSON.parse(fs.readFileSync(path.join(root, "openclaw.plugin.jso
 const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
 const dist = fs.readFileSync(path.join(root, "dist", "index.js"), "utf8");
 if (manifest.id !== "redis-team") throw new Error(`unexpected plugin id: ${manifest.id}`);
+if (pkg.version !== "0.2.1") {
+  throw new Error(`unexpected package version: ${pkg.version}`);
+}
+if (pkg.openclaw?.compat?.pluginApi !== ">=2026.5.4") {
+  throw new Error("package.json must preserve the OpenClaw 2026.5.4 plugin API compatibility floor");
+}
+if (pkg.openclaw?.build?.openclawVersion !== "2026.7.1-2") {
+  throw new Error("package.json must declare the tested OpenClaw 2026.7.1-2 build baseline");
+}
 if (!pkg.openclaw?.extensions?.includes("./dist/index.js")) {
   throw new Error("package.json openclaw.extensions must include ./dist/index.js");
 }
@@ -62,8 +71,6 @@ for (const token of [
   "explicitCompletion",
   "WIRE_SCHEMA_VERSION = 1",
   "PROTOCOL_VERSION = 4",
-  "automatic_turn_completion_v1",
-  "automaticTurnResult",
   "CONTROL_PLANE_REPLY_TARGETS",
   "completion_proposed",
   "waitForCompletionAcknowledgement",
@@ -75,7 +82,7 @@ for (const token of [
   "phaseDispositions",
   "explicit-disposition-v1",
   "completion_pending",
-  "waiting_completion",
+  "awaiting_completion_receipt",
   "resultMarkdown",
   "Math.min(99",
   "await writeText(resultMarkdownPath, resultMarkdown)",
@@ -110,21 +117,30 @@ for (const token of [
   'stateEffect: "none"',
   "truncated:",
   "nextOffset:",
-  "eventKind: \"agent_narrative\"",
   "assistant_session",
   "readAssistantNarrativesFromDispatch",
   "sourceOccurredAt",
   "lateProjection",
+  "suppressedAfterTerminal",
+  "terminalDelivery",
   "semanticEventKind",
   "leader-final-synthesis",
   "Available Team artifact references:",
   "already_terminal",
   "suppressed duplicate reply after submitted completion",
+	"before_message_write",
+	"withNarrativeProjection",
+	"durableTurnFacts.completionProposed",
+	"browserVerification",
+	"mergeBrowserVerificationState",
+	"Assignment-specific ownership:",
+	"call team_complete_task once",
   "resolveRedisTeamVerificationRole",
   "Evidence verification policy:",
   "Code review policy:",
   "API verification policy:",
   "reviewerBrowserToolDecision",
+  "reviewerBrowserGuardKey",
   "browserToolCallFailed",
   "Team artifact Browser preview",
   "single brief Browser verification budget is exhausted",

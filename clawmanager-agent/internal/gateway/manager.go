@@ -580,6 +580,15 @@ func OpenClawGatewayEnv(base []string, cfg Config, req CreateGatewayRequest, wor
 	env = setEnv(env, "OPENCLAW_GATEWAY_PORT", strconv.Itoa(port))
 	if cfg.GatewayAuthMode == "trusted-proxy" {
 		env = unsetEnv(env, "OPENCLAW_GATEWAY_TOKEN", "CLAWMANAGER_GATEWAY_TOKEN", "RUNTIME_GATEWAY_TOKEN")
+		// OpenClaw's local Browser client connects directly to this instance's
+		// loopback Gateway. Give that interactive surface the same per-instance
+		// secret that ClawManager already manages instead of trusting every
+		// process in a pooled Runtime through allowLoopback.
+		if instanceToken := strings.TrimSpace(req.Environment["CLAWMANAGER_INSTANCE_TOKEN"]); instanceToken != "" {
+			env = setEnv(env, "OPENCLAW_GATEWAY_PASSWORD", instanceToken)
+		} else if instanceToken := strings.TrimSpace(req.Env["CLAWMANAGER_INSTANCE_TOKEN"]); instanceToken != "" {
+			env = setEnv(env, "OPENCLAW_GATEWAY_PASSWORD", instanceToken)
+		}
 	} else if cfg.GatewayToken != "" {
 		env = setEnv(env, "OPENCLAW_GATEWAY_TOKEN", cfg.GatewayToken)
 	}
