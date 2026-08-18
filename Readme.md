@@ -9,6 +9,10 @@ The repository currently documents these runtime images:
 - `openclaw`
 - `openclaw-lite`
 - `openclaw-shell`
+- `opencode`
+- `opencode-lite`
+- `codex`
+- `claude-code`
 - `windows-vm`
 
 ## Repository layout
@@ -18,6 +22,9 @@ The repository currently documents these runtime images:
 - `openclaw/`: OpenClaw runtime image, built from the repository root so it can include the shared `clawmanager-agent/`
 - `openclaw-lite`: lite OpenClaw runtime image, built from the repository root with `openclaw/Dockerfile.openclaw`
 - `openclaw-shell/`: Alpine-based OpenClaw shell runtime image, built from the repository root so it can reuse the OpenClaw agent implementation under `openclaw/`
+- `opencode/`: OpenCode Lite/Pro runtime image (official `opencode web` + shared `clawmanager-agent/`)
+- `codex/`: Codex Pro desktop runtime (official Codex CLI + shared `clawmanager-agent/`)
+- `claude-code/`: Claude Code Pro desktop runtime (official Claude Code CLI + shared `clawmanager-agent/`)
 - `windows-vm/`: Windows VM runtime wrapper around `dockurr/windows`, built from the repository root so it can include the shared `clawmanager-agent/`
 - `clawmanager-agent/`: shared managed-runtime agent used by runtime images that need ClawManager runtime gateway control
 
@@ -74,6 +81,38 @@ docker build \
 ```
 
 This image does not include Webtop or a virtual desktop. It uses `/config` as the persistent directory, runs `openclaw-agent` on container start, and reports `runtime_type=openclaw-shell` to ClawManager when `CLAWMANAGER_AGENT_ENABLED=true`.
+
+### OpenCode
+
+```bash
+docker build \
+  -f opencode/Dockerfile \
+  -t opencode:local \
+  .
+```
+
+### OpenCode Lite
+
+```bash
+docker build \
+  -f opencode/Dockerfile \
+  -t opencode-lite:local \
+  .
+```
+
+Lite and Pro share the same Dockerfile. Tag as `opencode-lite` for Runtime Pod Agent V2 (`opencode web` via CreateGateway) and `opencode` for dedicated Webtop Pro. OpenCode is pinned via `OPENCODE_VERSION` (default `1.18.13`).
+
+### Codex
+
+```bash
+docker build -f codex/Dockerfile -t codex:local .
+```
+
+### Claude Code
+
+```bash
+docker build -f claude-code/Dockerfile -t claude-code:local .
+```
 
 ### Windows VM
 

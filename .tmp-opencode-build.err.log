@@ -1,0 +1,83 @@
+#0 building with "desktop-linux" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile:
+#1 transferring dockerfile: 3.34kB 0.1s done
+#1 DONE 0.6s
+
+#2 [internal] load metadata for docker.io/library/golang:1.26-bookworm
+#2 DONE 0.4s
+
+#3 [internal] load metadata for lscr.io/linuxserver/webtop:ubuntu-kde
+#3 DONE 4.7s
+
+#4 [internal] load .dockerignore
+#4 transferring context: 200B 0.0s done
+#4 DONE 0.1s
+
+#5 [internal] load build context
+#5 DONE 0.0s
+
+#6 [clawmanager-agent-builder 1/5] FROM docker.io/library/golang:1.26-bookworm@sha256:2389ebfa5b7f43eeafbd6be0c3700cc46690ef842ad962f6c5bd6be49ed82039
+#6 resolve docker.io/library/golang:1.26-bookworm@sha256:2389ebfa5b7f43eeafbd6be0c3700cc46690ef842ad962f6c5bd6be49ed82039
+#6 resolve docker.io/library/golang:1.26-bookworm@sha256:2389ebfa5b7f43eeafbd6be0c3700cc46690ef842ad962f6c5bd6be49ed82039 0.3s done
+#6 DONE 0.4s
+
+#7 [stage-1 1/6] FROM lscr.io/linuxserver/webtop:ubuntu-kde@sha256:5005ffafe50117dfd8b28e3c37efd2cf603e37bc3741d472b1540739492d3ee0
+#7 resolve lscr.io/linuxserver/webtop:ubuntu-kde@sha256:5005ffafe50117dfd8b28e3c37efd2cf603e37bc3741d472b1540739492d3ee0
+#7 resolve lscr.io/linuxserver/webtop:ubuntu-kde@sha256:5005ffafe50117dfd8b28e3c37efd2cf603e37bc3741d472b1540739492d3ee0 0.3s done
+#7 DONE 0.4s
+
+#5 [internal] load build context
+#5 transferring context: 58.88kB 0.1s done
+#5 DONE 0.2s
+
+#8 [clawmanager-agent-builder 3/5] COPY clawmanager-agent ./
+#8 CACHED
+
+#9 [clawmanager-agent-builder 4/5] RUN go mod download
+#9 CACHED
+
+#10 [clawmanager-agent-builder 5/5] RUN set -eux;     arch="amd64";     CGO_ENABLED=0 GOOS="linux" GOARCH="${arch}"         go build -trimpath -ldflags="-s -w -X main.version=dev"         -o /out/clawmanager-agent ./cmd/clawmanager-agent
+#10 CACHED
+
+#11 [stage-1 2/6] RUN set -eux;     apt-get update;     apt-get install -y --no-install-recommends         bash         ca-certificates         curl         git         openssh-client         ripgrep         tar         unzip         xz-utils;     rm -rf /var/lib/apt/lists/*
+#11 CACHED
+
+#12 [stage-1 3/6] RUN set -eux;     arch="amd64";     case "${arch}" in         amd64|x86_64) oc_arch="x64" ;;         arm64|aarch64) oc_arch="arm64" ;;         *) echo "Unsupported architecture for OpenCode: ${arch}" >&2; exit 1 ;;     esac;     curl -fsSL "https://github.com/anomalyco/opencode/releases/download/v1.18.13/opencode-linux-${oc_arch}.tar.gz"         -o /tmp/opencode.tar.gz;     mkdir -p /tmp/opencode-extract;     tar -xzf /tmp/opencode.tar.gz -C /tmp/opencode-extract;     bin="$(find /tmp/opencode-extract -type f -name opencode | head -1)";     test -n "${bin}";     install -m 0755 "${bin}" /usr/local/bin/opencode;     opencode --version || opencode --help >/dev/null;     rm -rf /tmp/opencode.tar.gz /tmp/opencode-extract
+#12 CACHED
+
+#13 [clawmanager-agent-builder 2/5] WORKDIR /src/clawmanager-agent
+#13 CACHED
+
+#14 [stage-1 4/6] COPY --from=clawmanager-agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent
+#14 CACHED
+
+#15 [stage-1 5/6] COPY opencode/rootfs/ /
+#15 DONE 0.3s
+
+#16 [stage-1 6/6] RUN set -eux;     find /etc/s6-overlay/s6-rc.d -type f -exec sed -i 's/\r$//' {} +;     sed -i 's/\r$//'         /usr/local/bin/start-opencode-web         /usr/local/bin/start-opencode-pro-web         /usr/local/bin/start-opencode-terminal         /usr/local/bin/opencode-apply-runtime-config         /custom-cont-init.d/99-opencode-config         /etc/s6-overlay/s6-rc.d/opencode-agent/run         /etc/s6-overlay/s6-rc.d/opencode-web/run         /etc/s6-overlay/s6-rc.d/opencode-terminal/run;     chmod 755         /usr/local/bin/clawmanager-agent         /usr/local/bin/opencode         /usr/local/bin/start-opencode-web         /usr/local/bin/start-opencode-pro-web         /usr/local/bin/start-opencode-terminal         /usr/local/bin/opencode-apply-runtime-config         /custom-cont-init.d/99-opencode-config         /etc/s6-overlay/s6-rc.d/opencode-agent/run         /etc/s6-overlay/s6-rc.d/opencode-web/run         /etc/s6-overlay/s6-rc.d/opencode-terminal/run;     mkdir -p /var/lib/clawmanager-agent /config/.opencode;     chown -R abc:abc /config/.opencode || true
+#16 0.755 + find /etc/s6-overlay/s6-rc.d -type f -exec sed -i 's/\r$//' '{}' +
+#16 0.918 + sed -i 's/\r$//' /usr/local/bin/start-opencode-web /usr/local/bin/start-opencode-pro-web /usr/local/bin/start-opencode-terminal /usr/local/bin/opencode-apply-runtime-config /custom-cont-init.d/99-opencode-config /etc/s6-overlay/s6-rc.d/opencode-agent/run /etc/s6-overlay/s6-rc.d/opencode-web/run /etc/s6-overlay/s6-rc.d/opencode-terminal/run
+#16 0.922 + chmod 755 /usr/local/bin/clawmanager-agent /usr/local/bin/opencode /usr/local/bin/start-opencode-web /usr/local/bin/start-opencode-pro-web /usr/local/bin/start-opencode-terminal /usr/local/bin/opencode-apply-runtime-config /custom-cont-init.d/99-opencode-config /etc/s6-overlay/s6-rc.d/opencode-agent/run /etc/s6-overlay/s6-rc.d/opencode-web/run /etc/s6-overlay/s6-rc.d/opencode-terminal/run
+#16 0.946 + mkdir -p /var/lib/clawmanager-agent /config/.opencode
+#16 0.957 + chown -R abc:abc /config/.opencode
+#16 DONE 1.4s
+
+#17 exporting to image
+#17 exporting layers
+#17 exporting layers 1.6s done
+#17 exporting manifest sha256:02a75793b86a0c824428b543e53223af7db87b357aa0d06a999792697518ab01 0.1s done
+#17 exporting config sha256:59fb0240fbdaef21e8c29d1dd2a7db00879bbb7b780d946dc71878155c48b568
+#17 exporting config sha256:59fb0240fbdaef21e8c29d1dd2a7db00879bbb7b780d946dc71878155c48b568 0.1s done
+#17 exporting attestation manifest sha256:22c7a8579651bca696550c84b7ee813047615455d7bdc2bcd95df4cc1d0b937b
+#17 exporting attestation manifest sha256:22c7a8579651bca696550c84b7ee813047615455d7bdc2bcd95df4cc1d0b937b 0.2s done
+#17 exporting manifest list sha256:61ab7e6e5db287e2826cb738a78133e8f54c6c9029aceb451592945c85a2de2d
+#17 exporting manifest list sha256:61ab7e6e5db287e2826cb738a78133e8f54c6c9029aceb451592945c85a2de2d 0.1s done
+#17 naming to docker.io/library/opencode:local
+#17 naming to docker.io/library/opencode:local 0.0s done
+#17 unpacking to docker.io/library/opencode:local
+#17 unpacking to docker.io/library/opencode:local 0.8s done
+#17 DONE 3.9s
+
+View build details: docker-desktop://dashboard/build/desktop-linux/desktop-linux/c1fefgs8xjms15ruqi0d6cvg6

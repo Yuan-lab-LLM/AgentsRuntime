@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Write a locked OpenCode provider config for Pro/desktop boots.
+# Lite CreateGateway uses clawmanager-agent WriteGatewayConfig instead.
+
+opencode_home="${OPENCODE_CONFIG_DIR:-${HOME:-/config}/.opencode}"
+mkdir -p "${opencode_home}"
+config_path="${OPENCODE_CONFIG:-${opencode_home}/opencode.json}"
+
+base_url="${CLAWMANAGER_LLM_BASE_URL:-${OPENAI_BASE_URL:-${OPENAI_API_BASE:-}}}"
+api_key="${CLAWMANAGER_LLM_API_KEY:-${OPENAI_API_KEY:-${CLAWMANAGER_INSTANCE_TOKEN:-}}}"
+model_id="${OPENAI_MODEL:-auto}"
+
+if [ -z "${base_url}" ] || [ -z "${api_key}" ]; then
+  echo "opencode-apply-runtime-config: LLM base URL / API key not ready; skipping"
+  exit 0
+fi
+
+base_url="${base_url%/}"
+export OPENCODE_SERVER_USERNAME="${OPENCODE_SERVER_USERNAME:-opencode}"
+if [ -z "${OPENCODE_SERVER_PASSWORD:-}" ]; then
+  export OPENCODE_SERVER_PASSWORD="${CLAWMANAGER_INSTANCE_TOKEN:-${CLAWMANAGER_LLM_API_KEY:-${api_key}}}"
+fi
+
+cat >"${config_path}" <<EOF
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "model": "clawmanager/${model_id}",
+  "provider": {
+    "clawmanager": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "ClawManager AI Gateway",
+      "options": {
+        "baseURL": "${base_url}",
+        "apiKey": "{env:CLAWMANAGER_LLM_API_KEY}"
+      },
+      "models": {
+        "${model_id}": { "name": "${model_id}" },
+        "auto": { "name": "ClawManager Auto" }
+      }
+    }
+  },
+  "enabled_providers": ["clawmanager"],
+  "disabled_providers": ["openai", "anthropic", "google", "amazon-bedrock", "azure", "groq", "mistral", "deepseek"]
+}
+EOF
+
+chmod 640 "${config_path}" || true
+export OPENCODE_CONFIG="${config_path}"
+export OPENCODE_CONFIG_DIR="${opencode_home}"
+echo "opencode-apply-runtime-config: wrote ${config_path}"

@@ -1,0 +1,96 @@
+
+FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS clawmanager-agent-builder
+
+WORKDIR /src/clawmanager-agent
+
+ARG TARGETOS=linux
+ARG TARGETARCH
+ARG AGENT_VERSION=dev
+
+COPY clawmanager-agent ./
+RUN go mod download
+
+RUN set -eux; \
+    arch="${TARGETARCH:-amd64}"; \
+    CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${arch}" \
+        go build -trimpath -ldflags="-s -w -X main.version=${AGENT_VERSION}" \
+        -o /out/clawmanager-agent ./cmd/clawmanager-agent
+
+FROM lscr.io/linuxserver/webtop:ubuntu-kde
+
+ARG OPENCODE_VERSION=1.18.13
+ARG TARGETARCH
+ARG DEBIAN_FRONTEND=noninteractive
+
+ENV OPENCODE_CONFIG_DIR=/config/.opencode \
+    CLAWMANAGER_RUNTIME_TYPE=opencode \
+    PUID=1000 \
+    PGID=1000 \
+    TITLE="OpenCode Runtime" \
+    SUBFOLDER="/" \
+    PATH=/usr/local/bin:${PATH}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        curl \
+        git \
+        openssh-client \
+        ripgrep \
+        tar \
+        unzip \
+        xz-utils; \
+    rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+    case "${arch}" in \
+        amd64|x86_64) oc_arch="x64" ;; \
+        arm64|aarch64) oc_arch="arm64" ;; \
+        *) echo "Unsupported architecture for OpenCode: ${arch}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-${oc_arch}.tar.gz" \
+        -o /tmp/opencode.tar.gz; \
+    mkdir -p /tmp/opencode-extract; \
+    tar -xzf /tmp/opencode.tar.gz -C /tmp/opencode-extract; \
+    bin="$(find /tmp/opencode-extract -type f -name opencode | head -1)"; \
+    test -n "${bin}"; \
+    install -m 0755 "${bin}" /usr/local/bin/opencode; \
+    opencode --version || opencode --help >/dev/null; \
+    rm -rf /tmp/opencode.tar.gz /tmp/opencode-extract
+
+COPY --from=clawmanager-agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent
+COPY opencode/rootfs/ /
+
+ENV SHELL=/bin/bash
+
+RUN set -eux; \
+    find /etc/s6-overlay/s6-rc.d -type f -exec sed -i 's/\r$//' {} +; \
+    sed -i 's/\r$//' \
+        /usr/local/bin/start-opencode-web \
+        /usr/local/bin/start-opencode-pro-web \
+        /usr/local/bin/start-opencode-terminal \
+        /usr/local/bin/opencode-apply-runtime-config \
+        /custom-cont-init.d/99-opencode-config \
+        /etc/s6-overlay/s6-rc.d/opencode-agent/run \
+        /etc/s6-overlay/s6-rc.d/opencode-web/run \
+        /etc/s6-overlay/s6-rc.d/opencode-terminal/run; \
+    chmod 755 \
+        /usr/local/bin/clawmanager-agent \
+        /usr/local/bin/opencode \
+        /usr/local/bin/start-opencode-web \
+        /usr/local/bin/start-opencode-pro-web \
+        /usr/local/bin/start-opencode-terminal \
+        /usr/local/bin/opencode-apply-runtime-config \
+        /custom-cont-init.d/99-opencode-config \
+        /etc/s6-overlay/s6-rc.d/opencode-agent/run \
+        /etc/s6-overlay/s6-rc.d/opencode-web/run \
+        /etc/s6-overlay/s6-rc.d/opencode-terminal/run; \
+    mkdir -p /var/lib/clawmanager-agent /config/.opencode; \
+    chown -R abc:abc /config/.opencode || true
+
+EXPOSE 3001

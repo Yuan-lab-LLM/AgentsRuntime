@@ -18,7 +18,7 @@ import (
 
 func CollectRuntimeState(cfg Config, lastSkillScanAt time.Time) (StateReport, map[string]any) {
 	sampledAt := time.Now().UTC()
-	status, pid, version := inspectHermes(cfg.RuntimeCommand)
+	status, pid, version := inspectRuntime(cfg.RuntimeCommand)
 	diskTotal, diskFree := diskStats(cfg.PersistentDir)
 	diskUsed := diskTotal - diskFree
 	persistentUsed := directorySize(cfg.PersistentDir)
@@ -57,7 +57,7 @@ func CollectRuntimeState(cfg Config, lastSkillScanAt time.Time) (StateReport, ma
 			OpenClawVersion: version,
 		},
 		SystemInfo: SystemInfo{
-			Runtime:            "hermes",
+			Runtime:            cfg.RuntimeType,
 			OS:                 osInfo.id,
 			OSName:             osInfo.prettyName,
 			OSVersion:          osInfo.versionID,
@@ -118,7 +118,7 @@ func CollectRuntimeState(cfg Config, lastSkillScanAt time.Time) (StateReport, ma
 			},
 		},
 		Health: HealthInfo{
-			"hermes_process":                  healthStatus(status),
+			cfg.RuntimeType + "_process":      healthStatus(status),
 			"desktop":                         "ok",
 			"agent":                           "ok",
 			"metrics_collector":               metricsCollector,
@@ -136,27 +136,27 @@ func CollectRuntimeState(cfg Config, lastSkillScanAt time.Time) (StateReport, ma
 	}
 
 	summary := map[string]any{
-		"runtime":                "hermes",
-		"hermes_status":          status,
-		"hermes_pid":             pid,
-		"skill_count":            0,
-		"active_skill_count":     0,
-		"sampled_at":             sampledAt,
-		"cpu_usage_percent":      cpuUsage,
-		"cpu_cores":              cpuCores,
-		"memory_used_bytes":      mem.used,
-		"memory_total_bytes":     mem.total,
-		"memory_available_bytes": mem.available,
-		"disk_used_bytes":        diskUsed,
-		"disk_limit_bytes":       cfg.DiskLimitBytes,
-		"disk_free_bytes":        diskFree,
-		"network_rx_bytes":       networkRX,
-		"network_tx_bytes":       networkTX,
+		"runtime":                   cfg.RuntimeType,
+		cfg.RuntimeType + "_status": status,
+		cfg.RuntimeType + "_pid":    pid,
+		"skill_count":               0,
+		"active_skill_count":        0,
+		"sampled_at":                sampledAt,
+		"cpu_usage_percent":         cpuUsage,
+		"cpu_cores":                 cpuCores,
+		"memory_used_bytes":         mem.used,
+		"memory_total_bytes":        mem.total,
+		"memory_available_bytes":    mem.available,
+		"disk_used_bytes":           diskUsed,
+		"disk_limit_bytes":          cfg.DiskLimitBytes,
+		"disk_free_bytes":           diskFree,
+		"network_rx_bytes":          networkRX,
+		"network_tx_bytes":          networkTX,
 	}
 	return report, summary
 }
 
-func inspectHermes(command string) (string, int, string) {
+func inspectRuntime(command string) (string, int, string) {
 	pid := findProcess(command)
 	version := runtimeVersion(command)
 
@@ -226,7 +226,7 @@ func runtimeVersion(command string) string {
 		line = line[:idx]
 	}
 	if line == "" {
-		return "hermes"
+		return filepath.Base(command)
 	}
 	return line
 }
@@ -248,10 +248,10 @@ func findProcess(command string) int {
 		cmdline, _ := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
 		comm, _ := os.ReadFile(filepath.Join("/proc", entry.Name(), "comm"))
 		text := string(bytes.ReplaceAll(cmdline, []byte{0}, []byte{' '})) + " " + strings.TrimSpace(string(comm))
-		if strings.Contains(text, "hermes-agent") {
+		if strings.Contains(text, "clawmanager-agent") {
 			continue
 		}
-		if strings.Contains(text, commandBase) || strings.Contains(text, "/usr/local/bin/hermes") {
+		if strings.Contains(text, commandBase) {
 			return pid
 		}
 	}

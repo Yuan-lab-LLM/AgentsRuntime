@@ -1,0 +1,66 @@
+# Local smoke Dockerfile when lscr.io/webtop cannot be pulled.
+# Base is an existing Webtop runtime already on the machine (openclaw-lite).
+# Production builds must use opencode/Dockerfile(.nosyntax) FROM linuxserver/webtop.
+
+FROM golang:1.26.1-alpine AS clawmanager-agent-builder
+
+WORKDIR /src/clawmanager-agent
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+ARG AGENT_VERSION=dev
+
+RUN apk add --no-cache git
+
+COPY clawmanager-agent ./
+RUN go mod download
+
+RUN CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" \
+    go build -trimpath -ldflags="-s -w -X main.version=${AGENT_VERSION}" \
+    -o /out/clawmanager-agent ./cmd/clawmanager-agent
+
+FROM openclaw-lite:local
+
+ARG OPENCODE_VERSION=1.18.13
+
+ENV OPENCODE_CONFIG_DIR=/config/.opencode \
+    CLAWMANAGER_RUNTIME_TYPE=opencode \
+    TITLE="OpenCode Runtime"
+
+COPY --from=clawmanager-agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent
+COPY opencode/rootfs/usr/local/bin/start-opencode-web /usr/local/bin/start-opencode-web
+COPY opencode/rootfs/usr/local/bin/start-opencode-pro-web /usr/local/bin/start-opencode-pro-web
+COPY opencode/rootfs/usr/local/bin/start-opencode-terminal /usr/local/bin/start-opencode-terminal
+COPY opencode/rootfs/usr/local/bin/opencode-apply-runtime-config /usr/local/bin/opencode-apply-runtime-config
+COPY opencode/rootfs/custom-cont-init.d/99-opencode-config /custom-cont-init.d/99-opencode-config
+
+RUN set -eux; \
+    npm install -g "opencode-ai@${OPENCODE_VERSION}"; \
+    command -v opencode; \
+    opencode --version || opencode --help >/dev/null; \
+    if [ ! -e /usr/local/bin/opencode ]; then \
+      ln -sf "$(command -v opencode)" /usr/local/bin/opencode; \
+    fi; \
+    sed -i 's/\r$//' \
+      /usr/local/bin/start-opencode-web \
+      /usr/local/bin/start-opencode-pro-web \
+      /usr/local/bin/start-opencode-terminal \
+      /usr/local/bin/opencode-apply-runtime-config \
+      /custom-cont-init.d/99-opencode-config; \
+    chmod 755 \
+      /usr/local/bin/clawmanager-agent \
+      /usr/local/bin/start-opencode-web \
+      /usr/local/bin/start-opencode-pro-web \
+      /usr/local/bin/start-opencode-terminal \
+      /usr/local/bin/opencode-apply-runtime-config \
+      /custom-cont-init.d/99-opencode-config; \
+    mkdir -p /config/.opencode /var/lib/clawmanager-agent; \
+    # Prefer OpenCode Pro web over OpenClaw gateway when this image is used as Pro.
+    if [ -f /etc/services.d/openclaw-agent/run ]; then \
+      printf '%s\n' '#!/usr/bin/with-contenv bash' 'set -euo pipefail' \
+        'if [ -n "${RUNTIME_AGENT_CONTROL_TOKEN:-}" ] || [ -n "${RUNTIME_AGENT_REPORT_TOKEN:-}" ]; then' \
+        '  exec sleep infinity' \
+        'fi' \
+        'exec /usr/local/bin/start-opencode-pro-web' \
+        > /etc/services.d/openclaw-agent/run; \
+      chmod 755 /etc/services.d/openclaw-agent/run; \
+    fi
