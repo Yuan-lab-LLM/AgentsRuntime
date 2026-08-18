@@ -13,6 +13,7 @@ import re
 import ssl
 import stat
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -38,9 +39,13 @@ PROTOCOL_CAPABILITIES = [
     "completion_ack_v1",
     "explicit_completion_receipt_v1",
     "turn_end_monitor_v1",
+    "turn_outcome_v1",
+    "immediate_recheck_v1",
     "assignment_lifecycle_v1",
     "assignment_heartbeat_v1",
+    "assignment_activity_v2",
     "durable_turn_facts_v1",
+    "terminal_tool_stop_v1",
     "team_artifact_preview_v1",
     "team_artifact_preview_v2",
     "review_contract_v1",
@@ -56,6 +61,8 @@ REDIS_RECONNECT_BACKOFF_SECONDS = (1, 2, 5, 10, 30)
 TEAM_SHARED_DIR_MODE = 0o2775
 TEAM_SHARED_FILE_MODE = 0o664
 MAX_ARTIFACT_BYTES = 1024 * 1024
+TURN_TOOL_TRACE_LIMIT = 24
+TEAM_CONTROL_TOOLS = {"team_send", "team_update_progress", "team_complete_task"}
 
 
 def _truthy(value: Any, default: bool = False) -> bool:
@@ -315,6 +322,10 @@ def root_workflow_state_key(settings: RedisTeamSettings, root_task_id: str) -> s
     return f"{_key_prefix(settings)}:root:{_redis_key_part(root_task_id)}:state"
 
 
+def assignment_dispatch_state_key(settings: RedisTeamSettings, root_task_id: str) -> str:
+    return f"{_key_prefix(settings)}:root:{_redis_key_part(root_task_id)}:assignment-dispatch"
+
+
 def event_for(settings: RedisTeamSettings, event: str, extra: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     payload = {
         "v": WIRE_SCHEMA_VERSION,
@@ -351,6 +362,287 @@ def _load_active_envelope(settings: RedisTeamSettings) -> dict[str, Any]:
 
 def _persist_active_envelope(settings: RedisTeamSettings, envelope: dict[str, Any]) -> None:
     _atomic_write_json(_active_envelope_path(settings), envelope)
+
+
+def _turn_observation_path(settings: RedisTeamSettings) -> Path:
+    return settings.shared_path / ".hermes-redis-team" / f"turn-{_safe_name(settings.member_id)}.json"
+
+
+def _begin_turn_observation(settings: RedisTeamSettings, envelope: dict[str, Any], *, context_only: bool) -> None:
+    try:
+        _atomic_write_json(_turn_observation_path(settings), {
+            "messageId": _trim(envelope.get("messageId")),
+            "rootTaskId": _trim(envelope.get("rootTaskId") or envelope.get("taskId")),
+            "assignmentId": _trim(envelope.get("assignmentId") or envelope.get("workId")),
+            "revision": max(1, int(envelope.get("revision") or 1)),
+            "contextOnly": context_only,
+            "startedAt": _now_iso(),
+            "observedAt": _now_iso(),
+            "turnState": "starting",
+            "apiCallCount": 0,
+            "toolCallCount": 0,
+            "toolTrace": [],
+            "lastTool": None,
+        })
+    except Exception as exc:
+        logger.warning("Redis Team: turn observation start skipped: %s", exc)
+
+
+def _record_turn_tool_result(settings: RedisTeamSettings, tool_name: str, result: dict[str, Any]) -> None:
+    try:
+        observation = _read_json(_turn_observation_path(settings)) or {}
+        if not isinstance(observation, dict) or not _trim(observation.get("messageId")):
+            return
+        failed = result.get("ok") is False or result.get("success") is False or bool(result.get("error"))
+        team_send_result = result.get("sent") if tool_name == "team_send" and isinstance(result.get("sent"), dict) else {}
+        tool_fact = {
+            "toolName": tool_name,
+            "failed": failed,
+            "retryable": result.get("retryable") is True,
+            "succeeded": not failed,
+            "error": _trim(result.get("error") or result.get("message")) or None,
+            "code": _trim(result.get("code")) or None,
+            "candidates": result.get("candidates") if isinstance(result.get("candidates"), list) else None,
+            "observedAt": _now_iso(),
+            "outboundObserved": bool(team_send_result),
+            "businessMutation": team_send_result.get("businessMutation") is True,
+            "businessDeliveryKind": _trim(team_send_result.get("businessDeliveryKind")) or None,
+            "outboundTarget": _trim(team_send_result.get("to")) or None,
+        }
+        trace = observation.get("toolTrace") if isinstance(observation.get("toolTrace"), list) else []
+        trace.append(tool_fact)
+        observation["toolTrace"] = trace[-TURN_TOOL_TRACE_LIMIT:]
+        observation["toolCallCount"] = max(int(observation.get("toolCallCount") or 0), len(trace))
+        observation["lastToolActivity"] = tool_fact
+        observation["lastToolAt"] = tool_fact["observedAt"]
+        observation["lastToolName"] = tool_name
+        observation["lastToolFailed"] = failed
+        observation["pendingToolName"] = ""
+        observation["turnState"] = "running"
+        observation["observedAt"] = tool_fact["observedAt"]
+        if tool_name in TEAM_CONTROL_TOOLS:
+            observation["lastTool"] = tool_fact
+        _atomic_write_json(_turn_observation_path(settings), observation)
+    except Exception as exc:
+        logger.warning("Redis Team: turn tool observation skipped: %s", exc)
+
+
+def _team_tool_json_result(settings: RedisTeamSettings, tool_name: str, result: dict[str, Any]) -> str:
+    _record_turn_tool_result(settings, tool_name, result)
+    return json.dumps(result, ensure_ascii=False)
+
+
+def _update_turn_observation_from_hook(
+    *,
+    phase: str,
+    tool_name: str = "",
+    result: Any = None,
+    task_id: str = "",
+    turn_id: str = "",
+    api_request_id: str = "",
+    api_call_count: int = 0,
+    duration_ms: int = 0,
+    finish_reason: str = "",
+    status: str = "",
+    error_message: str = "",
+) -> None:
+    """Persist bounded Hermes loop facts without changing Team business state."""
+
+    settings = load_settings(None)
+    if not settings.enabled:
+        return
+    try:
+        path = _turn_observation_path(settings)
+        observation = _read_json(path) or {}
+        if not isinstance(observation, dict) or not _trim(observation.get("messageId")):
+            return
+        expected_task = _trim(observation.get("rootTaskId") or observation.get("taskId"))
+        if task_id and expected_task and _trim(task_id) != expected_task:
+            return
+        now = _now_iso()
+        observation["observedAt"] = now
+        if turn_id:
+            observation["turnId"] = _trim(turn_id)
+        if api_request_id:
+            observation["apiRequestId"] = _trim(api_request_id)
+        if phase == "pre_api":
+            observation["turnState"] = "running"
+            observation["lastActivityKind"] = "api_request_started"
+            observation["lastApiActivityAt"] = now
+            observation["apiCallCount"] = max(int(observation.get("apiCallCount") or 0), int(api_call_count or 0))
+        elif phase == "post_api":
+            observation["turnState"] = "running"
+            observation["lastActivityKind"] = "api_response_received"
+            observation["lastApiActivityAt"] = now
+            observation["apiCallCount"] = max(int(observation.get("apiCallCount") or 0), int(api_call_count or 0))
+            observation["lastApiDurationMs"] = max(0, int(duration_ms or 0))
+            observation["lastFinishReason"] = _trim(finish_reason) or None
+        elif phase == "pre_tool":
+            observation["turnState"] = "waiting_tool"
+            observation["lastActivityKind"] = "tool_call_started"
+            observation["pendingToolName"] = _trim(tool_name)
+            observation["lastToolAt"] = now
+            observation["toolCallCount"] = int(observation.get("toolCallCount") or 0) + 1
+        elif phase == "post_tool":
+            parsed = result
+            if isinstance(result, str):
+                try:
+                    parsed = json.loads(result)
+                except (TypeError, ValueError):
+                    parsed = {"ok": status != "error", "error": error_message or None}
+            if not isinstance(parsed, dict):
+                parsed = {"ok": status != "error", "result": _short_text(str(parsed), 240)}
+            if status == "error" and not parsed.get("error"):
+                parsed["error"] = _trim(error_message) or "Hermes tool call failed"
+            _record_turn_tool_result(settings, _trim(tool_name), parsed)
+            return
+        _atomic_write_json(path, observation)
+    except Exception as exc:
+        logger.debug("Redis Team: Hermes hook observation skipped: %s", exc)
+
+
+def _hook_pre_api_request(**kwargs: Any) -> None:
+    _update_turn_observation_from_hook(
+        phase="pre_api",
+        task_id=_trim(kwargs.get("task_id")),
+        turn_id=_trim(kwargs.get("turn_id")),
+        api_request_id=_trim(kwargs.get("api_request_id")),
+        api_call_count=int(kwargs.get("api_call_count") or 0),
+    )
+
+
+def _hook_post_api_request(**kwargs: Any) -> None:
+    _update_turn_observation_from_hook(
+        phase="post_api",
+        task_id=_trim(kwargs.get("task_id")),
+        turn_id=_trim(kwargs.get("turn_id")),
+        api_request_id=_trim(kwargs.get("api_request_id")),
+        api_call_count=int(kwargs.get("api_call_count") or 0),
+        duration_ms=int(float(kwargs.get("api_duration") or 0) * 1000),
+        finish_reason=_trim(kwargs.get("finish_reason")),
+    )
+
+
+def _hook_pre_tool_call(**kwargs: Any) -> None:
+    _update_turn_observation_from_hook(
+        phase="pre_tool",
+        tool_name=_trim(kwargs.get("tool_name")),
+        task_id=_trim(kwargs.get("task_id")),
+        turn_id=_trim(kwargs.get("turn_id")),
+        api_request_id=_trim(kwargs.get("api_request_id")),
+    )
+
+
+def _hook_post_tool_call(**kwargs: Any) -> None:
+    tool_name = _trim(kwargs.get("tool_name"))
+    # Team handlers persist canonical results themselves. A schema/dispatch
+    # failure may happen before the handler, though; in that case the pending
+    # marker is still present and the hook must retain the retryable evidence.
+    if tool_name.startswith("team_"):
+        try:
+            settings = load_settings(None)
+            observation = _read_json(_turn_observation_path(settings)) or {}
+            if _trim(observation.get("pendingToolName")) != tool_name:
+                return
+        except Exception:
+            pass
+    _update_turn_observation_from_hook(
+        phase="post_tool",
+        tool_name=tool_name,
+        result=kwargs.get("result"),
+        task_id=_trim(kwargs.get("task_id")),
+        turn_id=_trim(kwargs.get("turn_id")),
+        api_request_id=_trim(kwargs.get("api_request_id")),
+        duration_ms=int(kwargs.get("duration_ms") or 0),
+        status=_trim(kwargs.get("status")),
+        error_message=_trim(kwargs.get("error_message")),
+    )
+
+
+def _finish_turn_observation(settings: RedisTeamSettings, message_id: str) -> dict[str, Any]:
+    path = _turn_observation_path(settings)
+    try:
+        observation = _read_json(path) or {}
+    except Exception as exc:
+        logger.warning("Redis Team: turn observation read skipped: %s", exc)
+        return {}
+    if not isinstance(observation, dict) or _trim(observation.get("messageId")) != _trim(message_id):
+        return {}
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return observation
+
+
+def _context_turn_outcome_policy(envelope: dict[str, Any]) -> dict[str, Any]:
+    configured = envelope.get("turnOutcomePolicy") or envelope.get("turn_outcome_policy")
+    if isinstance(configured, dict):
+        return {
+            "actionExpected": _truthy(configured.get("actionExpected", configured.get("action_expected")), False),
+            "immediateRecoveryAllowed": _truthy(configured.get("immediateRecoveryAllowed", configured.get("immediate_recovery_allowed")), False),
+            "reason": _trim(configured.get("reason")) or "control_plane_policy",
+        }
+    metadata = envelope.get("metadata") if isinstance(envelope.get("metadata"), dict) else {}
+    intent = _trim(envelope.get("intent") or metadata.get("intent") or metadata.get("monitorType")).lower()
+    if intent in {"member_result_confirmed", "leader_synthesis_reminder", "leader_workflow_decision", "leader_decision_reminder"}:
+        return {"actionExpected": True, "immediateRecoveryAllowed": True, "reason": "legacy_workflow_notification"}
+    if intent in {"root_coordination_recovery", "root_assignment_recovery", "assignment_recovery_reminder", "target_resolution_review"}:
+        return {"actionExpected": True, "immediateRecoveryAllowed": False, "reason": "recovery_turn"}
+    return {"actionExpected": False, "immediateRecoveryAllowed": False, "reason": "ordinary_context"}
+
+
+def _observe_team_turn_outcome(envelope: dict[str, Any], active: dict[str, Any], turn: dict[str, Any]) -> dict[str, Any]:
+    context_only = not _truthy(envelope.get("requiresCompletion"), True)
+    policy = _context_turn_outcome_policy(envelope) if context_only else {
+        "actionExpected": True,
+        "immediateRecoveryAllowed": True,
+        "reason": "formal_assignment",
+    }
+    last_tool = turn.get("lastTool") if isinstance(turn.get("lastTool"), dict) else {}
+    completion_observed = bool(active.get("terminal") or active.get("explicitCompletionSubmitted"))
+    conflicts: list[str] = []
+    if completion_observed and last_tool.get("failed") is True and last_tool.get("retryable") is True:
+        conflicts.append("completion_and_retryable_tool_gap")
+    if conflicts:
+        outcome = "runtime_observation_unknown"
+    elif completion_observed:
+        outcome = "completed"
+    elif (
+        last_tool.get("toolName") == "team_send"
+        and last_tool.get("succeeded") is True
+        and (
+            last_tool.get("businessMutation") is True
+            or _trim(last_tool.get("businessDeliveryKind")).lower() == "assignment"
+        )
+    ):
+        outcome = "legitimate_wait"
+    elif last_tool.get("failed") is True and last_tool.get("retryable") is True:
+        outcome = "retryable_tool_gap"
+    elif policy["actionExpected"]:
+        outcome = "completion_receipt_gap"
+    else:
+        outcome = "ordinary_open_turn"
+    return {
+        "outcome": outcome,
+        "contextOnly": context_only,
+        "actionExpected": policy["actionExpected"],
+        "immediateRecoveryEligible": bool(
+            policy["immediateRecoveryAllowed"]
+            and outcome in {"retryable_tool_gap", "completion_receipt_gap"}
+        ),
+        "policyReason": policy["reason"],
+        "evidenceConflict": bool(conflicts),
+        "evidenceConflicts": conflicts,
+        "lastTool": last_tool,
+        "hadOutboundAssignment": last_tool.get("outboundObserved") is True,
+        "downstreamAssignmentStarted": (
+            last_tool.get("businessMutation") is True
+            or _trim(last_tool.get("businessDeliveryKind")).lower() == "assignment"
+        ),
+        "outboundDeliveryKind": _trim(last_tool.get("businessDeliveryKind")) or None,
+        "outboundTarget": _trim(last_tool.get("outboundTarget")) or None,
+    }
 
 
 def _envelope_value(settings: RedisTeamSettings, args: dict[str, Any], *keys: str) -> str:
@@ -418,12 +710,19 @@ def _artifact_path(
             / _safe_name(assignment_id)
         )
         canonical_candidate = settings.shared_path / relative
-        if _trim(args.get("path")).replace("\\", "/").startswith("/team/"):
+        root_relative = root.relative_to(settings.shared_path)
+        raw_path = _trim(args.get("path")).replace("\\", "/")
+        canonical_relative = relative == root_relative or root_relative in relative.parents
+        if raw_path.startswith("/team/") or canonical_relative:
             try:
                 canonical_candidate.relative_to(root)
             except ValueError as exc:
                 raise ValueError("Canonical Team artifact path is outside the active member scope") from exc
             candidate = canonical_candidate
+        elif relative.parts and relative.parts[0] in {"artifacts", "results"}:
+            raise ValueError(
+                "Member artifact path must be assignment-relative or the exact canonical current-assignment path"
+            )
         else:
             candidate = root / relative
     elif scope == "team":
@@ -690,13 +989,22 @@ async def _tool_team_artifact_write(args: dict[str, Any], **_kwargs) -> str:
     try:
         effective_args = _normalize_validation_artifact_write_args(settings, args)
         target = _artifact_path(settings, effective_args, default_scope="member", write=True)
-        _atomic_write_text(target, str(args.get("content") or ""))
-        return json.dumps(
-            {"ok": True, "artifact": {"path": canonical_artifact_ref(settings, target), "bytes": target.stat().st_size}},
-            ensure_ascii=False,
+        content = str(args.get("content") or "")
+        _atomic_write_text(target, content)
+        return _team_tool_json_result(
+            settings,
+            "team_artifact_write",
+            {
+                "ok": True,
+                "artifact": {
+                    "path": canonical_artifact_ref(settings, target),
+                    "bytes": target.stat().st_size,
+                    "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                },
+            },
         )
     except Exception as exc:
-        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+        return _team_tool_json_result(settings, "team_artifact_write", {"ok": False, "error": str(exc)})
 
 
 async def _tool_team_artifact_read(args: dict[str, Any], **_kwargs) -> str:
@@ -704,23 +1012,36 @@ async def _tool_team_artifact_read(args: dict[str, Any], **_kwargs) -> str:
     try:
         target = _artifact_read_path_with_fallback(settings, args)
         max_bytes = min(MAX_ARTIFACT_BYTES, max(1, int(args.get("maxBytes") or 256 * 1024)))
+        offset = max(0, int(args.get("offset") or 0))
         if not target.is_file():
             raise ValueError("Team artifact is not a file")
-        if target.stat().st_size > max_bytes:
-            raise ValueError("Team artifact exceeds maxBytes")
-        return json.dumps(
+        size = target.stat().st_size
+        if offset > size:
+            raise ValueError("Team artifact offset exceeds file size")
+        with target.open("rb") as handle:
+            handle.seek(offset)
+            content_bytes = handle.read(max_bytes)
+        content = content_bytes.decode("utf-8", errors="replace")
+        next_offset = offset + len(content_bytes)
+        truncated = next_offset < size
+        return _team_tool_json_result(
+            settings,
+            "team_artifact_read",
             {
                 "ok": True,
                 "artifact": {
                     "path": canonical_artifact_ref(settings, target),
-                    "content": target.read_text(encoding="utf-8"),
-                    "bytes": target.stat().st_size,
+                    "content": content,
+                    "bytes": size,
+                    "offset": offset,
+                    "returnedBytes": len(content_bytes),
+                    "truncated": truncated,
+                    "nextOffset": next_offset if truncated else None,
                 },
             },
-            ensure_ascii=False,
         )
     except Exception as exc:
-        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+        return _team_tool_json_result(settings, "team_artifact_read", {"ok": False, "error": str(exc)})
 
 
 async def _tool_team_artifact_list(args: dict[str, Any], **_kwargs) -> str:
@@ -742,12 +1063,13 @@ async def _tool_team_artifact_list(args: dict[str, Any], **_kwargs) -> str:
                     "bytes": child.stat().st_size if child.is_file() else None,
                 }
             )
-        return json.dumps(
+        return _team_tool_json_result(
+            settings,
+            "team_artifact_list",
             {"ok": True, "path": canonical_artifact_ref(settings, target), "entries": entries},
-            ensure_ascii=False,
         )
     except Exception as exc:
-        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+        return _team_tool_json_result(settings, "team_artifact_list", {"ok": False, "error": str(exc)})
 
 
 async def _tool_team_artifact_mkdir(args: dict[str, Any], **_kwargs) -> str:
@@ -755,12 +1077,13 @@ async def _tool_team_artifact_mkdir(args: dict[str, Any], **_kwargs) -> str:
     try:
         target = _artifact_path(settings, args, default_scope="member", write=True)
         _ensure_shared_directory(target)
-        return json.dumps(
+        return _team_tool_json_result(
+            settings,
+            "team_artifact_mkdir",
             {"ok": True, "artifact": {"path": canonical_artifact_ref(settings, target)}},
-            ensure_ascii=False,
         )
     except Exception as exc:
-        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+        return _team_tool_json_result(settings, "team_artifact_mkdir", {"ok": False, "error": str(exc)})
 
 
 def _preview_url(settings: RedisTeamSettings, target: Path) -> str:
@@ -823,16 +1146,17 @@ async def _tool_team_artifact_preview(args: dict[str, Any], **_kwargs) -> str:
         target = _artifact_path(settings, args, default_scope="team")
         if not target.is_file():
             raise ValueError("Team artifact preview requires a readable file")
-        return json.dumps(
+        return _team_tool_json_result(
+            settings,
+            "team_artifact_preview",
             {
                 "ok": True,
                 "artifact": {"path": canonical_artifact_ref(settings, target), "bytes": target.stat().st_size},
                 "previewUrl": _preview_url(settings, target),
             },
-            ensure_ascii=False,
         )
     except Exception as exc:
-        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+        return _team_tool_json_result(settings, "team_artifact_preview", {"ok": False, "error": str(exc)})
 
 
 def write_local_status(settings: RedisTeamSettings, patch: Optional[dict[str, Any]] = None) -> dict[str, Any]:
@@ -992,6 +1316,102 @@ def read_team_statuses(settings: RedisTeamSettings, member_id: str = "") -> Any:
     return statuses
 
 
+def _team_roster_members(settings: RedisTeamSettings) -> list[dict[str, Any]]:
+    raw = _read_json(settings.shared_path / "team.json") or {}
+    candidates = raw.get("members")
+    if not isinstance(candidates, list) and isinstance(raw.get("team"), dict):
+        candidates = raw["team"].get("members")
+    if not isinstance(candidates, list):
+        return []
+    members: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        member_id = _trim(
+            candidate.get("memberId") or candidate.get("memberID")
+            or candidate.get("memberKey") or candidate.get("id") or candidate.get("key")
+        )
+        if not member_id:
+            continue
+        aliases = {member_id, _safe_name(member_id)}
+        for value in (candidate.get("displayName"), candidate.get("name")):
+            text = _trim(value)
+            if text:
+                aliases.update({text, _safe_name(text)})
+        members.append({"memberId": member_id, "aliases": sorted(aliases)})
+    return members
+
+
+def _comparable_roster_identity(value: Any) -> str:
+    return unicodedata.normalize("NFKC", _trim(value)).casefold()
+
+
+def _roster_identity_fragments(value: Any) -> set[str]:
+    comparable = _comparable_roster_identity(value)
+    if not comparable:
+        return set()
+    return {comparable, *[part for part in re.split(r"[^\w]+", comparable, flags=re.UNICODE) if part]}
+
+
+def _bounded_roster_alias_match(value: str, alias: str) -> bool:
+    if not value or not alias:
+        return False
+    if value == alias:
+        return True
+    return re.search(r"(?<!\w)" + re.escape(alias) + r"(?!\w)", value, flags=re.UNICODE) is not None
+
+
+def _roster_edit_distance(left: str, right: str) -> int:
+    previous = list(range(len(right) + 1))
+    for index, left_char in enumerate(left, start=1):
+        current = [index]
+        for offset, right_char in enumerate(right, start=1):
+            current.append(min(
+                current[-1] + 1,
+                previous[offset] + 1,
+                previous[offset - 1] + (0 if left_char == right_char else 1),
+            ))
+        previous = current
+    return previous[-1]
+
+
+def _resolve_roster_target(settings: RedisTeamSettings, value: Any) -> dict[str, Any]:
+    original = _trim(value)
+    comparable = _comparable_roster_identity(original)
+    fragments = _roster_identity_fragments(original)
+    members = _team_roster_members(settings)
+    if not comparable or not members:
+        return {"memberId": original if comparable and not members else "", "kind": "roster_unavailable", "candidates": [], "suggestions": []}
+    matches: list[dict[str, Any]] = []
+    for member in members:
+        aliases = {_comparable_roster_identity(alias) for alias in member["aliases"] if _trim(alias)}
+        matched = sorted(alias for alias in aliases if alias in fragments or _bounded_roster_alias_match(comparable, alias))
+        if matched:
+            matches.append({"member": member, "aliases": matched})
+    if len(matches) == 1:
+        return {
+            "memberId": matches[0]["member"]["memberId"],
+            "kind": "exact_roster_alias" if comparable in matches[0]["aliases"] else "unique_roster_information",
+            "candidates": [matches[0]["member"]["memberId"]],
+            "suggestions": [],
+        }
+    if len(matches) > 1:
+        return {"memberId": "", "kind": "ambiguous_roster_information", "candidates": [match["member"]["memberId"] for match in matches], "suggestions": []}
+    scored: list[tuple[int, str]] = []
+    for member in members:
+        distances = [
+            _roster_edit_distance(fragment, _comparable_roster_identity(alias))
+            for fragment in fragments
+            for alias in member["aliases"]
+            if len(fragment) >= 3 and len(_comparable_roster_identity(alias)) >= 3
+        ]
+        if distances and min(distances) <= 2:
+            scored.append((min(distances), member["memberId"]))
+    best = min((score for score, _ in scored), default=None)
+    suggestions = [member_id for score, member_id in scored if score == best] if best is not None else []
+    return {"memberId": "", "kind": "suggestion_only" if suggestions else "unresolved", "candidates": [], "suggestions": suggestions}
+
+
 def write_task_result(
     settings: RedisTeamSettings,
     task_id: str,
@@ -1088,6 +1508,18 @@ def normalize_envelope(raw: Any) -> Optional[dict[str, Any]]:
         "sessionKey": raw.get("sessionKey") or raw.get("approvalSessionKey") or "",
         "approval": raw.get("approval") if isinstance(raw.get("approval"), dict) else {},
         "requiresCompletion": raw.get("requiresCompletion", raw.get("requires_completion", True)),
+        "turnOutcomePolicy": (
+            raw.get("turnOutcomePolicy")
+            or raw.get("turn_outcome_policy")
+            or (raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}).get("turnOutcomePolicy")
+            or {}
+        ),
+        "businessDeliveryKind": raw.get("businessDeliveryKind") or raw.get("business_delivery_kind"),
+        "businessDeliveryReason": raw.get("businessDeliveryReason") or raw.get("business_delivery_reason"),
+        "deliverySemanticsVersion": raw.get("deliverySemanticsVersion") or raw.get("delivery_semantics_version"),
+        "businessMutation": raw.get("businessMutation", raw.get("business_mutation")),
+        "revisionAuthorized": raw.get("revisionAuthorized", raw.get("revision_authorized")),
+        "nonAuthoritative": raw.get("nonAuthoritative", raw.get("non_authoritative")),
         "responseLocale": raw.get("responseLocale") or raw.get("response_locale") or "zh-CN",
         "sharedWorkspace": raw.get("sharedWorkspace") if isinstance(raw.get("sharedWorkspace"), dict) else {},
         "idempotencyKey": raw.get("idempotencyKey") or message_id,
@@ -1107,9 +1539,21 @@ def _is_context_only_envelope(envelope: dict[str, Any]) -> bool:
         return False
     if not _truthy(envelope.get("requiresCompletion"), True):
         return True
+    delivery_kind = _trim(
+        envelope.get("businessDeliveryKind")
+        or envelope.get("business_delivery_kind")
+        or envelope.get("deliveryKind")
+        or envelope.get("delivery_kind")
+    ).lower()
+    if delivery_kind in {"context", "peer_request", "notification", "monitor", "ambiguous"}:
+        return True
     metadata = envelope.get("metadata") if isinstance(envelope.get("metadata"), dict) else {}
     intent = _trim(envelope.get("intent") or metadata.get("intent") or envelope.get("type")).lower()
-    return intent in {"member_result_confirmed", "context", "notification"}
+    return intent in {
+        "member_result_confirmed", "context", "context_update", "notification",
+        "peer_request", "question", "reminder", "follow_up",
+        "assignment_status_check", "assignment_recovery_request", "leader_synthesis_reminder",
+    }
 
 
 def _is_formal_assignment(envelope: dict[str, Any]) -> bool:
@@ -1153,6 +1597,59 @@ async def _root_task_is_terminal(
         # Keep the Runtime compatible and rely on the control-plane terminal
         # barrier rather than turning a transient read failure into task loss.
         return False
+
+
+async def _read_root_workflow_state(
+    redis: "AsyncRedisClient",
+    settings: RedisTeamSettings,
+    root_task_id: str,
+) -> dict[str, Any]:
+    if not root_task_id:
+        return {}
+    try:
+        raw = await redis.command("GET", root_workflow_state_key(settings, root_task_id))
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        value = json.loads(raw) if isinstance(raw, str) and raw else raw
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
+async def _recent_target_assignment_dispatch(
+    redis: "AsyncRedisClient",
+    settings: RedisTeamSettings,
+    root_task_id: str,
+    target_member_id: str,
+) -> dict[str, Any]:
+    try:
+        entries = await redis.command("HGETALL", assignment_dispatch_state_key(settings, root_task_id))
+    except Exception:
+        return {}
+    if not isinstance(entries, list):
+        return {}
+    latest: dict[str, Any] = {}
+    latest_timestamp = 0.0
+    for index in range(0, len(entries) - 1, 2):
+        try:
+            value = json.loads(str(entries[index + 1]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(value, dict) or _trim(value.get("to")) != _trim(target_member_id):
+            continue
+        if _trim(value.get("rootTaskId")) != _trim(root_task_id):
+            continue
+        if _trim(value.get("status")).lower() not in {"dispatched", "waiting_dependencies"}:
+            continue
+        try:
+            created_at = datetime.fromisoformat(_trim(value.get("createdAt")).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+        if time.time() - created_at > 120 or created_at <= latest_timestamp:
+            continue
+        latest = value
+        latest_timestamp = created_at
+    return latest
 
 
 def _is_monitor_envelope(envelope: dict[str, Any]) -> bool:
@@ -1656,16 +2153,191 @@ async def _publish_event(settings: RedisTeamSettings, event: str, payload: dict[
         redis.close()
 
 
+def _normalized_send_intent(value: Any) -> str:
+    return re.sub(r"[\s-]+", "_", _trim(value).lower())
+
+
+def _send_intent_is_context(value: Any) -> bool:
+    return _normalized_send_intent(value) in {
+        "context", "context_update", "peer_request", "question", "reminder",
+        "follow_up", "status_check", "assignment_status_check", "notification", "ack",
+    }
+
+
+def _stable_hermes_assignment_id(settings: RedisTeamSettings, root_task_id: str, target: str, title: str, text: str) -> str:
+    digest = hashlib.sha256(
+        "\n".join([settings.team_id, settings.member_id, root_task_id, target, title, text]).encode("utf-8")
+    ).hexdigest()[:12]
+    return f"assignment-{_safe_name(target)}-{digest}"
+
+
+def _hermes_business_delivery_from_ledger(
+    settings: RedisTeamSettings,
+    message: dict[str, Any],
+    workflow_state: dict[str, Any],
+    *,
+    explicit_assignment_id: bool,
+    recent_target_dispatch: Optional[dict[str, Any]] = None,
+    target_status: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    intent = _normalized_send_intent(message.get("intent"))
+    if "leader" in _trim(message.get("to")).lower():
+        return {"kind": "context", "reason": "message_to_leader", "revision": 1, "authorized": False}
+    if _send_intent_is_context(intent):
+        return {"kind": "peer_request" if intent == "peer_request" else "context", "reason": "explicit_context_intent", "revision": 1, "authorized": False}
+    assignments_value = workflow_state.get("assignments")
+    assignments = list(assignments_value.values()) if isinstance(assignments_value, dict) else []
+    assignments = [entry for entry in assignments if isinstance(entry, dict)]
+    existing = assignments_value.get(message.get("assignmentId")) if isinstance(assignments_value, dict) else None
+    target_assignments = [
+        entry for entry in assignments
+        if _trim(entry.get("ownerMemberKey")) == _trim(message.get("to"))
+    ]
+    target_assignments.sort(
+        key=lambda entry: (int(entry.get("revision") or 1), _trim(entry.get("updatedAt"))),
+        reverse=True,
+    )
+    latest = target_assignments[0] if target_assignments else None
+    if isinstance(existing, dict):
+        revision = max(1, int(existing.get("revision") or 1))
+        assignment_id = _trim(existing.get("assignmentId") or existing.get("workId"))
+        owner = _trim(existing.get("ownerMemberKey"))
+        if owner and owner != _trim(message.get("to")):
+            return {"kind": "ambiguous", "reason": "assignment_owner_conflict", "revision": revision, "authorized": False}
+        status = _trim(existing.get("status")).lower()
+        if status in {"pending", "dispatched", "running"}:
+            return {"kind": "context", "reason": "existing_attempt_active", "assignmentId": assignment_id, "revision": revision, "authorized": False}
+        runtime_status = _trim((target_status or {}).get("runtimeStatus")).lower()
+        availability = _trim((target_status or {}).get("availability")).lower()
+        status_assignment = _trim((target_status or {}).get("currentAssignmentId") or (target_status or {}).get("assignmentId") or (target_status or {}).get("workId"))
+        status_revision = max(1, int((target_status or {}).get("currentRevision") or 1))
+        last_seen = _trim((target_status or {}).get("lastSeenAt"))
+        try:
+            last_seen_at = datetime.fromisoformat(last_seen.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            last_seen_at = 0.0
+        runtime_active = (
+            (runtime_status in {"running", "busy", "completion_pending", "recovering"} or availability == "busy")
+            and last_seen_at > 0
+            and time.time() - last_seen_at <= 120
+            and status_assignment == assignment_id
+            and status_revision == revision
+        )
+        if runtime_active:
+            return {"kind": "context", "reason": "runtime_attempt_still_active", "assignmentId": assignment_id, "revision": revision, "authorized": False}
+        if existing.get("nextRevisionAllowed") is True and int(existing.get("nextRevision") or 0) == revision + 1:
+            return {"kind": "assignment", "reason": "ledger_authorized_recovery", "assignmentId": assignment_id, "revision": revision + 1, "authorized": True}
+        return {"kind": "ambiguous", "reason": "terminal_attempt_follow_up", "assignmentId": assignment_id, "revision": revision, "authorized": False}
+    if not explicit_assignment_id and isinstance(latest, dict):
+        revision = max(1, int(latest.get("revision") or 1))
+        assignment_id = _trim(latest.get("assignmentId") or latest.get("workId"))
+        return {"kind": "ambiguous", "reason": "target_has_existing_assignment", "assignmentId": assignment_id, "revision": revision, "authorized": False}
+    if not explicit_assignment_id and isinstance(recent_target_dispatch, dict) and recent_target_dispatch:
+        return {
+            "kind": "ambiguous",
+            "reason": "target_has_recent_unprojected_assignment",
+            "assignmentId": _trim(recent_target_dispatch.get("assignmentId") or recent_target_dispatch.get("workId")),
+            "revision": max(1, int(recent_target_dispatch.get("revision") or 1)),
+            "authorized": False,
+        }
+    sender_is_leader = "leader" in settings.role.lower() or "leader" in settings.member_id.lower()
+    if not sender_is_leader and not explicit_assignment_id:
+        return {"kind": "peer_request", "reason": "member_message_without_assignment_contract", "revision": 1, "authorized": False}
+    return {"kind": "assignment", "reason": "new_assignment_contract", "assignmentId": message.get("assignmentId"), "revision": 1, "authorized": True}
+
+
 async def _tool_team_send(args: dict[str, Any], **_kwargs) -> str:
     settings = load_settings(None)
     if not settings.valid:
-        return json.dumps({"error": "Redis Team env is incomplete"}, ensure_ascii=False)
-    to = _trim(args.get("to"))
-    text = _trim(args.get("text") or args.get("prompt"))
-    if not to or not text:
-        return json.dumps({"error": "to and text are required"}, ensure_ascii=False)
+        return _team_tool_json_result(settings, "team_send", {"ok": False, "retryable": True, "error": "Redis Team env is incomplete"})
+    target_values = {
+        _trim(args.get(key))
+        for key in ("to", "recipient", "targetMemberId", "target_member_id")
+        if _trim(args.get(key))
+    }
+    text_values = {
+        _trim(args.get(key))
+        for key in ("text", "message", "prompt")
+        if _trim(args.get(key))
+    }
+    if len(target_values) > 1:
+        return _team_tool_json_result(settings, "team_send", {
+            "ok": False,
+            "retryable": True,
+            "clarificationRequired": True,
+            "error": "Conflicting Team recipient fields; confirm one current roster member.",
+            "candidates": sorted(target_values),
+        })
+    if len(text_values) > 1:
+        return _team_tool_json_result(settings, "team_send", {
+            "ok": False,
+            "retryable": True,
+            "clarificationRequired": True,
+            "error": "Conflicting Team message fields; provide one text value.",
+            "code": "conflicting_team_message",
+        })
+    raw_to = next(iter(target_values), "")
+    text = next(iter(text_values), "")
+    if not raw_to or not text:
+        return _team_tool_json_result(settings, "team_send", {
+            "ok": False,
+            "retryable": True,
+            "error": "A recipient and text are required",
+        })
+    target_resolution = _resolve_roster_target(settings, raw_to)
+    to = _trim(target_resolution.get("memberId"))
+    if not to:
+        active = _load_active_envelope(settings)
+        warning = {
+            "eventKind": "target_resolution_warning",
+            "failureDomain": "transport",
+            "failureKind": "target_resolution",
+            "retryable": True,
+            "nonAuthoritative": True,
+            "stateEffect": "none",
+            "rootTaskTerminal": False,
+            "clarificationRequired": True,
+            "status": "attention_required",
+            "runtimeStatus": "running",
+            "availability": "busy",
+            "taskId": _trim(active.get("taskId") or active.get("rootTaskId")),
+            "rootTaskId": _trim(active.get("rootTaskId") or active.get("taskId")),
+            "rootMessageId": _trim(active.get("rootMessageId") or active.get("messageId")),
+            "assignmentId": _trim(active.get("assignmentId") or active.get("workId")),
+            "workId": _trim(active.get("workId") or active.get("assignmentId")),
+            "revision": max(1, int(active.get("revision") or 1)),
+            "from": settings.member_id,
+            "to": raw_to,
+            "targetCandidates": target_resolution.get("candidates") or [],
+            "targetSuggestions": target_resolution.get("suggestions") or [],
+            "summary": "Redis Team recipient could not be uniquely resolved from the current roster.",
+        }
+        await _publish_event(settings, "message_warning", warning)
+        return _team_tool_json_result(settings, "team_send", {
+            "ok": False,
+            "sent": False,
+            "messageDelivered": False,
+            "retryable": True,
+            "nonAuthoritative": True,
+            "clarificationRequired": True,
+            "candidates": target_resolution.get("candidates") or [],
+            "suggestions": target_resolution.get("suggestions") or [],
+            "error": "Recipient is ambiguous or unknown; confirm one current roster member.",
+        })
     active = _load_active_envelope(settings)
     task_id = _trim(args.get("taskId")) or _trim(active.get("taskId") or active.get("rootTaskId"))
+    root_task_id = _trim(active.get("rootTaskId") or task_id)
+    intent = _normalized_send_intent(args.get("intent") or "send")
+    explicit_assignment_id = _trim(args.get("assignmentId") or args.get("workId"))
+    title = _trim(args.get("title")) or "Team Message"
+    trusted_recovery_assignment_id = ""
+    if (
+        not explicit_assignment_id
+        and _normalized_send_intent(active.get("intent")) == "assignment_recovery_request"
+        and _trim(active.get("from")).lower() == "clawmanager"
+    ):
+        trusted_recovery_assignment_id = _trim(active.get("assignmentId") or active.get("workId"))
+    assignment_id = explicit_assignment_id or trusted_recovery_assignment_id or _stable_hermes_assignment_id(settings, root_task_id, to, title, text)
     message = {
         "v": WIRE_SCHEMA_VERSION,
         "protocolVersion": PROTOCOL_VERSION,
@@ -1673,14 +2345,14 @@ async def _tool_team_send(args: dict[str, Any], **_kwargs) -> str:
         "teamId": settings.team_id,
         "from": settings.member_id,
         "to": to,
-        "intent": _trim(args.get("intent")) or "send",
+        "intent": intent or "send",
         "taskId": task_id,
-        "rootTaskId": _trim(active.get("rootTaskId") or task_id),
+        "rootTaskId": root_task_id,
         "rootMessageId": _trim(active.get("rootMessageId")),
-        "workId": _trim(args.get("workId")) or _trim(active.get("assignmentId") or active.get("workId")),
-        "assignmentId": _trim(args.get("assignmentId")) or _trim(active.get("assignmentId") or active.get("workId")),
+        "workId": assignment_id,
+        "assignmentId": assignment_id,
         "phaseId": _trim(args.get("phaseId")) or _trim(active.get("phaseId")),
-        "revision": int(args.get("revision") or active.get("revision") or 1),
+        "revision": 1,
         "required": _truthy(args.get("required"), True),
         "reviewRequired": _truthy(args.get("reviewRequired") or args.get("review_required"), False),
         "validationRequired": _truthy(args.get("validationRequired") or args.get("validation_required"), False),
@@ -1699,7 +2371,7 @@ async def _tool_team_send(args: dict[str, Any], **_kwargs) -> str:
             for value in (args.get("dependsOn") if isinstance(args.get("dependsOn"), list) else [])
             if _trim(value)
         ],
-        "title": _trim(args.get("title")) or "Team Message",
+        "title": title,
         "text": text,
         "contextRefs": args.get("contextRefs") if isinstance(args.get("contextRefs"), list) else [],
         "ttlSeconds": args.get("ttlSeconds") if isinstance(args.get("ttlSeconds"), int) else 3600,
@@ -1710,268 +2382,110 @@ async def _tool_team_send(args: dict[str, Any], **_kwargs) -> str:
     redis = AsyncRedisClient(settings.redis_url)
     try:
         await redis.connect()
-        redis_id = await xadd_json(redis, inbox_key(settings, to), message)
-        await xadd_json(
-            redis,
-            events_key(settings),
-            event_for(settings, "outbound", {"messageId": message["messageId"], "to": to}),
-        )
-    finally:
-        redis.close()
-    message["redisId"] = redis_id
-    return json.dumps({"ok": True, "sent": message}, ensure_ascii=False)
-
-
-def _substantive_final_text(value: Any) -> bool:
-    text = _trim(value)
-    if len(text) < 12:
-        return False
-    normalized = " ".join(text.lower().split())
-    if normalized.endswith("?") or normalized.endswith("？"):
-        return False
-    generic = {
-        "done",
-        "completed",
-        "task completed",
-        "redis team task processing completed",
-        "agent 回合已结束，正在等待显式完成回执。",
-    }
-    return normalized not in generic
-
-
-async def _propose_completion(
-    settings: RedisTeamSettings,
-    envelope: dict[str, Any],
-    *,
-    status: str,
-    summary: str,
-    result_markdown: str,
-    artifact_refs: Optional[list[str]] = None,
-    explicit: bool,
-    automatic_turn_result: bool = False,
-    review_verdict: str = "",
-    reviewed_assignment_id: str = "",
-    reviewed_revision: Optional[int] = None,
-    reviewed_artifact_refs: Optional[list[str]] = None,
-) -> dict[str, Any]:
-    if not settings.valid:
-        raise ValueError("Redis Team env is incomplete")
-    status = _trim(status).lower()
-    if status not in {"succeeded", "failed", "cancelled"}:
-        raise ValueError("completion status must be succeeded, failed or cancelled")
-    task_id = _trim(envelope.get("taskId") or envelope.get("rootTaskId"))
-    if not task_id:
-        raise ValueError("active task identity is unavailable")
-    result = write_task_result(
-        settings,
-        task_id,
-        envelope=envelope,
-        status=status,
-        summary=summary,
-        result_markdown=result_markdown,
-        artifact_refs=artifact_refs,
-    )
-    completion_id = _completion_id(settings, envelope)
-    attempt_id = f"attempt_{uuid.uuid4().hex}"
-    artifact_meta = artifact_metadata(settings, result["artifactRefs"])
-    reviewed_refs = validate_artifact_refs(settings, reviewed_artifact_refs)
-    reviewed_meta = artifact_metadata(settings, reviewed_refs)
-    result_content_hash = hashlib.sha256(
-        (result_markdown + "\n" + "\n".join(result["artifactRefs"])).encode("utf-8")
-    ).hexdigest()
-    completion = _task_event(
-        settings,
-        "completion_proposed",
-        envelope,
-        {
-            "completionId": completion_id,
-            "attemptId": attempt_id,
-            # Runtime-authored natural completion still uses the same strict
-            # completion envelope as the explicit tool. automaticTurnResult
-            # records how it was produced without weakening control-plane
-            # validation or falling back to prose heuristics.
-            "completionSource": COMPLETION_SOURCE,
-            "explicitCompletion": True,
-            "agentInvokedCompletionTool": explicit or None,
-            "automaticTurnResult": automatic_turn_result or None,
-            "assignmentResultOnly": True,
-            "rootTaskTerminal": False,
-            "status": status,
-            "availability": "idle" if status == "succeeded" else "blocked",
-            "runtimeStatus": "completion_pending",
-            "workflowFinal": False,
-            "finalAnswerReady": False,
-            "summary": summary,
-            "result": result_markdown,
-            "resultMarkdown": result_markdown,
-            "artifactRefs": result["artifactRefs"],
-            "artifactMetadata": artifact_meta,
-            "resultContentHash": result_content_hash,
-            "reviewVerdict": review_verdict or None,
-            "reviewedAssignmentId": reviewed_assignment_id or None,
-            "reviewedRevision": reviewed_revision,
-            "reviewedArtifactRefs": reviewed_refs,
-            "reviewedArtifactMetadata": reviewed_meta,
-            "visibleToChat": False,
-            "chatPolicy": "hidden",
-        },
-    )
-    redis = AsyncRedisClient(settings.redis_url)
-    try:
-        await redis.connect()
-        published = await _publish_once(
-            redis,
-            settings,
-            _completion_attempt_key(settings, completion_id, attempt_id),
-            completion,
-        )
-        acknowledgement = await _completion_ack(redis, settings, completion_id, attempt_id)
-    finally:
-        redis.close()
-    decision = _trim((acknowledgement or {}).get("decision")).lower() or "submitted"
-    runtime_status = "completion_pending"
-    availability = "busy"
-    if decision == "accepted":
-        runtime_status = status
-        availability = "idle" if status == "succeeded" else "blocked"
-    elif decision == "rejected":
-        runtime_status = "blocked"
-        availability = "blocked"
-    active = _load_active_envelope(settings)
-    if _trim(active.get("taskId") or active.get("rootTaskId")) == task_id:
-        active["completionDecision"] = decision
-        active["completionId"] = completion_id
-        if explicit:
-            active["explicitCompletionSubmitted"] = True
-        if decision == "accepted":
-            active["terminal"] = True
-            active["terminalStatus"] = status
-            active["completedAt"] = _now_iso()
-        elif decision == "rejected":
-            active["terminal"] = False
-            active["terminalStatus"] = ""
-        _persist_active_envelope(settings, active)
-    if decision in {"submitted", "deferred"}:
-        asyncio.create_task(
-            _observe_late_completion(
-                settings,
-                completion_id,
-                attempt_id,
-                task_id,
-                status,
-                summary,
-                result["artifactRefs"],
+        workflow_state = await _read_root_workflow_state(redis, settings, root_task_id)
+        recent_target_dispatch = {}
+        if not explicit_assignment_id and not trusted_recovery_assignment_id:
+            recent_target_dispatch = await _recent_target_assignment_dispatch(
+                redis, settings, root_task_id, to
             )
+        decision = _hermes_business_delivery_from_ledger(
+            settings,
+            message,
+            workflow_state,
+            explicit_assignment_id=bool(explicit_assignment_id or trusted_recovery_assignment_id),
+            recent_target_dispatch=recent_target_dispatch,
+            target_status=read_team_statuses(settings, to) or {},
         )
-    write_local_status(
-        settings,
-        {
-            "availability": availability,
-            "runtimeStatus": runtime_status,
-            "currentTaskId": task_id,
-            "currentAssignmentId": envelope.get("assignmentId") or envelope.get("workId"),
-            "progress": 100 if decision == "accepted" else 99,
-            "lastSummary": _trim((acknowledgement or {}).get("reason")) or summary,
-            "artifactRefs": result["artifactRefs"],
-        },
-    )
-    return {
-        "ok": True,
-        **result,
-        **published,
-        "completionId": completion_id,
-        "attemptId": attempt_id,
-        "decision": decision,
-        "acknowledgement": acknowledgement,
-    }
-
-
-async def _publish_event(settings: RedisTeamSettings, event: str, payload: dict[str, Any]) -> None:
-    if not settings.valid:
-        return
-    redis = AsyncRedisClient(settings.redis_url)
-    try:
-        await redis.connect()
-        await xadd_json(redis, events_key(settings), event_for(settings, event, payload))
-    finally:
-        redis.close()
-
-
-async def _tool_team_send(args: dict[str, Any], **_kwargs) -> str:
-    settings = load_settings(None)
-    if not settings.valid:
-        return json.dumps({"error": "Redis Team env is incomplete"}, ensure_ascii=False)
-    to = _trim(args.get("to"))
-    text = _trim(args.get("text") or args.get("prompt"))
-    if not to or not text:
-        return json.dumps({"error": "to and text are required"}, ensure_ascii=False)
-    active = _load_active_envelope(settings)
-    task_id = _trim(args.get("taskId")) or _trim(active.get("taskId") or active.get("rootTaskId"))
-    message = {
-        "v": WIRE_SCHEMA_VERSION,
-        "protocolVersion": PROTOCOL_VERSION,
-        "messageId": f"msg_{uuid.uuid4().hex}",
-        "teamId": settings.team_id,
-        "from": settings.member_id,
-        "to": to,
-        "intent": _trim(args.get("intent")) or "send",
-        "taskId": task_id,
-        "rootTaskId": _trim(active.get("rootTaskId") or task_id),
-        "rootMessageId": _trim(active.get("rootMessageId")),
-        "workId": _trim(args.get("workId")) or _trim(active.get("assignmentId") or active.get("workId")),
-        "assignmentId": _trim(args.get("assignmentId")) or _trim(active.get("assignmentId") or active.get("workId")),
-        "phaseId": _trim(args.get("phaseId")) or _trim(active.get("phaseId")),
-        "revision": int(args.get("revision") or active.get("revision") or 1),
-        "title": _trim(args.get("title")) or "Team Message",
-        "text": text,
-        "contextRefs": args.get("contextRefs") if isinstance(args.get("contextRefs"), list) else [],
-        "ttlSeconds": args.get("ttlSeconds") if isinstance(args.get("ttlSeconds"), int) else 3600,
-        "priority": _trim(args.get("priority")) or "normal",
-        "metadata": args.get("metadata") if isinstance(args.get("metadata"), dict) else {},
-        "createdAt": _now_iso(),
-    }
-    redis = AsyncRedisClient(settings.redis_url)
-    try:
-        await redis.connect()
+        if _trim(decision.get("assignmentId")):
+            message["assignmentId"] = _trim(decision.get("assignmentId"))
+            message["workId"] = message["assignmentId"]
+        business_delivery_kind = _trim(decision.get("kind")) or "ambiguous"
+        message.update({
+            "revision": max(1, int(decision.get("revision") or 1)),
+            "businessDeliveryKind": business_delivery_kind,
+            "businessDeliveryReason": decision.get("reason"),
+            "deliverySemanticsVersion": 1,
+            "decisionLedgerVersion": int(workflow_state.get("ledgerVersion") or 0),
+            "decisionPlanVersion": int(workflow_state.get("planVersion") or 0),
+            "businessMutation": business_delivery_kind == "assignment",
+            "requiresCompletion": business_delivery_kind == "assignment",
+            "revisionAuthorized": decision.get("authorized") is True,
+            "sourceTool": "team_send",
+            "agentIntent": _trim(args.get("intent")) or None,
+            "nonAuthoritative": business_delivery_kind != "assignment",
+        })
         redis_id = await xadd_json(redis, inbox_key(settings, to), message)
+        if business_delivery_kind == "assignment":
+            dispatch_state = json.dumps({
+                "assignmentId": message["assignmentId"],
+                "workId": message["workId"],
+                "revision": message["revision"],
+                "rootTaskId": root_task_id,
+                "to": to,
+                "messageId": message["messageId"],
+                "status": "dispatched",
+                "createdAt": message["createdAt"],
+            }, ensure_ascii=False)
+            dispatch_key = assignment_dispatch_state_key(settings, root_task_id)
+            await redis.command("HSET", dispatch_key, message["assignmentId"], dispatch_state)
+            await redis.command("EXPIRE", dispatch_key, 604800)
         await xadd_json(
             redis,
             events_key(settings),
-            event_for(settings, "outbound", {"messageId": message["messageId"], "to": to}),
+            event_for(settings, "peer_request" if business_delivery_kind == "peer_request" else "outbound", {
+                **message,
+                "inReplyTo": _trim(active.get("messageId")),
+            }),
         )
     finally:
         redis.close()
     message["redisId"] = redis_id
-    return json.dumps({"ok": True, "sent": message}, ensure_ascii=False)
+    response: dict[str, Any] = {"ok": True, "sent": message}
+    if message.get("businessDeliveryKind") == "ambiguous":
+        response.update({
+            "deliveryState": "delivered_as_context",
+            "clarificationRequired": True,
+            "leaderGuidance": (
+                "The message was delivered without creating a new Work Item because the current ledger does not "
+                "uniquely identify a new business assignment. If this is a real next stage, resend it with a distinct "
+                "assignmentId; if it is rework, first confirm the exact failed or stale attempt."
+            ),
+        })
+    return _team_tool_json_result(settings, "team_send", response)
 
 
 async def _tool_team_status(args: dict[str, Any], **_kwargs) -> str:
     settings = load_settings(None)
     if not settings.enabled:
-        return json.dumps({"error": "Redis Team is disabled"}, ensure_ascii=False)
-    return json.dumps(
+        return _team_tool_json_result(settings, "team_status", {"ok": False, "retryable": True, "error": "Redis Team is disabled"})
+    return _team_tool_json_result(
+        settings,
+        "team_status",
         {"ok": True, "status": read_team_statuses(settings, _trim(args.get("memberId")))},
-        ensure_ascii=False,
     )
 
 
 async def _tool_team_update_progress(args: dict[str, Any], **_kwargs) -> str:
     settings = load_settings(None)
     if not settings.enabled:
-        return json.dumps({"error": "Redis Team is disabled"}, ensure_ascii=False)
+        return _team_tool_json_result(settings, "team_update_progress", {"ok": False, "retryable": True, "error": "Redis Team is disabled"})
     active = _load_active_envelope(settings)
     reported_task_id = _trim(args.get("taskId"))
     active_task_id = _trim(active.get("rootTaskId") or active.get("taskId"))
     task_id = active_task_id or reported_task_id
-    status_text = _trim(args.get("status"))
+    status_text = _trim(args.get("status")).lower()
     summary = _trim(args.get("summary"))
     if not task_id or not status_text:
-        return json.dumps({"error": "taskId and status are required"}, ensure_ascii=False)
+        return _team_tool_json_result(settings, "team_update_progress", {"ok": False, "retryable": True, "error": "taskId and status are required"})
     progress = args.get("progress")
+    waiting = status_text in {"blocked", "waiting", "dependency_wait", "completion_pending"}
+    idle = status_text == "idle"
+    local_runtime_status = "waiting" if waiting else "idle" if idle else "running"
     status = write_local_status(
         settings,
         {
-            "availability": "idle" if status_text == "idle" else status_text,
+            "availability": "idle" if idle else "busy",
+            "runtimeStatus": local_runtime_status,
             "currentTaskId": task_id,
             "progress": progress if isinstance(progress, (int, float)) else None,
             "lastSummary": summary or status_text,
@@ -1988,16 +2502,19 @@ async def _tool_team_update_progress(args: dict[str, Any], **_kwargs) -> str:
         "phaseId": active.get("phaseId"),
         "revision": active.get("revision") or 1,
         "eventKind": _trim(args.get("eventKind")) or "worker_progress",
+        "status": "waiting" if waiting else status_text,
+        "runtimeStatus": local_runtime_status,
+        "availability": "idle" if idle else "busy",
         "reportedTaskId": reported_task_id if reported_task_id and reported_task_id != task_id else None,
     }
     await _publish_event(settings, "task_progress", progress_payload)
-    return json.dumps({"ok": True, "status": status}, ensure_ascii=False)
+    return _team_tool_json_result(settings, "team_update_progress", {"ok": True, "status": status})
 
 
 async def _tool_team_complete_task(args: dict[str, Any], **_kwargs) -> str:
     settings = load_settings(None)
     if not settings.enabled:
-        return json.dumps({"error": "Redis Team is disabled"}, ensure_ascii=False)
+        return _team_tool_json_result(settings, "team_complete_task", {"ok": False, "retryable": True, "error": "Redis Team is disabled"})
     active = _load_active_envelope(settings)
     reported_task_id = _trim(args.get("taskId"))
     active_task_id = _trim(active.get("rootTaskId") or active.get("taskId"))
@@ -2005,12 +2522,9 @@ async def _tool_team_complete_task(args: dict[str, Any], **_kwargs) -> str:
     status_text = _trim(args.get("status")).lower()
     summary = _trim(args.get("summary"))
     if not task_id or not status_text or not summary:
-        return json.dumps({"error": "taskId, status and summary are required"}, ensure_ascii=False)
+        return _team_tool_json_result(settings, "team_complete_task", {"ok": False, "retryable": True, "error": "taskId, status and summary are required"})
     if status_text not in {"succeeded", "failed", "cancelled"}:
-        return json.dumps(
-            {"error": "status must be succeeded, failed or cancelled"},
-            ensure_ascii=False,
-        )
+        return _team_tool_json_result(settings, "team_complete_task", {"ok": False, "retryable": True, "error": "status must be succeeded, failed or cancelled"})
     if reported_task_id and reported_task_id != task_id:
         active["reportedTaskId"] = reported_task_id
     active["taskId"] = active.get("taskId") or task_id
@@ -2031,8 +2545,10 @@ async def _tool_team_complete_task(args: dict[str, Any], **_kwargs) -> str:
             reviewed_artifact_refs=args.get("reviewedArtifactRefs") if isinstance(args.get("reviewedArtifactRefs"), list) else [],
         )
     except Exception as exc:
-        return json.dumps({"error": str(exc)}, ensure_ascii=False)
-    return json.dumps(result, ensure_ascii=False)
+        return _team_tool_json_result(settings, "team_complete_task", {"ok": False, "retryable": True, "error": str(exc)})
+    normalized_result = dict(result) if isinstance(result, dict) else {"ok": True, "result": result}
+    normalized_result.setdefault("ok", True)
+    return _team_tool_json_result(settings, "team_complete_task", normalized_result)
 
 
 class RedisTeamAdapter(BasePlatformAdapter):
@@ -2821,10 +3337,12 @@ class RedisTeamAdapter(BasePlatformAdapter):
         envelope = event.raw_message if isinstance(event.raw_message, dict) else _load_active_envelope(self.settings)
         task_id = str(envelope.get("taskId") or event.source.chat_id)
         message_id = str(envelope.get("messageId") or event.message_id or "")
+        turn_observation = _finish_turn_observation(self.settings, message_id)
         if outcome == ProcessingOutcome.SUCCESS:
             active = _load_active_envelope(self.settings)
             response = _trim(self._turn_responses.get(message_id) or active.get("lastAssistantResponse"))
             if not _truthy(envelope.get("requiresCompletion"), True):
+                observation = _observe_team_turn_outcome(envelope, active, turn_observation)
                 if self._redis:
                     await xadd_json(
                         self._redis,
@@ -2835,10 +3353,31 @@ class RedisTeamAdapter(BasePlatformAdapter):
                             envelope,
                             {
                                 "messageId": message_id,
+                                "eventKind": "turn_finished_without_completion",
                                 "summary": "Non-terminal Team turn finished",
+                                "activeTurnFinished": True,
+                                "nonAuthoritative": True,
+                                "rootTaskTerminal": False,
                                 "stateEffect": "none",
                                 "visibleToChat": False,
                                 "chatPolicy": "hidden",
+                                "turnObservationOutcome": observation["outcome"],
+                                "contextOnlyTurn": True,
+                                "observationActionExpected": observation["actionExpected"],
+                                "immediateRecoveryEligible": observation["immediateRecoveryEligible"],
+                                "observationConflict": observation["evidenceConflict"] or None,
+                                "observationConflicts": observation["evidenceConflicts"] or None,
+                                "observationPolicyReason": observation["policyReason"],
+                                "hadOutboundAssignment": observation["hadOutboundAssignment"],
+                                "downstreamAssignmentStarted": observation["downstreamAssignmentStarted"],
+                                "outboundDeliveryKind": observation["outboundDeliveryKind"],
+                                "outboundTarget": observation["outboundTarget"],
+                                "lastToolFailed": observation["lastTool"].get("failed") is True or None,
+                                "lastToolName": _trim(observation["lastTool"].get("toolName")) or None,
+                                "lastToolError": _trim(observation["lastTool"].get("error")) or None,
+                                "lastToolCode": _trim(observation["lastTool"].get("code")) or None,
+                                "targetCandidates": observation["lastTool"].get("candidates") or None,
+                                "retryable": observation["outcome"] in {"retryable_tool_gap", "completion_receipt_gap"} or None,
                             },
                         ),
                     )
@@ -2901,6 +3440,7 @@ class RedisTeamAdapter(BasePlatformAdapter):
                     },
                 )
             else:
+                observation = _observe_team_turn_outcome(envelope, active, turn_observation)
                 write_local_status(
                     self.settings,
                     {
@@ -2920,6 +3460,7 @@ class RedisTeamAdapter(BasePlatformAdapter):
                             envelope,
                             {
                                 "messageId": message_id,
+                                "eventKind": "turn_finished_without_completion",
                                 "summary": "Turn finished without an explicit completion receipt",
                                 "status": "running",
                                 "availability": "busy",
@@ -2928,6 +3469,22 @@ class RedisTeamAdapter(BasePlatformAdapter):
                                 "nonAuthoritative": True,
                                 "rootTaskTerminal": False,
                                 "activeTurnFinished": True,
+                                "turnObservationOutcome": observation["outcome"],
+                                "observationActionExpected": observation["actionExpected"],
+                                "immediateRecoveryEligible": observation["immediateRecoveryEligible"],
+                                "observationConflict": observation["evidenceConflict"] or None,
+                                "observationConflicts": observation["evidenceConflicts"] or None,
+                                "observationPolicyReason": observation["policyReason"],
+                                "hadOutboundAssignment": observation["hadOutboundAssignment"],
+                                "downstreamAssignmentStarted": observation["downstreamAssignmentStarted"],
+                                "outboundDeliveryKind": observation["outboundDeliveryKind"],
+                                "outboundTarget": observation["outboundTarget"],
+                                "lastToolFailed": observation["lastTool"].get("failed") is True or None,
+                                "lastToolName": _trim(observation["lastTool"].get("toolName")) or None,
+                                "lastToolError": _trim(observation["lastTool"].get("error")) or None,
+                                "lastToolCode": _trim(observation["lastTool"].get("code")) or None,
+                                "targetCandidates": observation["lastTool"].get("candidates") or None,
+                                "retryable": observation["outcome"] in {"retryable_tool_gap", "completion_receipt_gap"} or None,
                                 "resultMarkdown": response or None,
                                 "visibleToChat": False,
                                 "chatPolicy": "hidden",
@@ -3011,16 +3568,48 @@ class RedisTeamAdapter(BasePlatformAdapter):
                         continue
                     root_task_id, assignment_id = identity
                     active = tracked.get("envelope") or {}
+                    observation = _read_json(_turn_observation_path(self.settings)) or {}
+                    observation_matches = bool(
+                        isinstance(observation, dict)
+                        and _trim(observation.get("rootTaskId")) == root_task_id
+                        and _trim(observation.get("assignmentId")) == assignment_id
+                    )
+                    turn_state = _trim(observation.get("turnState")) if observation_matches else "finished"
+                    if turn_state not in {"starting", "running", "waiting_tool"}:
+                        turn_state = "finished"
                     activity = {
+                        "schemaVersion": 2,
                         "teamId": self.settings.team_id,
                         "memberId": self.settings.member_id,
                         "rootTaskId": root_task_id,
                         "assignmentId": assignment_id,
                         "workId": assignment_id,
                         "revision": max(1, int(active.get("revision") or 1)),
-                        "state": "running",
+                        "state": "running" if observation_matches else "awaiting_completion_receipt",
+                        "turnId": _trim(observation.get("turnId")) if observation_matches else "",
+                        "turnState": turn_state,
+                        "startedAt": _trim(observation.get("startedAt")) if observation_matches else "",
                         "observedAt": _now_iso(),
                         "runtime": "hermes",
+                        "executionAlive": observation_matches and turn_state != "finished",
+                        "lastActivityKind": _trim(observation.get("lastActivityKind")) if observation_matches else "turn_finished",
+                        "pendingToolName": _trim(observation.get("pendingToolName")) if observation_matches else "",
+                        "lastToolName": _trim(observation.get("lastToolName")) if observation_matches else "",
+                        "lastToolFailed": observation.get("lastToolFailed") is True if observation_matches else False,
+                        "lastToolAt": _trim(observation.get("lastToolAt")) if observation_matches else "",
+                        "lastSessionEventAt": (
+                            _trim(observation.get("lastApiActivityAt") or observation.get("observedAt"))
+                            if observation_matches
+                            else ""
+                        ),
+                        "sessionCursor": (
+                            f"{_trim(observation.get('turnId'))}:{int(observation.get('apiCallCount') or 0)}:"
+                            f"{int(observation.get('toolCallCount') or 0)}"
+                            if observation_matches
+                            else ""
+                        ),
+                        "apiCallCount": int(observation.get("apiCallCount") or 0) if observation_matches else 0,
+                        "toolCallCount": int(observation.get("toolCallCount") or 0) if observation_matches else 0,
                     }
                     await redis.command(
                         "SET",
@@ -3502,6 +4091,7 @@ class RedisTeamAdapter(BasePlatformAdapter):
             "source_message_id": envelope.get("messageId"),
             "context_only": context_only,
         }
+        _begin_turn_observation(self.settings, envelope, context_only=context_only)
         if not context_only:
             if self._redis and await _root_task_is_terminal(self._redis, self.settings, envelope):
                 identity = _assignment_identity(envelope)
@@ -3670,9 +4260,23 @@ async def _standalone_send(
 
 
 def register(ctx) -> None:
+    # These hooks are observational and fail-open. They let the control-plane
+    # Monitor distinguish an active Hermes API/tool loop from a finished turn
+    # without making Runtime telemetry authoritative business state.
+    ctx.register_hook("pre_api_request", _hook_pre_api_request)
+    ctx.register_hook("post_api_request", _hook_post_api_request)
+    ctx.register_hook("pre_tool_call", _hook_pre_tool_call)
+    ctx.register_hook("post_tool_call", _hook_post_tool_call)
     artifact_path_properties = {
         "scope": {"type": "string", "enum": ["member", "team"]},
-        "path": {"type": "string", "description": "Current-Team path; traversal and symlinks are rejected"},
+        "path": {
+            "type": "string",
+            "description": (
+                "For member writes prefer an assignment-relative path such as report.md. "
+                "An exact canonical /team/... path returned by these tools is also accepted; "
+                "do not prepend either form to the other. Traversal and symlinks are rejected."
+            ),
+        },
         "rootTaskId": {"type": "string"},
         "assignmentId": {"type": "string"},
     }
@@ -3681,7 +4285,11 @@ def register(ctx) -> None:
         toolset="redis_team",
         schema={
             "name": "team_artifact_write",
-            "description": "Atomically write a UTF-8 artifact inside the current Team workspace.",
+            "description": (
+                "Atomically write a UTF-8 artifact inside the current Team workspace. "
+                "The success result includes the canonical path, byte count, and sha256; "
+                "do not read the file back only to confirm the write."
+            ),
             "parameters": {
                 "type": "object",
                 "additionalProperties": False,
@@ -3705,7 +4313,11 @@ def register(ctx) -> None:
                 "type": "object",
                 "additionalProperties": False,
                 "required": ["path"],
-                "properties": {**artifact_path_properties, "maxBytes": {"type": "integer", "minimum": 1, "maximum": MAX_ARTIFACT_BYTES}},
+                "properties": {
+                    **artifact_path_properties,
+                    "offset": {"type": "integer", "minimum": 0},
+                    "maxBytes": {"type": "integer", "minimum": 1, "maximum": MAX_ARTIFACT_BYTES},
+                },
             },
         },
         handler=_tool_team_artifact_read,
@@ -3780,10 +4392,19 @@ def register(ctx) -> None:
             "parameters": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["to", "text"],
+                "anyOf": [
+                    {"required": ["text"]},
+                    {"required": ["message"]},
+                    {"required": ["prompt"]},
+                ],
                 "properties": {
                     "to": {"type": "string", "description": "Recipient member ID, or broadcast if supported"},
+                    "recipient": {"type": "string", "description": "Compatibility alias for to"},
+                    "targetMemberId": {"type": "string", "description": "Compatibility alias for to"},
+                    "target_member_id": {"type": "string", "description": "Compatibility alias for to"},
                     "text": {"type": "string", "description": "Task or message text"},
+                    "message": {"type": "string", "description": "Compatibility alias for text"},
+                    "prompt": {"type": "string", "description": "Compatibility alias for text"},
                     "intent": {"type": "string"},
                     "taskId": {"type": "string"},
                     "rootTaskId": {"type": "string"},
@@ -3917,14 +4538,20 @@ def register(ctx) -> None:
             "message as delegated Worker work. Read the task context and "
             "/team/team.json when available. Prefer team_artifact_write/read/list/mkdir "
             "for shared files and use team_artifact_preview before opening a Team file "
-            "in Browser; never use file:// or start a temporary server. Validation is "
+            "in Browser; never use file:// or start a temporary server. For research or "
+            "data collection, discover the authoritative page/API once, then batch independent "
+            "records in one execute_code call instead of alternating one model turn per item. "
+            "Reuse endpoints already verified in the current task, and treat a successful "
+            "team_artifact_write receipt as proof of the write instead of reading it back. "
+            "This is efficiency guidance, never a reason to skip required evidence or delivery. Validation is "
             "assignment-specific: production-only assignments produce and hand off artifacts "
             "without tests, while assignments explicitly designated by the Leader as test, "
             "review, or evidence work validate normally regardless of the member role. "
             "These instructions never block delivery and tools remain available for required "
             "implementation or validation work. When work is ready, call team_complete_task "
-            "once with the actual result; automatic final-turn submission is only a compatibility "
-            "fallback. Missing optional Team metadata is not a reason to stop. Never write "
+            "once with the actual result. A normal assistant reply is non-terminal; if the explicit "
+            "receipt is missed, end the turn normally and let ClawManager Monitor issue a separate "
+            "bounded reminder. Missing optional Team metadata is not a reason to stop. Never write "
             "Team tokens, API keys, or Redis credentials into Team files or logs."
         ),
     )

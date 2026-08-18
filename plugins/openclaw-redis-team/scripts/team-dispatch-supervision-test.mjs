@@ -51,6 +51,7 @@ try {
       { memberId: "leader", role: "leader", isLeader: true },
       { memberId: "developer", role: "developer" },
       { memberId: "reviewer", role: "reviewer" },
+      { memberId: "researcher", role: "researcher" },
     ],
   }), "utf8");
   await redis.connect();
@@ -58,6 +59,7 @@ try {
     "DEL",
     `${prefix}:inbox:developer`,
     `${prefix}:inbox:reviewer`,
+    `${prefix}:inbox:researcher`,
     `${prefix}:events`,
     `${prefix}:root:${rootTaskId}:state`,
     `${prefix}:root:${rootTaskId}:assignment-dispatch`,
@@ -81,6 +83,23 @@ try {
   };
 
   await runtime.withActiveEnvelope(envelope, async () => {
+    const normalizedMissingIdentity = await runtime.send({
+      to: "researcher",
+      text: "Collect the primary source evidence.",
+      intent: "assignment",
+    });
+    assert.equal(normalizedMissingIdentity.businessDeliveryKind, "assignment");
+    assert.equal(normalizedMissingIdentity.revision, 1);
+    const racingMissingIdentity = await runtime.send({
+      to: "researcher",
+      text: "Also include a concise risk summary.",
+      intent: "send",
+    });
+    assert.equal(racingMissingIdentity.businessDeliveryKind, "ambiguous");
+    assert.equal(racingMissingIdentity.sent, true);
+    assert.equal(racingMissingIdentity.businessDeliveryReason, "target_has_recent_unprojected_assignment");
+    assert.equal(Number(await redis.command("XLEN", `${prefix}:inbox:researcher`)), 2, "the follow-up remains visible without creating a second business contract");
+
     const developer = await runtime.send({
       to: "developer",
       text: "Implement the page.",
@@ -190,6 +209,123 @@ try {
     assert.equal(Number(await redis.command("XLEN", `${prefix}:inbox:reviewer`)), 3, "unknown dependency identity must fail open instead of freezing mixed versions");
 		assert.equal(unknownDependency.deferred, false);
 		assert.equal(unknownDependency.dependencyAdvisory.state, "unknown_advisory");
+
+    await redis.command("SET", pluginModule.rootWorkflowStateKey(cfg, rootTaskId), JSON.stringify({
+      status: "running",
+      terminal: false,
+      assignmentLedgerComplete: true,
+      snapshotSchemaVersion: 2,
+      ledgerVersion: 7,
+      assignments: {
+        "dev-page": {
+          assignmentId: "dev-page",
+          ownerMemberKey: "developer",
+          revision: 1,
+          status: "succeeded",
+          nextRevisionAllowed: false,
+          nextRevision: 2,
+          updatedAt: new Date().toISOString(),
+        },
+        "review-page": {
+          assignmentId: "review-page",
+          ownerMemberKey: "reviewer",
+          revision: 1,
+          status: "succeeded",
+          nextRevisionAllowed: false,
+          nextRevision: 2,
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    }));
+
+    const completedFollowUp = await runtime.send({
+      to: "developer",
+      text: "Please clarify one implementation detail.",
+      intent: "assignment",
+      assignmentId: "dev-page",
+      revision: 99,
+    });
+    assert.equal(completedFollowUp.businessDeliveryKind, "ambiguous");
+    assert.equal(completedFollowUp.revision, 1, "Agent-authored revision numbers cannot create a successor");
+    assert.equal(completedFollowUp.requiresCompletion, false);
+
+    const nextStageSameMember = await runtime.send({
+      to: "developer",
+      text: "Implement the independent export stage.",
+      intent: "assignment",
+      assignmentId: "dev-export",
+      revision: 8,
+    });
+    assert.equal(nextStageSameMember.businessDeliveryKind, "assignment");
+    assert.equal(nextStageSameMember.assignmentId, "dev-export");
+    assert.equal(nextStageSameMember.revision, 1, "a distinct multi-stage assignment starts at revision 1");
+
+    const ambiguousSameTarget = await runtime.send({
+      to: "reviewer",
+      text: "Take another look and answer a question.",
+      intent: "send",
+    });
+    assert.equal(ambiguousSameTarget.businessDeliveryKind, "ambiguous");
+    assert.equal(ambiguousSameTarget.sent, true, "uncertain traffic is still delivered to preserve flow");
+    assert.equal(ambiguousSameTarget.clarificationRequired, true);
+
+    await redis.command("SET", pluginModule.rootWorkflowStateKey(cfg, rootTaskId), JSON.stringify({
+      status: "running",
+      terminal: false,
+      assignmentLedgerComplete: true,
+      snapshotSchemaVersion: 2,
+      ledgerVersion: 8,
+      assignments: {
+        "dev-page": {
+          assignmentId: "dev-page",
+          ownerMemberKey: "developer",
+          revision: 1,
+          status: "failed",
+          nextRevisionAllowed: true,
+          nextRevision: 2,
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    }));
+		await fs.mkdir(path.join(shared, "status"), { recursive: true });
+		await fs.writeFile(path.join(shared, "status", "developer.json"), JSON.stringify({
+			memberId: "developer",
+			runtimeStatus: "awaiting_completion_receipt",
+			availability: "busy",
+			lastSeenAt: new Date().toISOString(),
+			currentTaskId: rootTaskId,
+			currentAssignmentId: "dev-page",
+			currentRevision: 1,
+		}), "utf8");
+		const activeAttemptRecovery = await runtime.send({
+			to: "developer",
+			text: "The transport receipt conflicted with your live attempt; continue the same work.",
+			intent: "send",
+			assignmentId: "dev-page",
+		});
+		assert.equal(activeAttemptRecovery.businessDeliveryKind, "context");
+		assert.equal(activeAttemptRecovery.businessDeliveryReason, "runtime_attempt_still_active");
+		assert.equal(activeAttemptRecovery.revision, 1, "a live r1 receives a recovery reminder instead of an invented r2");
+		await fs.writeFile(path.join(shared, "status", "developer.json"), JSON.stringify({
+			memberId: "developer",
+			runtimeStatus: "failed",
+			availability: "blocked",
+			lastSeenAt: new Date(Date.now() - 10 * 60_000).toISOString(),
+			currentTaskId: rootTaskId,
+			currentAssignmentId: "dev-page",
+			currentRevision: 1,
+		}), "utf8");
+    const recovery = await runtime.send({
+      to: "developer",
+      text: "Fix the accepted failure and redeliver.",
+      intent: "send",
+      assignmentId: "dev-page",
+      revision: 77,
+    });
+    assert.equal(recovery.businessDeliveryKind, "assignment");
+    assert.equal(recovery.businessDeliveryReason, "ledger_authorized_recovery");
+    assert.equal(recovery.revision, 2);
+    assert.equal(recovery.revisionAuthorized, true);
   }, cfg);
 
   console.log("Redis Team dependency supervision regression: OK");

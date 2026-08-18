@@ -1,6 +1,8 @@
 package openclaw
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,6 +22,7 @@ const openClawTrustedProxyRequiredHeader = "x-forwarded-proto"
 const openClawTrustedProxyDefaultPassword = "9fb3edf4bf38bb834227d41fe9cc1196"
 const openClawAutoProviderName = "auto"
 const openClawRedisTeamPluginID = "redis-team"
+const openClawRedisTeamPluginPackage = "@clawmanager/openclaw-redis-team"
 const openClawRedisTeamPluginDirEnv = "CLAWMANAGER_OPENCLAW_REDIS_TEAM_PLUGIN_DIR"
 const openClawBrowserExecutablePath = "/usr/bin/chromium"
 const openClawBrowserProxyEnv = "CLAWMANAGER_BROWSER_PROXY_URL"
@@ -120,7 +123,13 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 	} else {
 		auth["mode"] = "trusted-proxy"
 		delete(auth, "token")
-		if strings.TrimSpace(configStringValue(auth["password"])) == "" {
+		if managedPassword, managed := managedOpenClawGatewayPassword(req); managed {
+			// ClawManager-managed Lite instances use the same per-instance
+			// credential for the Gateway process and its local Browser client.
+			// Reconcile persisted legacy values here so a recreated instance
+			// cannot start the two sides with different passwords.
+			auth["password"] = managedPassword
+		} else if strings.TrimSpace(configStringValue(auth["password"])) == "" {
 			auth["password"] = openClawTrustedProxyDefaultPassword
 		}
 		trustedProxy := ensureObject(auth, "trustedProxy")
@@ -195,6 +204,12 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 		return fmt.Errorf("stat openclaw cron dir: %w", err)
 	}
 	return nil
+}
+
+func managedOpenClawGatewayPassword(req gateway.CreateGatewayRequest) (string, bool) {
+	value, ok := requestEnvValue(req, "CLAWMANAGER_INSTANCE_TOKEN")
+	value = strings.TrimSpace(value)
+	return value, ok && value != ""
 }
 
 // configureManagedOpenClawBrowser supplies the safe Lite runtime defaults that
@@ -551,17 +566,34 @@ func seedOpenClawRedisTeamPlugin(req gateway.CreateGatewayRequest, workspacePath
 	if !ok {
 		return fmt.Errorf("redis-team plugin source not found; checked %s and default OpenClaw extension locations", openClawRedisTeamPluginDirEnv)
 	}
+	if err := validateOpenClawRedisTeamPlugin(source, true); err != nil {
+		return fmt.Errorf("invalid managed redis-team plugin source: %w", err)
+	}
 	extensionsDir := filepath.Join(workspacePath, "home", ".openclaw", "extensions")
 	target := filepath.Join(extensionsDir, openClawRedisTeamPluginID)
-	if _, err := os.Stat(filepath.Join(target, "openclaw.plugin.json")); err == nil {
-		if err := chownTree(target, req.UID, req.GID); err != nil {
-			return fmt.Errorf("chown redis-team plugin: %w", err)
+	targetExists := false
+	if _, err := os.Stat(target); err == nil {
+		targetExists = true
+		if err := validateOpenClawRedisTeamPlugin(target, false); err != nil {
+			// This path may contain a user-managed extension.  Never overwrite an
+			// unrecognized tree merely because it is named redis-team.
+			log.Printf("warning: preserving unrecognized redis-team extension at %s: %v", target, err)
+			return nil
 		}
-		return nil
+		if sameOpenClawRedisTeamPlugin(source, target) {
+			return chownTree(target, req.UID, req.GID)
+		}
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("stat redis-team plugin target: %w", err)
 	}
-	if err := copyDir(source, target); err != nil {
+	if err := replaceOpenClawRedisTeamPlugin(source, target, extensionsDir); err != nil {
+		if targetExists {
+			log.Printf("warning: keeping previous redis-team plugin after managed update failed: %v", err)
+			if err := chownTree(target, req.UID, req.GID); err != nil {
+				return fmt.Errorf("chown redis-team plugin: %w", err)
+			}
+			return nil
+		}
 		return fmt.Errorf("seed redis-team plugin: %w", err)
 	}
 	if err := chownTree(extensionsDir, req.UID, req.GID); err != nil {
@@ -576,7 +608,6 @@ func findOpenClawRedisTeamPluginSource() (string, bool, error) {
 		candidates = append(candidates, value)
 	}
 	candidates = append(candidates,
-		"/config/.openclaw/extensions/redis-team",
 		"/defaults/.openclaw/extensions/redis-team",
 	)
 	for _, candidate := range candidates {
@@ -586,10 +617,6 @@ func findOpenClawRedisTeamPluginSource() (string, bool, error) {
 			if !info.IsDir() {
 				return "", false, fmt.Errorf("redis-team plugin source is not a directory: %s", clean)
 			}
-			manifest := filepath.Join(clean, "openclaw.plugin.json")
-			if _, err := os.Stat(manifest); err != nil {
-				return "", false, fmt.Errorf("redis-team plugin source missing manifest %s: %w", manifest, err)
-			}
 			return clean, true, nil
 		}
 		if os.IsNotExist(err) {
@@ -598,6 +625,127 @@ func findOpenClawRedisTeamPluginSource() (string, bool, error) {
 		return "", false, fmt.Errorf("stat redis-team plugin source %s: %w", clean, err)
 	}
 	return "", false, nil
+}
+
+func validateOpenClawRedisTeamPlugin(root string, requireCurrentPackage bool) error {
+	packageData, err := os.ReadFile(filepath.Join(root, "package.json"))
+	if err != nil {
+		return fmt.Errorf("read package.json: %w", err)
+	}
+	var pkg struct {
+		Name    string `json:"name"`
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(packageData, &pkg); err != nil {
+		return fmt.Errorf("parse package.json: %w", err)
+	}
+	if pkg.Name != openClawRedisTeamPluginPackage {
+		if requireCurrentPackage || pkg.Name != "@clawmanager/redis-team" {
+			return fmt.Errorf("unexpected package name %q", pkg.Name)
+		}
+	}
+	if strings.TrimSpace(pkg.Version) == "" {
+		return fmt.Errorf("package version is empty")
+	}
+	manifestData, err := os.ReadFile(filepath.Join(root, "openclaw.plugin.json"))
+	if err != nil {
+		return fmt.Errorf("read manifest: %w", err)
+	}
+	var manifest struct {
+		ID       string   `json:"id"`
+		Channels []string `json:"channels"`
+	}
+	if err := json.Unmarshal(manifestData, &manifest); err != nil {
+		return fmt.Errorf("parse manifest: %w", err)
+	}
+	if manifest.ID != openClawRedisTeamPluginID {
+		return fmt.Errorf("unexpected manifest id %q", manifest.ID)
+	}
+	channelOK := false
+	for _, channel := range manifest.Channels {
+		if channel == openClawRedisTeamPluginID {
+			channelOK = true
+			break
+		}
+	}
+	if !channelOK {
+		return fmt.Errorf("manifest does not declare redis-team channel")
+	}
+	entry, err := os.Stat(filepath.Join(root, "dist", "index.js"))
+	if err != nil {
+		return fmt.Errorf("stat dist/index.js: %w", err)
+	}
+	if !entry.Mode().IsRegular() || entry.Size() == 0 {
+		return fmt.Errorf("dist/index.js is missing or empty")
+	}
+	return nil
+}
+
+func sameOpenClawRedisTeamPlugin(source, target string) bool {
+	for _, rel := range []string{"package.json", "openclaw.plugin.json", filepath.Join("dist", "index.js")} {
+		sourceHash, err := openClawRedisTeamFileHash(filepath.Join(source, rel))
+		if err != nil {
+			return false
+		}
+		targetHash, err := openClawRedisTeamFileHash(filepath.Join(target, rel))
+		if err != nil || sourceHash != targetHash {
+			return false
+		}
+	}
+	return true
+}
+
+func openClawRedisTeamFileHash(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func replaceOpenClawRedisTeamPlugin(source, target, extensionsDir string) error {
+	if err := os.MkdirAll(extensionsDir, 0o750); err != nil {
+		return err
+	}
+	staging, err := os.MkdirTemp(extensionsDir, ".redis-team-staging-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(staging)
+	if err := copyDir(source, staging); err != nil {
+		return err
+	}
+	if err := validateOpenClawRedisTeamPlugin(staging, true); err != nil {
+		return fmt.Errorf("validate staged redis-team plugin: %w", err)
+	}
+	backup, err := os.MkdirTemp(extensionsDir, ".redis-team-backup-")
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(backup); err != nil {
+		return err
+	}
+	defer os.RemoveAll(backup)
+	hadTarget := false
+	if _, err := os.Stat(target); err == nil {
+		hadTarget = true
+		if err := os.Rename(target, backup); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Rename(staging, target); err != nil {
+		if hadTarget {
+			_ = os.Rename(backup, target)
+		}
+		return err
+	}
+	if hadTarget {
+		_ = os.RemoveAll(backup)
+	}
+	return nil
 }
 
 func copyDir(source, target string) error {
