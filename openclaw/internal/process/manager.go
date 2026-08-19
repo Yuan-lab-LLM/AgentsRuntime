@@ -572,8 +572,15 @@ func (m *Manager) tryNotifyStartup(ctx context.Context, message string, generati
 }
 
 func (m *Manager) notifySendArgs(message string) []string {
+	runtimeName := strings.TrimSpace(m.cfg.RuntimeName)
+	if runtimeName == "" {
+		runtimeName = strings.TrimSpace(m.cfg.RuntimeType)
+	}
+	if runtimeName == "" {
+		runtimeName = "OpenClaw"
+	}
 	args := []string{
-		"-a", "OpenClaw",
+		"-a", runtimeName,
 		"-t", fmt.Sprintf("%d", startupNotificationTTL.Milliseconds()),
 		"-h", "boolean:transient:true",
 		"-p",
@@ -583,7 +590,7 @@ func (m *Manager) notifySendArgs(message string) []string {
 		args = append(args, "-r", m.notificationID)
 	}
 	m.notifyMu.Unlock()
-	return append(args, "OpenClaw", message)
+	return append(args, runtimeName, message)
 }
 
 func (m *Manager) storeNotificationID(generation int, id string) {

@@ -80,6 +80,36 @@ func TestGatewayChannelSettleDelayFromOS(t *testing.T) {
 	}
 }
 
+func TestNotifySendArgsUseConfiguredRuntimeName(t *testing.T) {
+	m := New(appconfig.Config{
+		RuntimeType: "deepseek-harness",
+		RuntimeName: "DeepSeek Harness Pro",
+	})
+
+	want := []string{
+		"-a", "DeepSeek Harness Pro",
+		"-t", "60000",
+		"-h", "boolean:transient:true",
+		"-p",
+		"DeepSeek Harness Pro", "DeepSeek Harness is starting",
+	}
+	if got := m.notifySendArgs("DeepSeek Harness is starting"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected DeepSeek Harness notification args:\nwant %#v\n got %#v", want, got)
+	}
+}
+
+func TestNotifySendArgsFallbackToRuntimeType(t *testing.T) {
+	m := New(appconfig.Config{RuntimeType: "deepseek-harness"})
+
+	args := m.notifySendArgs("starting")
+	if got := args[1]; got != "deepseek-harness" {
+		t.Fatalf("notification application name = %q, want %q", got, "deepseek-harness")
+	}
+	if got := args[len(args)-2]; got != "deepseek-harness" {
+		t.Fatalf("notification title = %q, want %q", got, "deepseek-harness")
+	}
+}
+
 func envValue(env []string, key string) string {
 	prefix := key + "="
 	for _, item := range env {
