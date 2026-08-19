@@ -101,7 +101,7 @@ func managedDesktopInstanceAllowed() bool {
 		return true
 	}
 	switch product {
-	case "hermes", "opencode", "codex", "claude-code":
+	case "hermes", "opencode":
 		return true
 	default:
 		return false
