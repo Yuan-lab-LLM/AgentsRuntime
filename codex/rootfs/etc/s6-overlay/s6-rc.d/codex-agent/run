@@ -1,0 +1,10 @@
+#!/usr/bin/with-contenv bash
+set -euo pipefail
+if [ "${CLAWMANAGER_AGENT_ENABLED:-false}" != "true" ]; then
+  echo "ClawManager Codex instance agent disabled"
+  exec sleep infinity
+fi
+export HOME="${HOME:-/config}"
+export CODEX_HOME="${CODEX_HOME:-/config/.codex}"
+mkdir -p "${CLAWMANAGER_AGENT_PERSISTENT_DIR:-/config}/codex-agent" "$CODEX_HOME"
+exec /usr/local/bin/clawmanager-agent

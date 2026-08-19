@@ -84,6 +84,9 @@ RUN set -eux; \
     npm --version; \
     rm -f /tmp/node.tar.xz
 
+COPY hermes/patches/hermes-agent/apply_team_completion_stop.py /tmp/apply_team_completion_stop.py
+COPY hermes/patches/hermes-agent/apply_team_live_sessions.py /tmp/apply_team_live_sessions.py
+
 RUN set -eux; \
     mkdir -p "${HERMES_HOME}" "${PLAYWRIGHT_BROWSERS_PATH}"; \
     export HOME=/root; \
@@ -91,6 +94,10 @@ RUN set -eux; \
         | bash -s -- --branch "${HERMES_GIT_REF}" --hermes-home "${HERMES_HOME}" --skip-setup; \
     /usr/local/lib/hermes-agent/venv/bin/python -m ensurepip --upgrade; \
     /usr/local/lib/hermes-agent/venv/bin/python -m pip install --no-cache-dir "hermes-agent[dingtalk,messaging,matrix,wecom]==${HERMES_VERSION}"; \
+    /usr/local/lib/hermes-agent/venv/bin/python /tmp/apply_team_completion_stop.py \
+        /usr/local/lib/hermes-agent/agent/conversation_loop.py; \
+    /usr/local/lib/hermes-agent/venv/bin/python /tmp/apply_team_live_sessions.py \
+        /usr/local/lib/hermes-agent; \
     cd /usr/local/lib/hermes-agent; \
     npm install --workspace web; \
     npm install --workspace ui-tui; \

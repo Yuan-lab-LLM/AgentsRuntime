@@ -529,6 +529,9 @@ func TestControlHandlerPassesRequestEnvironmentToGatewayProcess(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(redisTeamPlugin, "openclaw.plugin.json"), []byte(`{"id":"redis-team","channels":["redis-team"]}`), 0o644); err != nil {
 		t.Fatalf("write redis-team manifest: %v", err)
 	}
+	if err := os.WriteFile(filepath.Join(redisTeamPlugin, "package.json"), []byte(`{"name":"@clawmanager/openclaw-redis-team","version":"0.2.1"}`), 0o644); err != nil {
+		t.Fatalf("write redis-team package: %v", err)
+	}
 	if err := os.WriteFile(filepath.Join(redisTeamPlugin, "dist", "index.js"), []byte(`module.exports = {};`), 0o644); err != nil {
 		t.Fatalf("write redis-team entrypoint: %v", err)
 	}

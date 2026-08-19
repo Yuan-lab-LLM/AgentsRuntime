@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import importlib.util
 import json
 import os
@@ -93,6 +94,9 @@ class HermesRedisTeamContractTests(unittest.TestCase):
         self.assertIn("review, or evidence work", source)
         self.assertIn("never block delivery", source)
         self.assertIn("call team_complete_task", source)
+        self.assertIn("batch independent", source)
+        self.assertIn("one execute_code call", source)
+        self.assertIn("never a reason to skip required evidence", source)
 
     def test_assignment_validation_guidance_is_contract_driven_and_role_agnostic(self):
         developer = adapter.RedisTeamSettings(
@@ -167,6 +171,165 @@ class HermesRedisTeamContractTests(unittest.TestCase):
 
         asyncio.run(run_test())
 
+    def test_team_send_accepts_message_alias_and_rejects_conflicting_text(self):
+        async def run_test():
+            with tempfile.TemporaryDirectory() as tmp:
+                settings = self.settings(Path(tmp))
+                adapter.ensure_team_dirs(settings)
+                adapter._persist_active_envelope(
+                    settings,
+                    {"taskId": "team-42-task-1", "rootTaskId": "team-42-task-1"},
+                )
+
+                class FakeRedis:
+                    def __init__(self, *_args, **_kwargs):
+                        pass
+
+                    async def connect(self):
+                        return None
+
+                    async def command(self, *_args):
+                        return "1-0"
+
+                    def close(self):
+                        pass
+
+                with mock.patch.object(adapter, "load_settings", return_value=settings), mock.patch.object(
+                    adapter, "AsyncRedisClient", FakeRedis
+                ):
+                    accepted = json.loads(await adapter._tool_team_send({
+                        "recipient": "auditor",
+                        "message": "Review the current result.",
+                        "assignmentId": "review-1",
+                    }))
+                    conflict = json.loads(await adapter._tool_team_send({
+                        "to": "auditor",
+                        "text": "one",
+                        "prompt": "two",
+                    }))
+                self.assertTrue(accepted["ok"])
+                self.assertEqual(accepted["sent"]["text"], "Review the current result.")
+                self.assertFalse(conflict["ok"])
+                self.assertTrue(conflict["retryable"])
+                self.assertEqual(conflict["code"], "conflicting_team_message")
+
+        asyncio.run(run_test())
+
+    def test_business_delivery_uses_complete_ledger_without_trusting_agent_revision(self):
+        settings = adapter.RedisTeamSettings(
+            enabled=True,
+            redis_url="redis://example.invalid:6379/0",
+            team_id="42",
+            member_id="leader",
+            role="leader",
+        )
+        state = {
+            "assignmentLedgerComplete": True,
+            "snapshotSchemaVersion": 2,
+            "ledgerVersion": 12,
+            "assignments": {
+                "dev-page": {
+                    "assignmentId": "dev-page",
+                    "ownerMemberKey": "developer",
+                    "revision": 1,
+                    "status": "succeeded",
+                    "nextRevisionAllowed": False,
+                    "nextRevision": 2,
+                }
+            },
+        }
+        follow_up = adapter._hermes_business_delivery_from_ledger(
+            settings,
+            {"to": "developer", "assignmentId": "dev-page", "intent": "assignment"},
+            state,
+            explicit_assignment_id=True,
+        )
+        self.assertEqual(follow_up["kind"], "ambiguous")
+        self.assertEqual(follow_up["revision"], 1)
+
+        next_stage = adapter._hermes_business_delivery_from_ledger(
+            settings,
+            {"to": "developer", "assignmentId": "dev-export", "intent": "assignment"},
+            state,
+            explicit_assignment_id=True,
+        )
+        self.assertEqual(next_stage["kind"], "assignment")
+        self.assertEqual(next_stage["revision"], 1)
+
+        no_identity = adapter._hermes_business_delivery_from_ledger(
+            settings,
+            {"to": "developer", "assignmentId": "generated", "intent": "send"},
+            state,
+            explicit_assignment_id=False,
+        )
+        self.assertEqual(no_identity["kind"], "ambiguous")
+
+        state["assignments"]["dev-page"].update({
+            "status": "failed",
+            "nextRevisionAllowed": True,
+            "nextRevision": 2,
+        })
+        recovery = adapter._hermes_business_delivery_from_ledger(
+            settings,
+            {"to": "developer", "assignmentId": "dev-page", "intent": "send"},
+            state,
+            explicit_assignment_id=True,
+        )
+        self.assertEqual(recovery["kind"], "assignment")
+        self.assertEqual(recovery["revision"], 2)
+        self.assertTrue(recovery["authorized"])
+
+    def test_roster_target_resolution_uses_unique_information_and_never_fuzzy_routes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.settings(Path(tmp))
+            Path(tmp, "team.json").write_text(json.dumps({
+                "members": [
+                    {"memberId": "leader", "displayName": "Lead"},
+                    {"memberId": "developer", "displayName": "Builder"},
+                ]
+            }), encoding="utf-8")
+            resolved = adapter._resolve_roster_target(settings, "identity={leader}")
+            self.assertEqual(resolved["memberId"], "leader")
+            ambiguous = adapter._resolve_roster_target(settings, "developer should report to leader")
+            self.assertEqual(ambiguous["memberId"], "")
+            self.assertEqual(set(ambiguous["candidates"]), {"developer", "leader"})
+            typo = adapter._resolve_roster_target(settings, "leadr")
+            self.assertEqual(typo["memberId"], "")
+            self.assertEqual(typo["suggestions"], ["leader"])
+
+    def test_live_runtime_attempt_downgrades_stale_ledger_recovery_to_context(self):
+        settings = adapter.RedisTeamSettings(
+            enabled=True,
+            redis_url="redis://example.invalid:6379/0",
+            team_id="42",
+            member_id="leader",
+            role="leader",
+        )
+        state = {"assignments": {"dev-page": {
+            "assignmentId": "dev-page",
+            "ownerMemberKey": "developer",
+            "revision": 1,
+            "status": "failed",
+            "nextRevisionAllowed": True,
+            "nextRevision": 2,
+        }}}
+        decision = adapter._hermes_business_delivery_from_ledger(
+            settings,
+            {"to": "developer", "assignmentId": "dev-page", "rootTaskId": "team-42-task-1", "intent": "send"},
+            state,
+            explicit_assignment_id=True,
+            target_status={
+                "runtimeStatus": "awaiting_completion_receipt",
+                "availability": "busy",
+                "lastSeenAt": adapter._now_iso(),
+                "currentAssignmentId": "dev-page",
+                "currentRevision": 1,
+            },
+        )
+        self.assertEqual(decision["kind"], "context")
+        self.assertEqual(decision["reason"], "runtime_attempt_still_active")
+        self.assertEqual(decision["revision"], 1)
+
     def settings(self, root):
         return adapter.RedisTeamSettings(
             enabled=True,
@@ -185,9 +348,143 @@ class HermesRedisTeamContractTests(unittest.TestCase):
         self.assertNotIn("automatic_turn_completion_v2", adapter.PROTOCOL_CAPABILITIES)
         self.assertIn("explicit_completion_receipt_v1", adapter.PROTOCOL_CAPABILITIES)
         self.assertIn("turn_end_monitor_v1", adapter.PROTOCOL_CAPABILITIES)
+        self.assertIn("turn_outcome_v1", adapter.PROTOCOL_CAPABILITIES)
+        self.assertIn("immediate_recheck_v1", adapter.PROTOCOL_CAPABILITIES)
         self.assertIn("assignment_lifecycle_v1", adapter.PROTOCOL_CAPABILITIES)
+        self.assertIn("assignment_activity_v2", adapter.PROTOCOL_CAPABILITIES)
+        self.assertIn("terminal_tool_stop_v1", adapter.PROTOCOL_CAPABILITIES)
         self.assertIn("team_artifact_preview_v1", adapter.PROTOCOL_CAPABILITIES)
         self.assertIn("team_artifact_preview_v2", adapter.PROTOCOL_CAPABILITIES)
+
+    def test_register_installs_fail_open_runtime_observation_hooks(self):
+        class Context:
+            def __init__(self):
+                self.hooks = {}
+
+            def register_hook(self, name, callback):
+                self.hooks[name] = callback
+
+            def register_tool(self, **_kwargs):
+                pass
+
+            def register_platform(self, **_kwargs):
+                pass
+
+        context = Context()
+        adapter.register(context)
+        self.assertEqual(
+            set(context.hooks),
+            {"pre_api_request", "post_api_request", "pre_tool_call", "post_tool_call"},
+        )
+
+    def test_team_tool_schema_failure_is_retained_by_post_tool_hook(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.settings(Path(tmp))
+            adapter.ensure_team_dirs(settings)
+            adapter._begin_turn_observation(
+                settings,
+                {
+                    "messageId": "schema-failure-turn",
+                    "rootTaskId": "team-42-task-1",
+                    "assignmentId": "dev-1",
+                    "revision": 1,
+                },
+                context_only=False,
+            )
+            with mock.patch.object(adapter, "load_settings", return_value=settings):
+                adapter._hook_pre_tool_call(
+                    tool_name="team_send",
+                    task_id="team-42-task-1",
+                    turn_id="turn-1",
+                )
+                adapter._hook_post_tool_call(
+                    tool_name="team_send",
+                    task_id="team-42-task-1",
+                    turn_id="turn-1",
+                    status="error",
+                    error_message="tool schema rejected arguments",
+                    result=json.dumps({
+                        "ok": False,
+                        "retryable": True,
+                        "error": "tool schema rejected arguments",
+                    }),
+                )
+            observation = adapter._read_json(adapter._turn_observation_path(settings))
+            self.assertEqual(observation["lastTool"]["toolName"], "team_send")
+            self.assertTrue(observation["lastTool"]["failed"])
+            self.assertTrue(observation["lastTool"]["retryable"])
+
+    def test_artifact_read_is_paginated_and_observed(self):
+        async def run_test():
+            with tempfile.TemporaryDirectory() as tmp:
+                settings = self.settings(Path(tmp))
+                adapter.ensure_team_dirs(settings)
+                target = settings.shared_path / "artifacts" / "large.txt"
+                target.write_text("abcdefghij", encoding="utf-8")
+                adapter._begin_turn_observation(
+                    settings,
+                    {
+                        "messageId": "artifact-turn",
+                        "rootTaskId": "team-42-task-1",
+                        "assignmentId": "dev-1",
+                        "revision": 1,
+                    },
+                    context_only=False,
+                )
+                with mock.patch.object(adapter, "load_settings", return_value=settings):
+                    first = json.loads(await adapter._tool_team_artifact_read({
+                        "scope": "team",
+                        "path": "/team/artifacts/large.txt",
+                        "maxBytes": 4,
+                    }))
+                    second = json.loads(await adapter._tool_team_artifact_read({
+                        "scope": "team",
+                        "path": "/team/artifacts/large.txt",
+                        "offset": first["artifact"]["nextOffset"],
+                        "maxBytes": 6,
+                    }))
+                self.assertEqual(first["artifact"]["content"], "abcd")
+                self.assertTrue(first["artifact"]["truncated"])
+                self.assertEqual(first["artifact"]["nextOffset"], 4)
+                self.assertEqual(second["artifact"]["content"], "efghij")
+                self.assertFalse(second["artifact"]["truncated"])
+                observation = adapter._read_json(adapter._turn_observation_path(settings))
+                self.assertEqual(observation["lastToolName"], "team_artifact_read")
+                self.assertIsNone(observation["lastTool"])
+
+        asyncio.run(run_test())
+
+    def test_progress_blocked_is_nonterminal_waiting(self):
+        async def run_test():
+            with tempfile.TemporaryDirectory() as tmp:
+                settings = self.settings(Path(tmp))
+                adapter.ensure_team_dirs(settings)
+                adapter._persist_active_envelope(settings, {
+                    "messageId": "wait-turn",
+                    "taskId": "team-42-task-1",
+                    "rootTaskId": "team-42-task-1",
+                    "assignmentId": "dev-1",
+                    "revision": 1,
+                })
+                published = []
+
+                async def capture(_settings, event, payload):
+                    published.append((event, payload))
+
+                with mock.patch.object(adapter, "load_settings", return_value=settings), mock.patch.object(
+                    adapter, "_publish_event", capture
+                ):
+                    result = json.loads(await adapter._tool_team_update_progress({
+                        "status": "blocked",
+                        "summary": "Waiting for dependency dev-0",
+                    }))
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["status"]["availability"], "busy")
+                self.assertEqual(result["status"]["runtimeStatus"], "waiting")
+                self.assertEqual(published[0][1]["status"], "waiting")
+                self.assertEqual(published[0][1]["runtimeStatus"], "waiting")
+
+        asyncio.run(run_test())
 
     def test_managed_startup_identity_loads_from_environment(self):
         with mock.patch.dict(
@@ -408,6 +705,22 @@ class HermesRedisTeamContractTests(unittest.TestCase):
                 adapter.canonical_artifact_ref(settings, target),
                 "/team/artifacts/team-42-task-7/members/developer/dev-1/result.md",
             )
+            canonical_without_prefix = adapter._artifact_path(
+                settings,
+                {
+                    "path": "artifacts/team-42-task-7/members/developer/dev-1/result.md",
+                },
+                default_scope="member",
+                write=True,
+            )
+            self.assertEqual(canonical_without_prefix, target)
+            with self.assertRaisesRegex(ValueError, "assignment-relative"):
+                adapter._artifact_path(
+                    settings,
+                    {"path": "artifacts/team-42-task-7/result.md"},
+                    default_scope="member",
+                    write=True,
+                )
             with self.assertRaisesRegex(ValueError, "traversal"):
                 adapter._artifact_path(
                     settings,
@@ -415,6 +728,38 @@ class HermesRedisTeamContractTests(unittest.TestCase):
                     default_scope="member",
                     write=True,
                 )
+
+    def test_artifact_write_receipt_is_sufficient_without_readback(self):
+        async def run_test():
+            with tempfile.TemporaryDirectory() as tmp:
+                settings = self.settings(Path(tmp))
+                adapter.ensure_team_dirs(settings)
+                adapter._persist_active_envelope(
+                    settings,
+                    {
+                        "rootTaskId": "team-42-task-7",
+                        "assignmentId": "dev-1",
+                        "taskId": "team-42-task-7",
+                    },
+                )
+                with mock.patch.object(adapter, "load_settings", return_value=settings):
+                    result = json.loads(
+                        await adapter._tool_team_artifact_write(
+                            {"path": "result.md", "content": "complete"}
+                        )
+                    )
+                self.assertTrue(result["ok"])
+                self.assertEqual(
+                    result["artifact"]["path"],
+                    "/team/artifacts/team-42-task-7/members/developer/dev-1/result.md",
+                )
+                self.assertEqual(result["artifact"]["bytes"], len("complete"))
+                self.assertEqual(
+                    result["artifact"]["sha256"],
+                    hashlib.sha256(b"complete").hexdigest(),
+                )
+
+        asyncio.run(run_test())
 
     def test_preview_uses_same_persistent_managed_url_contract_as_openclaw(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -668,12 +1013,18 @@ class HermesRedisTeamContractTests(unittest.TestCase):
                 "workId": "dev-1",
                 "revision": 3,
                 "requiresCompletion": False,
+                "turnOutcomePolicy": {
+                    "actionExpected": True,
+                    "immediateRecoveryAllowed": False,
+                },
             }
         )
         self.assertEqual(value["assignmentId"], "dev-1")
         self.assertEqual(value["rootMessageId"], "root-msg")
         self.assertEqual(value["revision"], 3)
         self.assertFalse(value["requiresCompletion"])
+        self.assertEqual(value["turnOutcomePolicy"]["actionExpected"], True)
+        self.assertEqual(value["turnOutcomePolicy"]["immediateRecoveryAllowed"], False)
 
     def test_completion_uses_active_envelope_when_agent_reports_wrong_task_id(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -832,6 +1183,160 @@ class HermesRedisTeamContractTests(unittest.TestCase):
                 if command[0] == "XADD" and command[1] == adapter.events_key(settings)
             ]
             self.assertFalse(any(event.get("event") in {"task_received", "task_started"} for event in events))
+
+    def test_context_turn_observer_is_state_neutral_and_conflict_safe(self):
+        envelope = {
+            "messageId": "context-observe-1",
+            "requiresCompletion": False,
+            "intent": "member_result_confirmed",
+            "turnOutcomePolicy": {
+                "actionExpected": True,
+                "immediateRecoveryAllowed": True,
+            },
+        }
+        retryable = adapter._observe_team_turn_outcome(envelope, {}, {
+            "lastTool": {
+                "toolName": "team_send",
+                "failed": True,
+                "retryable": True,
+                "succeeded": False,
+                "code": "ambiguous_team_target",
+            },
+        })
+        self.assertEqual(retryable["outcome"], "retryable_tool_gap")
+        self.assertTrue(retryable["immediateRecoveryEligible"])
+        conflict = adapter._observe_team_turn_outcome(envelope, {"explicitCompletionSubmitted": True}, {
+            "lastTool": {
+                "toolName": "team_send",
+                "failed": True,
+                "retryable": True,
+                "succeeded": False,
+            },
+        })
+        self.assertEqual(conflict["outcome"], "runtime_observation_unknown")
+        self.assertFalse(conflict["immediateRecoveryEligible"])
+        ordinary = adapter._observe_team_turn_outcome(
+            {"messageId": "context-observe-2", "requiresCompletion": False, "intent": "context"},
+            {},
+            {},
+        )
+        self.assertEqual(ordinary["outcome"], "ordinary_open_turn")
+        self.assertFalse(ordinary["immediateRecoveryEligible"])
+
+    def test_turn_observer_distinguishes_leader_return_from_downstream_assignment(self):
+        envelope = {
+            "messageId": "worker-return-1",
+            "requiresCompletion": True,
+            "intent": "assignment",
+            "turnOutcomePolicy": {
+                "actionExpected": True,
+                "immediateRecoveryAllowed": True,
+            },
+        }
+        leader_return = adapter._observe_team_turn_outcome(envelope, {}, {
+            "lastTool": {
+                "toolName": "team_send",
+                "failed": False,
+                "retryable": False,
+                "succeeded": True,
+                "outboundObserved": True,
+                "businessMutation": False,
+                "businessDeliveryKind": "peer_request",
+                "outboundTarget": "leader",
+            },
+        })
+        self.assertEqual(leader_return["outcome"], "completion_receipt_gap")
+        self.assertTrue(leader_return["immediateRecoveryEligible"])
+        self.assertTrue(leader_return["hadOutboundAssignment"])
+        self.assertFalse(leader_return["downstreamAssignmentStarted"])
+
+        downstream = adapter._observe_team_turn_outcome(envelope, {}, {
+            "lastTool": {
+                "toolName": "team_send",
+                "failed": False,
+                "retryable": False,
+                "succeeded": True,
+                "outboundObserved": True,
+                "businessMutation": True,
+                "businessDeliveryKind": "assignment",
+                "outboundTarget": "worker-2",
+            },
+        })
+        self.assertEqual(downstream["outcome"], "legitimate_wait")
+        self.assertFalse(downstream["immediateRecoveryEligible"])
+        self.assertTrue(downstream["downstreamAssignmentStarted"])
+
+    def test_context_processing_emits_actionable_hidden_turn_fact_without_business_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.settings(Path(tmp))
+            commands = []
+            formal = {
+                "messageId": "formal-active",
+                "taskId": "team-42-task-7",
+                "rootTaskId": "team-42-task-7",
+                "assignmentId": "leader-final-synthesis",
+                "workId": "leader-final-synthesis",
+                "requiresCompletion": True,
+            }
+            context = {
+                "messageId": "context-actionable",
+                "taskId": "team-42-task-7",
+                "rootTaskId": "team-42-task-7",
+                "assignmentId": "leader-final-synthesis",
+                "workId": "leader-final-synthesis",
+                "requiresCompletion": False,
+                "intent": "member_result_confirmed",
+                "turnOutcomePolicy": {
+                    "actionExpected": True,
+                    "immediateRecoveryAllowed": True,
+                },
+            }
+
+            class FakeRedis:
+                async def command(self, *args):
+                    commands.append(args)
+                    if args[0] == "XADD":
+                        return "1-0"
+                    return None
+
+                def close(self):
+                    pass
+
+            async def run_test():
+                with mock.patch.object(adapter, "load_settings", return_value=settings):
+                    instance = adapter.RedisTeamAdapter(types.SimpleNamespace(extra={}))
+                instance._redis = FakeRedis()
+                adapter._persist_active_envelope(settings, formal)
+                instance._track_active_assignment(formal)
+                adapter._begin_turn_observation(settings, context, context_only=True)
+                adapter._record_turn_tool_result(settings, "team_send", {
+                    "ok": False,
+                    "retryable": True,
+                    "code": "ambiguous_team_target",
+                    "error": "Recipient is ambiguous",
+                    "candidates": ["developer", "reviewer"],
+                })
+                event = types.SimpleNamespace(
+                    raw_message=context,
+                    message_id=context["messageId"],
+                    source=types.SimpleNamespace(chat_id=context["taskId"]),
+                )
+
+                await instance.on_processing_complete(event, adapter.ProcessingOutcome.SUCCESS)
+
+            asyncio.run(run_test())
+            events = [
+                json.loads(command[-1])
+                for command in commands
+                if command[0] == "XADD" and command[1] == adapter.events_key(settings)
+            ]
+            observed = [event for event in events if event.get("eventKind") == "turn_finished_without_completion"]
+            self.assertEqual(len(observed), 1)
+            self.assertEqual(observed[0]["turnObservationOutcome"], "retryable_tool_gap")
+            self.assertTrue(observed[0]["immediateRecoveryEligible"])
+            self.assertEqual(observed[0]["stateEffect"], "none")
+            self.assertFalse(observed[0]["rootTaskTerminal"])
+            self.assertFalse(any(event.get("event") in {"task_received", "task_started", "task_completed"} for event in events))
 
     def test_terminal_root_rejects_late_assignment_before_model_dispatch(self):
         with tempfile.TemporaryDirectory() as tmp:

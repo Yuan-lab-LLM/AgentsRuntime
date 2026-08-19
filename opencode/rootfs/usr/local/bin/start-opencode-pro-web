@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Pro desktop helper: bind localhost only (portal goes through Webtop 3001).
+export HOST="${HOST:-127.0.0.1}"
+export PORT="${PORT:-4096}"
+export CLAWMANAGER_GATEWAY_PORT="${CLAWMANAGER_GATEWAY_PORT:-${PORT}}"
+export HOME="${HOME:-/config}"
+export OPENCODE_CONFIG_DIR="${OPENCODE_CONFIG_DIR:-/config/.opencode}"
+mkdir -p "${OPENCODE_CONFIG_DIR}"
+if [ -z "${OPENCODE_CONFIG:-}" ] && [ -f "${OPENCODE_CONFIG_DIR}/opencode.json" ]; then
+  export OPENCODE_CONFIG="${OPENCODE_CONFIG_DIR}/opencode.json"
+fi
+
+# Pro is bound to loopback and is reached through the authenticated Webtop
+# desktop proxy. Avoid a second Basic Auth prompt inside the desktop by
+# default. Set OPENCODE_PRO_WEB_AUTH=true to keep local web authentication.
+case "${OPENCODE_PRO_WEB_AUTH:-false}" in
+  1|true|TRUE|yes|YES|on|ON) ;;
+  *) unset OPENCODE_SERVER_USERNAME OPENCODE_SERVER_PASSWORD ;;
+esac
+
+# The desktop launch helper opens a directory-scoped Web URL once this local
+# server is ready. Do not create a synthetic session here: project paths can
+# contain arbitrary UTF-8 and the Web route already provides a correct new
+# session view for the selected directory.
+exec /usr/local/bin/start-opencode-web

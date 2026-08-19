@@ -61,9 +61,36 @@ const config = {
 };
 
 const sessionResult = "开发任务已完成，产物已经保存并可交给 Reviewer 验收。";
+let dispatchMode = "assignment";
 globalThis.__redisTeamTestDispatch = async () => {
   const timestamp = new Date().toISOString();
-  const records = [
+  const records = dispatchMode === "context-retryable" ? [
+    {
+      id: "assistant-context-tool-call",
+      timestamp,
+      message: {
+        role: "assistant",
+        content: [{ type: "tool_use", id: "tool-context-1", name: "team_send", input: {} }],
+      },
+    },
+    {
+      id: "context-tool-result",
+      timestamp,
+      message: {
+        role: "tool",
+        content: [{
+          type: "tool_result",
+          tool_use_id: "tool-context-1",
+          text: JSON.stringify({ ok: false, retryable: true, code: "ambiguous_team_target", candidates: ["developer", "reviewer"] }),
+        }],
+      },
+    },
+    {
+      id: "assistant-context-final",
+      timestamp,
+      message: { role: "assistant", content: [{ type: "text", text: "I will correct the Team recipient." }] },
+    },
+  ] : [
     {
       id: "assistant-tool-call",
       timestamp,
@@ -229,6 +256,47 @@ try {
     await redis.command("XLEN", dlqKey),
     0,
     "a valid turn-end monitor record must not enter the dead-letter stream",
+  );
+
+  dispatchMode = "context-retryable";
+  const contextMessageId = `consumer-context-${runId}`;
+  const contextEnvelope = {
+    ...envelope,
+    messageId: contextMessageId,
+    idempotencyKey: contextMessageId,
+    intent: "member_result_confirmed",
+    type: "notification",
+    text: "A member result was confirmed. Continue the current workflow decision.",
+    requiresCompletion: false,
+    turnOutcomePolicy: {
+      actionExpected: true,
+      immediateRecoveryAllowed: true,
+      reason: "consumer_regression",
+    },
+    createdAt: new Date().toISOString(),
+  };
+  await redis.command("XADD", inboxKey, "*", "payload", JSON.stringify(contextEnvelope));
+  const contextTurn = await waitFor(async () => {
+    const response = await redis.command("XRANGE", eventsKey, "-", "+");
+    observed.splice(0, observed.length, ...streamPayloads(response));
+    return observed.find((event) =>
+      event.eventKind === "turn_finished_without_completion" &&
+      (event.sourceMessageId === contextMessageId || event.messageId === contextMessageId)) || false;
+  });
+  assert.equal(contextTurn.turnObservationOutcome, "retryable_tool_gap");
+  assert.equal(contextTurn.immediateRecoveryEligible, true);
+  assert.equal(contextTurn.contextOnlyTurn, true);
+  assert.equal(contextTurn.lastToolName, "team_send");
+  assert.equal(contextTurn.lastToolCode, "ambiguous_team_target");
+  assert.deepEqual(contextTurn.targetCandidates, ["developer", "reviewer"]);
+  assert.equal(contextTurn.stateEffect, "none");
+  assert.equal(contextTurn.rootTaskTerminal, false);
+  assert.equal(
+    observed.some((event) =>
+      (event.sourceMessageId === contextMessageId || event.messageId === contextMessageId) &&
+      ["task_received", "task_started", "completion_proposed", "task_failed"].includes(event.event)),
+    false,
+    "context observation must not create business lifecycle state",
   );
 
   console.log("Redis Team real consumer regression: OK");

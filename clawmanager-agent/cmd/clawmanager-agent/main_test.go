@@ -2,6 +2,38 @@ package main
 
 import "testing"
 
+func TestSelectModeUsesInstanceAgentForOpenCode(t *testing.T) {
+	t.Setenv("RUNTIME_AGENT_CONTROL_TOKEN", "")
+	t.Setenv("RUNTIME_AGENT_REPORT_TOKEN", "")
+	t.Setenv("CLAWMANAGER_AGENT_ENABLED", "true")
+	t.Setenv("CLAWMANAGER_AGENT_INSTANCE_ID", "4")
+	t.Setenv("CLAWMANAGER_AGENT_BOOTSTRAP_TOKEN", "boot")
+	t.Setenv("CLAWMANAGER_RUNTIME_TYPE", "desktop")
+	t.Setenv("CLAWMANAGER_AGENT_RUNTIME_TYPE", "opencode")
+
+	if got := selectMode(); got != modeInstance {
+		t.Fatalf("selectMode() = %s, want %s", got, modeInstance)
+	}
+}
+
+func TestSelectModeUsesInstanceAgentForCodexAndClaudeCode(t *testing.T) {
+	for _, runtimeType := range []string{"codex", "claude-code"} {
+		t.Run(runtimeType, func(t *testing.T) {
+			t.Setenv("RUNTIME_AGENT_CONTROL_TOKEN", "")
+			t.Setenv("RUNTIME_AGENT_REPORT_TOKEN", "")
+			t.Setenv("CLAWMANAGER_AGENT_ENABLED", "true")
+			t.Setenv("CLAWMANAGER_AGENT_INSTANCE_ID", "4")
+			t.Setenv("CLAWMANAGER_AGENT_BOOTSTRAP_TOKEN", "boot")
+			t.Setenv("CLAWMANAGER_RUNTIME_TYPE", "desktop")
+			t.Setenv("CLAWMANAGER_AGENT_RUNTIME_TYPE", runtimeType)
+
+			if got := selectMode(); got != modeInstance {
+				t.Fatalf("selectMode() = %s, want %s", got, modeInstance)
+			}
+		})
+	}
+}
+
 func TestSelectModePrefersRuntimePodAgent(t *testing.T) {
 	t.Setenv("RUNTIME_AGENT_CONTROL_TOKEN", "control")
 	t.Setenv("CLAWMANAGER_AGENT_ENABLED", "")

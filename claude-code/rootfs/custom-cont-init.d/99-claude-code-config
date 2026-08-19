@@ -1,0 +1,42 @@
+#!/usr/bin/with-contenv bash
+set -e
+export HOME="${HOME:-/config}"
+export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-/config/.claude}"
+export CLAWMANAGER_PROJECT_PATH="${CLAWMANAGER_PROJECT_PATH:-/config/workspace}"
+mkdir -p "$CLAUDE_CONFIG_DIR" "$CLAWMANAGER_PROJECT_PATH" "${CLAWMANAGER_AGENT_PERSISTENT_DIR:-/config}/claude-code-agent" /config/.config/autostart
+if [ -n "${CLAWMANAGER_LLM_BASE_URL:-}" ] && [ -n "${CLAWMANAGER_LLM_API_KEY:-}" ]; then
+  # Claude Code speaks Anthropic Messages; the base below resolves to the
+  # ClawManager /v1/messages compatibility endpoint.
+  export ANTHROPIC_BASE_URL="$CLAWMANAGER_LLM_BASE_URL"
+  # A managed third-party gateway uses the auth-token form. Do not also export
+  # ANTHROPIC_API_KEY: Claude Code warns about ambiguous authentication when
+  # both are present.
+  unset ANTHROPIC_API_KEY
+  export ANTHROPIC_AUTH_TOKEN="$CLAWMANAGER_LLM_API_KEY"
+  export ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-${OPENAI_MODEL:-auto}}"
+  # The managed model catalog may contain non-Anthropic model names. Avoid
+  # imposing Claude Code's fallback 200k context-window assumption on them.
+  export CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1
+  export DISABLE_AUTOUPDATER=1
+  cat >"$CLAUDE_CONFIG_DIR/clawmanager.env" <<EOF
+# Managed by ClawManager. The token is deliberately not persisted here.
+ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL}
+ANTHROPIC_MODEL=${ANTHROPIC_MODEL}
+EOF
+  chmod 600 "$CLAUDE_CONFIG_DIR/clawmanager.env"
+fi
+if command -v git >/dev/null 2>&1 && [ ! -d "$CLAWMANAGER_PROJECT_PATH/.git" ]; then git -C "$CLAWMANAGER_PROJECT_PATH" init --quiet || true; fi
+cat >/config/.config/autostart/claude-code.desktop <<'DESKTOP'
+[Desktop Entry]
+Type=Application
+Name=Claude Code
+Exec=/usr/local/bin/start-claude-code-terminal
+Terminal=false
+X-KDE-Autostart-enabled=true
+DESKTOP
+mkdir -p /config/.config/openbox
+touch /config/.config/openbox/autostart
+if ! grep -q 'start-claude-code-terminal' /config/.config/openbox/autostart 2>/dev/null; then
+  echo '(/usr/local/bin/start-claude-code-terminal) &' >>/config/.config/openbox/autostart
+fi
+chown -R abc:abc "$CLAUDE_CONFIG_DIR" "$CLAWMANAGER_PROJECT_PATH" /config/.config 2>/dev/null || true

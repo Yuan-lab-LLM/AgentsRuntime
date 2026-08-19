@@ -1,6 +1,6 @@
 {
   "name": "@clawmanager/openclaw-redis-team",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "OpenClaw Redis Streams Team Bus plugin for ClawManager managed runtimes.",
   "type": "module",
   "main": "./dist/index.js",

@@ -17,6 +17,7 @@ import (
 	"github.com/iamlovingit/clawmanager-agent/internal/runtime/generic"
 	"github.com/iamlovingit/clawmanager-agent/internal/runtime/hermes"
 	"github.com/iamlovingit/clawmanager-agent/internal/runtime/openclaw"
+	"github.com/iamlovingit/clawmanager-agent/internal/runtime/opencode"
 	"github.com/iamlovingit/clawmanager-agent/internal/runtime/windowsvm"
 )
 
@@ -201,6 +202,7 @@ func defaultRuntimeRegistry() *runtimeprofiles.Registry {
 	_ = registry.Register(openclaw.NewProfile("openclaw"))
 	_ = registry.Register(openclaw.NewProfile("openclaw-shell"))
 	_ = registry.Register(hermes.NewProfile("hermes"))
+	_ = registry.Register(opencode.NewProfile("opencode"))
 	_ = registry.Register(windowsvm.NewProfile("windows-vm"))
 	return registry
 }

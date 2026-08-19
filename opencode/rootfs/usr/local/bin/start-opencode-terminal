@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# The desktop may trigger both its regular XDG autostart and Openbox fallback.
+# Hold a short-lived lock so only one OpenCode terminal is opened per boot.
+case "${OPENCODE_AUTOSTART:-true}" in
+  0|false|FALSE|no|NO|off|OFF) exit 0 ;;
+esac
+
+if command -v flock >/dev/null 2>&1; then
+  exec 9>/tmp/opencode-terminal-autostart.lock
+  flock -n 9 || exit 0
+fi
+
+export HOME="${HOME:-/config}"
+export OPENCODE_CONFIG_DIR="${OPENCODE_CONFIG_DIR:-/config/.opencode}"
+export CLAWMANAGER_PROJECT_PATH="${CLAWMANAGER_PROJECT_PATH:-/config/workspace}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/config/.cache}"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-/config/.config}"
+export XDG_DATA_HOME="${XDG_DATA_HOME:-/config/.local/share}"
+
+mkdir -p "$HOME" "$OPENCODE_CONFIG_DIR" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$CLAWMANAGER_PROJECT_PATH"
+/usr/local/bin/opencode-apply-runtime-config >/tmp/opencode-runtime-config.log 2>&1 || true
+
+workspace_path="$(realpath -m "${CLAWMANAGER_PROJECT_PATH}")"
+project_path="$(realpath -m "${CLAWMANAGER_DEFAULT_PROJECT_PATH:-${workspace_path%/}/project}")"
+case "${project_path}" in
+  "${workspace_path}"|"${workspace_path}"/*) ;;
+  *)
+    echo "OpenCode project path must stay within ${workspace_path}: ${project_path}" >&2
+    exit 64
+    ;;
+esac
+# OpenCode routes project context through a URL-safe Base64 directory segment.
+# Opening '/' leaves the Web UI on its global landing page even though the
+# server itself was started from the selected project directory.
+project_slug="$(printf '%s' "${project_path}" | base64 | tr '+/' '-_' | tr -d '=\r\n')"
+
+launch_cmd='export HOME=/config OPENCODE_CONFIG_DIR=/config/.opencode XDG_CACHE_HOME=/config/.cache XDG_CONFIG_HOME=/config/.config XDG_DATA_HOME=/config/.local/share CLAWMANAGER_PROJECT_PATH=/config/workspace; cd "$CLAWMANAGER_PROJECT_PATH"; exec /usr/local/bin/opencode'
+
+# Pro is presented through the Webtop desktop.  Its primary interface is the
+# local `opencode web` service, so open it explicitly once KDE is ready rather
+# than relying on an XDG .desktop autostart entry (which Wayland may ignore).
+if [ "${OPENCODE_AUTOSTART_MODE:-web}" = "web" ] && command -v chromium >/dev/null 2>&1; then
+  opencode_web_port="${OPENCODE_WEB_PORT:-4096}"
+  for _ in $(seq 1 30); do
+    if curl -fsS --max-time 1 http://127.0.0.1:"${opencode_web_port}"/ >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+  # Chromium stores its single-instance lock in the persistent /config
+  # profile. A Pod restart leaves that lock referring to the previous Pod,
+  # and Chromium then refuses to open at all. Only remove it when this user
+  # has no live Chromium process, so a running browser is never disrupted.
+  chromium_profile="${XDG_CONFIG_HOME}/chromium"
+  if ! pgrep -u "$(id -u)" -x chromium >/dev/null 2>&1; then
+    rm -f \
+      "${chromium_profile}/SingletonLock" \
+      "${chromium_profile}/SingletonCookie" \
+      "${chromium_profile}/SingletonSocket"
+  fi
+  # Do not exec Chromium: when its window is closed or it crashes, S6 would
+  # restart this long-run service and race the KDE session again.  Launch it
+  # once after OpenCode is healthy, then keep the service alive.
+  nohup chromium \
+    --no-first-run \
+    --no-default-browser-check \
+    --password-store=basic \
+    --disable-gpu \
+    --disable-dev-shm-usage \
+    --no-sandbox \
+    --app="http://127.0.0.1:${opencode_web_port}/${project_slug}/session" \
+    >/tmp/opencode-browser.log 2>&1 &
+  exec sleep infinity
+fi
+
+if command -v konsole >/dev/null 2>&1; then
+  exec konsole --workdir /config --hold -e /bin/bash -lc "$launch_cmd"
+fi
+
+if command -v x-terminal-emulator >/dev/null 2>&1; then
+  exec x-terminal-emulator -e /bin/bash -lc "$launch_cmd; exec /bin/bash"
+fi
+
+exec /bin/bash -lc "$launch_cmd"

@@ -1,0 +1,20 @@
+# syntax=docker/dockerfile:1.7
+# Rebuild only clawmanager-agent on top of an existing opencode-lite image.
+ARG BASE_IMAGE=ghcr.io/yuan-lab-llm/agentsruntime/opencode-lite:latest
+
+FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS clawmanager-agent-builder
+WORKDIR /src/clawmanager-agent
+ARG TARGETOS=linux
+ARG TARGETARCH
+ARG AGENT_VERSION=dev
+COPY clawmanager-agent ./
+RUN go mod download
+RUN set -eux; \
+    arch="${TARGETARCH:-amd64}"; \
+    CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${arch}" \
+      go build -trimpath -ldflags="-s -w -X main.version=${AGENT_VERSION}" \
+      -o /out/clawmanager-agent ./cmd/clawmanager-agent
+
+FROM ${BASE_IMAGE}
+COPY --from=clawmanager-agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent
+RUN chmod 755 /usr/local/bin/clawmanager-agent

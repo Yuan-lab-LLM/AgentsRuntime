@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+project="${CLAWMANAGER_PROJECT_PATH:-/config/workspace}"
+mkdir -p "$project"
+# A stale Codex OAuth session must never take precedence over the per-instance
+# gateway token. The generated config selects the clawmanager provider.
+exec konsole --noclose -e bash -lc "cd '$project'; unset CODEX_API_KEY OPENAI_API_KEY; export OPENAI_BASE_URL='${CLAWMANAGER_LLM_BASE_URL%/}/v1' OPENAI_API_BASE='${CLAWMANAGER_LLM_BASE_URL%/}/v1' OPENAI_API_KEY='${CLAWMANAGER_LLM_API_KEY:-}' OPENAI_MODEL='${OPENAI_MODEL:-auto}'; exec codex"
