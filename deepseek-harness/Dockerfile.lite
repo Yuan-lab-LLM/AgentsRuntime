@@ -1,0 +1,70 @@
+# syntax=docker/dockerfile:1.7
+
+FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS clawmanager-agent-builder
+
+WORKDIR /src/clawmanager-agent
+
+ARG TARGETOS=linux
+ARG TARGETARCH
+ARG AGENT_VERSION=dev
+
+COPY clawmanager-agent ./
+RUN go mod download
+RUN set -eux; \
+    arch="${TARGETARCH:-amd64}"; \
+    CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${arch}" \
+      go build -trimpath -ldflags="-s -w -X main.version=${AGENT_VERSION}" \
+      -o /out/clawmanager-agent ./cmd/clawmanager-agent
+
+FROM node:22-bookworm-slim@sha256:53ada149d435c38b14476cb57e4a7da73c15595aba79bd6971b547ceb6d018bf
+
+ARG DSH_VERSION=0.1.0-rc.6
+ARG DEBIAN_FRONTEND=noninteractive
+
+ENV CLAWMANAGER_RUNTIME_TYPE=deepseek-harness \
+    RUNTIME_WORKSPACE_ROOT=/workspaces \
+    RUNTIME_AGENT_DATA_DIR=/var/lib/clawmanager-agent \
+    RUNTIME_GATEWAY_COMMAND=/usr/local/bin/start-deepseek-harness-gateway \
+    DSH_TELEMETRY_DISABLED=1
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      bash \
+      build-essential \
+      ca-certificates \
+      curl \
+      git \
+      jq \
+      openssh-client \
+      python3 \
+      python3-pip \
+      ripgrep \
+      tini \
+      unzip; \
+    rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    npm install --global "@deepseek-ai/dsh@${DSH_VERSION}"; \
+    dsh --version; \
+    npm cache clean --force
+
+COPY --from=clawmanager-agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent
+COPY deepseek-harness/config/managed.cordis.patch.yml /usr/local/share/deepseek-harness/managed.cordis.patch.yml
+COPY deepseek-harness/scripts/start-deepseek-harness-gateway /usr/local/bin/start-deepseek-harness-gateway
+COPY deepseek-harness/scripts/deepseek-harness-lite-entrypoint /usr/local/bin/deepseek-harness-lite-entrypoint
+
+RUN set -eux; \
+    sed -i 's/\r$//' \
+      /usr/local/bin/start-deepseek-harness-gateway \
+      /usr/local/bin/deepseek-harness-lite-entrypoint; \
+    chmod 0755 \
+      /usr/local/bin/clawmanager-agent \
+      /usr/local/bin/start-deepseek-harness-gateway \
+      /usr/local/bin/deepseek-harness-lite-entrypoint; \
+    mkdir -p /var/lib/clawmanager-agent /workspaces; \
+    chmod 0755 /var/lib/clawmanager-agent /workspaces
+
+EXPOSE 19090 20300-20399
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/deepseek-harness-lite-entrypoint"]
