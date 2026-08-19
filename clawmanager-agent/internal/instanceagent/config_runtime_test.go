@@ -10,8 +10,8 @@ func TestLoadConfigUsesManagedRuntimeIdentity(t *testing.T) {
 		runtimeType string
 		command     string
 	}{
-		{runtimeType: "codex", command: "codex"},
-		{runtimeType: "claude-code", command: "claude"},
+		{runtimeType: "opencode", command: "opencode"},
+		{runtimeType: "hermes", command: "hermes"},
 	} {
 		t.Run(testCase.runtimeType, func(t *testing.T) {
 			t.Setenv("CLAWMANAGER_AGENT_ENABLED", "true")

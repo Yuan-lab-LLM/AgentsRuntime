@@ -84,7 +84,7 @@ func managedRuntimeType() string {
 		value = strings.ToLower(strings.TrimSpace(os.Getenv("CLAWMANAGER_RUNTIME_TYPE")))
 	}
 	switch value {
-	case "opencode", "codex", "claude-code", "hermes":
+	case "opencode", "hermes":
 		return value
 	default:
 		return "hermes"
@@ -95,10 +95,6 @@ func runtimeDefaults(runtimeType string) (command, skillDirs string) {
 	switch runtimeType {
 	case "opencode":
 		return "opencode", "/config/.opencode/skills"
-	case "codex":
-		return "codex", "/config/.codex/skills"
-	case "claude-code":
-		return "claude", "/config/.claude/skills"
 	default:
 		return "hermes", "/config/hermes/skills:/config/.hermes/skills"
 	}

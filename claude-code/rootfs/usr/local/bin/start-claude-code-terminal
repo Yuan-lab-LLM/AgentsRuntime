@@ -1,7 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-project="${CLAWMANAGER_PROJECT_PATH:-/config/workspace}"
-mkdir -p "$project"
-# Do not let credentials left by `claude login` override the injected instance
-# token. Claude Code will use the Messages endpoint configured below.
-exec konsole --noclose -e bash -lc "cd '$project'; unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY; export ANTHROPIC_BASE_URL='${CLAWMANAGER_LLM_BASE_URL:-}' ANTHROPIC_AUTH_TOKEN='${CLAWMANAGER_LLM_API_KEY:-}' ANTHROPIC_MODEL='${ANTHROPIC_MODEL:-${OPENAI_MODEL:-auto}}' CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1 DISABLE_AUTOUPDATER=1; exec claude"

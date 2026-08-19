@@ -60,8 +60,6 @@ jobs:
             "openclaw-shell|.|./openclaw-shell/Dockerfile|openclaw-shell"
             "opencode|.|./opencode/Dockerfile|opencode"
             "opencode-lite|.|./opencode/Dockerfile|opencode-lite"
-            "codex|.|./codex/Dockerfile|codex"
-            "claude-code|.|./claude-code/Dockerfile|claude-code"
           )
 
           entries=()
