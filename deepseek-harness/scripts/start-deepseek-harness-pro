@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export DSH_HOME="${DSH_HOME:-/config/.dsh}"
+export DSH_BIND_HOST="127.0.0.1"
+export DSH_TELEMETRY_DISABLED="${DSH_TELEMETRY_DISABLED:-1}"
+mkdir -p "${DSH_HOME}" "${DSH_HOME}/skills" /config/workspace
+cd /config/workspace
+
+exec dsh web \
+  --patch /usr/local/share/deepseek-harness/managed.cordis.patch.yml \
+  --port 3080

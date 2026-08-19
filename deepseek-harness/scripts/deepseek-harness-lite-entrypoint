@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+umask "${CLAWMANAGER_TEAM_UMASK:-0002}"
+agent_data_dir="${RUNTIME_AGENT_DATA_DIR:-/var/lib/clawmanager-agent}"
+workspace_root="${RUNTIME_WORKSPACE_ROOT:-/workspaces}"
+mkdir -p "${agent_data_dir}" "${workspace_root}"
+
+if [ -z "${RUNTIME_AGENT_CONTROL_TOKEN:-}" ] && [ -z "${RUNTIME_AGENT_REPORT_TOKEN:-}" ]; then
+  echo "ClawManager DeepSeek Harness Lite runtime agent disabled"
+  exec sleep infinity
+fi
+
+exec /usr/local/bin/clawmanager-agent

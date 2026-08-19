@@ -1,3 +1,4 @@
 *.sh text eol=lf
+deepseek-harness/scripts/* text eol=lf
 hermes/rootfs/usr/local/bin/hermes-apply-runtime-config text eol=lf
 hermes/rootfs/usr/local/bin/start-hermes-dashboard-gateway text eol=lf

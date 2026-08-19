@@ -11,6 +11,8 @@ The repository currently documents these runtime images:
 - `openclaw-shell`
 - `opencode`
 - `opencode-lite`
+- `deepseek-harness`
+- `deepseek-harness-lite`
 - `windows-vm`
 
 ## Repository layout
@@ -21,6 +23,7 @@ The repository currently documents these runtime images:
 - `openclaw-lite`: lite OpenClaw runtime image, built from the repository root with `openclaw/Dockerfile.openclaw`
 - `openclaw-shell/`: Alpine-based OpenClaw shell runtime image, built from the repository root so it can reuse the OpenClaw agent implementation under `openclaw/`
 - `opencode/`: OpenCode Lite/Pro runtime image (official `opencode web` + shared `clawmanager-agent/`)
+- `deepseek-harness/`: DeepSeek Harness Lite and Pro runtime images plus their managed configuration and startup scripts
 - `windows-vm/`: Windows VM runtime wrapper around `dockurr/windows`, built from the repository root so it can include the shared `clawmanager-agent/`
 - `clawmanager-agent/`: shared managed-runtime agent used by runtime images that need ClawManager runtime gateway control
 
@@ -98,6 +101,31 @@ docker build \
 
 Lite and Pro share the same Dockerfile. Tag as `opencode-lite` for Runtime Pod Agent V2 (`opencode web` via CreateGateway) and `opencode` for dedicated Webtop Pro. OpenCode is pinned via `OPENCODE_VERSION` (default `1.18.13`).
 
+### DeepSeek Harness Lite
+
+```bash
+docker build \
+  -f deepseek-harness/Dockerfile.lite \
+  -t deepseek-harness-lite:local \
+  .
+```
+
+This is a pooled headless runtime. The shared agent starts one isolated
+DeepSeek Harness Web gateway per assigned instance and persists its state in
+the instance workspace under `home/.dsh`.
+
+### DeepSeek Harness Pro
+
+```bash
+docker build \
+  -f deepseek-harness/Dockerfile.pro \
+  -t deepseek-harness:local \
+  .
+```
+
+This is a dedicated Webtop runtime. DeepSeek Harness listens on loopback port
+`3080`, while the desktop remains exposed through the inherited Webtop service.
+
 ### Windows VM
 
 ```bash
@@ -162,6 +190,28 @@ docker buildx build \
   --platform linux/amd64,linux/arm64 \
   -f openclaw-shell/Dockerfile \
   -t <registry>/openclaw-shell:latest \
+  --push \
+  .
+```
+
+### DeepSeek Harness Lite
+
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -f deepseek-harness/Dockerfile.lite \
+  -t <registry>/deepseek-harness-lite:latest \
+  --push \
+  .
+```
+
+### DeepSeek Harness Pro
+
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -f deepseek-harness/Dockerfile.pro \
+  -t <registry>/deepseek-harness:latest \
   --push \
   .
 ```

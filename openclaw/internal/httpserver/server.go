@@ -2,13 +2,16 @@ package httpserver
 
 import (
 	"context"
+	"html"
 	"net/http"
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	appconfig "github.com/iamlovingit/clawmanager-openclaw-image/internal/config"
 	"github.com/iamlovingit/clawmanager-openclaw-image/internal/openclawinspector"
 	"github.com/iamlovingit/clawmanager-openclaw-image/internal/process"
 	"github.com/iamlovingit/clawmanager-openclaw-image/internal/profiler"
@@ -21,7 +24,7 @@ type Server struct {
 
 const openClawWaitWarmupTimeout = 30 * time.Second
 
-func New(bind string, proc *process.Manager, prof *profiler.Profiler, inspector *openclawinspector.Inspector, st *store.Store) *Server {
+func New(cfg appconfig.Config, proc *process.Manager, prof *profiler.Profiler, inspector *openclawinspector.Inspector, st *store.Store) *Server {
 	router := gin.New()
 	router.Use(gin.Recovery())
 
@@ -52,17 +55,23 @@ func New(bind string, proc *process.Manager, prof *profiler.Profiler, inspector 
 		})
 	})
 
-	router.GET("/openclaw-wait", func(c *gin.Context) {
+	waitPageHandler := func(c *gin.Context) {
 		target := c.Query("target")
+		if target == "" {
+			target = cfg.BrowserURL
+		}
 		if target == "" {
 			target = "http://localhost:18789"
 		}
-		c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(openClawWaitPage(target)))
-	})
+		c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(runtimeWaitPage(target, cfg.RuntimeType, cfg.RuntimeName)))
+	}
+	router.GET("/runtime-wait", waitPageHandler)
+	// Keep the original route for already-running images and saved browser tabs.
+	router.GET("/openclaw-wait", waitPageHandler)
 
-	router.GET("/openclaw-wait/ready", func(c *gin.Context) {
+	waitReadyHandler := func(c *gin.Context) {
 		snapshot := proc.Snapshot()
-		ready := openClawWaitReady(snapshot)
+		ready := runtimeWaitReady(snapshot)
 		c.JSON(http.StatusOK, gin.H{
 			"ready":                  ready,
 			"status":                 snapshot.Status,
@@ -72,7 +81,9 @@ func New(bind string, proc *process.Manager, prof *profiler.Profiler, inspector 
 			"operation":              snapshot.LastOperation,
 			"operation_log":          snapshot.LastOperationResult,
 		})
-	})
+	}
+	router.GET("/runtime-wait/ready", waitReadyHandler)
+	router.GET("/openclaw-wait/ready", waitReadyHandler)
 
 	router.GET("/debug/state", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
@@ -93,30 +104,39 @@ func New(bind string, proc *process.Manager, prof *profiler.Profiler, inspector 
 
 	return &Server{
 		srv: &http.Server{
-			Addr:              bind,
+			Addr:              cfg.LocalHTTPBind,
 			Handler:           router,
 			ReadHeaderTimeout: 5 * time.Second,
 		},
 	}
 }
 
-func openClawWaitReady(snapshot process.Snapshot) bool {
+func runtimeWaitReady(snapshot process.Snapshot) bool {
 	return snapshot.Status == process.StatusRunning || snapshot.GatewayWarmupStarted || snapshot.GatewayWarmupReady
 }
 
-func openClawWaitPage(target string) string {
-	if gatewayToken := os.Getenv("OPENCLAW_GATEWAY_TOKEN"); gatewayToken != "" {
+func runtimeWaitPage(target, runtimeType, runtimeName string) string {
+	isOpenClaw := strings.EqualFold(strings.TrimSpace(runtimeType), "openclaw")
+	if gatewayToken := os.Getenv("OPENCLAW_GATEWAY_TOKEN"); isOpenClaw && gatewayToken != "" {
 		// Keep the token server-side until the wait page is rendered. Do not
 		// attach it to the wait-page query string or browser launch arguments.
 		target = "http://localhost:18789/#token=" + url.QueryEscape(gatewayToken)
 	}
+	displayName := strings.TrimSpace(runtimeName)
+	if displayName == "" {
+		displayName = strings.TrimSpace(runtimeType)
+	}
+	if displayName == "" {
+		displayName = "Runtime"
+	}
+	displayName = html.EscapeString(displayName)
 
 	return `<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>OpenClaw</title>
+  <title>` + displayName + `</title>
   <style>
     html, body { height: 100%; margin: 0; }
     body {
@@ -146,19 +166,24 @@ func openClawWaitPage(target string) string {
 </head>
 <body>
   <main>
-    <h1>&#27491;&#22312;&#21551;&#21160;&#40857;&#34430;</h1>
+    <h1>&#27491;&#22312;&#21551;&#21160; ` + displayName + `</h1>
     <p id="status">&#21518;&#21488;&#26381;&#21153;&#20934;&#22791;&#20013;&#65292;&#35831;&#31245;&#20505;&#12290;</p>
     <div class="bar"></div>
   </main>
   <script>
     const target = ` + strconv.Quote(target) + `;
+    const runtimeRequiresWarmup = ` + strconv.FormatBool(isOpenClaw) + `;
     const warmupWaitMs = ` + strconv.FormatInt(openClawWaitWarmupTimeout.Milliseconds(), 10) + `;
     let gatewayReadyAt = 0;
     async function check() {
       try {
-        const resp = await fetch("/openclaw-wait/ready", { cache: "no-store" });
+        const resp = await fetch("/runtime-wait/ready", { cache: "no-store" });
         const data = await resp.json();
         if (data.ready) {
+          if (!runtimeRequiresWarmup) {
+            location.replace(target);
+            return;
+          }
           if (gatewayReadyAt === 0) {
             gatewayReadyAt = Date.now();
           }

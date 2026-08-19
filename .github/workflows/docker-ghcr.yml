@@ -1,6 +1,15 @@
 name: Build and push runtime images
 
 "on":
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/docker-ghcr.yml"
+      - ".dockerignore"
+      - "clawmanager-agent/**"
+      - "deepseek-harness/**"
+      - "openclaw/**"
   workflow_dispatch:
     inputs:
       image_namespace:
@@ -60,7 +69,19 @@ jobs:
             "openclaw-shell|.|./openclaw-shell/Dockerfile|openclaw-shell"
             "opencode|.|./opencode/Dockerfile|opencode"
             "opencode-lite|.|./opencode/Dockerfile|opencode-lite"
+            "deepseek-harness|.|./deepseek-harness/Dockerfile.pro|deepseek-harness"
+            "deepseek-harness-lite|.|./deepseek-harness/Dockerfile.lite|deepseek-harness-lite"
           )
+
+          # Dependency changes on the default branch automatically publish only
+          # the two DeepSeek Harness variants. A manual dispatch keeps the
+          # existing behavior and publishes every runtime in the matrix.
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            specs=(
+              "deepseek-harness|.|./deepseek-harness/Dockerfile.pro|deepseek-harness"
+              "deepseek-harness-lite|.|./deepseek-harness/Dockerfile.lite|deepseek-harness-lite"
+            )
+          fi
 
           entries=()
           for spec in "${specs[@]}"; do

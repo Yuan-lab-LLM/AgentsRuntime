@@ -7,26 +7,26 @@ import (
 	"github.com/iamlovingit/clawmanager-openclaw-image/internal/process"
 )
 
-func TestOpenClawWaitReadyDoesNotRequireGatewayWarmup(t *testing.T) {
-	if !openClawWaitReady(process.Snapshot{Status: process.StatusRunning, GatewayWarmupReady: false}) {
+func TestRuntimeWaitReadyDoesNotRequireGatewayWarmup(t *testing.T) {
+	if !runtimeWaitReady(process.Snapshot{Status: process.StatusRunning, GatewayWarmupReady: false}) {
 		t.Fatal("running gateway should release wait page even while models warmup continues")
 	}
 }
 
-func TestOpenClawWaitReadyDoesNotReleaseStartingGateway(t *testing.T) {
-	if openClawWaitReady(process.Snapshot{Status: process.StatusStarting}) {
+func TestRuntimeWaitReadyDoesNotReleaseStartingGateway(t *testing.T) {
+	if runtimeWaitReady(process.Snapshot{Status: process.StatusStarting}) {
 		t.Fatal("starting gateway should not release wait page before gateway readiness promotion")
 	}
 }
 
-func TestOpenClawWaitReadyReleasesWhenWarmupStarted(t *testing.T) {
-	if !openClawWaitReady(process.Snapshot{Status: process.StatusStarting, GatewayWarmupStarted: true}) {
+func TestRuntimeWaitReadyReleasesWhenWarmupStarted(t *testing.T) {
+	if !runtimeWaitReady(process.Snapshot{Status: process.StatusStarting, GatewayWarmupStarted: true}) {
 		t.Fatal("started warmup should release wait page into bounded warmup wait")
 	}
 }
 
-func TestOpenClawWaitPageStartsWarmupTimeoutAfterGatewayReady(t *testing.T) {
-	page := openClawWaitPage("http://localhost:18789")
+func TestRuntimeWaitPageStartsWarmupTimeoutAfterGatewayReady(t *testing.T) {
+	page := runtimeWaitPage("http://localhost:18789", "openclaw", "OpenClaw")
 	if !strings.Contains(page, "let gatewayReadyAt = 0") {
 		t.Fatal("wait page should track when the gateway first becomes ready")
 	}
@@ -38,10 +38,10 @@ func TestOpenClawWaitPageStartsWarmupTimeoutAfterGatewayReady(t *testing.T) {
 	}
 }
 
-func TestOpenClawWaitPageUsesServerSideGatewayToken(t *testing.T) {
+func TestRuntimeWaitPageUsesServerSideGatewayTokenForOpenClaw(t *testing.T) {
 	t.Setenv("OPENCLAW_GATEWAY_TOKEN", "token /?+&=")
 
-	page := openClawWaitPage("https://untrusted.example.invalid/")
+	page := runtimeWaitPage("https://untrusted.example.invalid/", "openclaw", "OpenClaw")
 	wantTarget := `const target = "http://localhost:18789/#token=token+%2F%3F%2B%26%3D";`
 	if !strings.Contains(page, wantTarget) {
 		t.Fatal("wait page target does not contain URL-encoded server token")
@@ -54,14 +54,35 @@ func TestOpenClawWaitPageUsesServerSideGatewayToken(t *testing.T) {
 	}
 }
 
-func TestOpenClawWaitPageWithoutGatewayTokenKeepsOriginalTarget(t *testing.T) {
+func TestRuntimeWaitPageWithoutGatewayTokenKeepsOriginalTarget(t *testing.T) {
 	t.Setenv("OPENCLAW_GATEWAY_TOKEN", "")
 
-	page := openClawWaitPage("http://localhost:18789/workspace")
+	page := runtimeWaitPage("http://localhost:18789/workspace", "openclaw", "OpenClaw")
 	if !strings.Contains(page, `const target = "http://localhost:18789/workspace";`) {
 		t.Fatal("wait page should keep the original target when no gateway token is configured")
 	}
 	if strings.Contains(page, "#token=") {
 		t.Fatal("wait page should not add a token fragment when no gateway token is configured")
+	}
+}
+
+func TestRuntimeWaitPageKeepsDeepSeekTargetAndBranding(t *testing.T) {
+	t.Setenv("OPENCLAW_GATEWAY_TOKEN", "openclaw-secret")
+
+	page := runtimeWaitPage("http://127.0.0.1:3080", "deepseek-harness", "DeepSeek Harness Pro")
+	if !strings.Contains(page, `const target = "http://127.0.0.1:3080";`) {
+		t.Fatal("DeepSeek wait page should keep the configured runtime target")
+	}
+	if strings.Contains(page, "#token=") || strings.Contains(page, "localhost:18789") {
+		t.Fatal("DeepSeek wait page should not use the OpenClaw gateway target or token")
+	}
+	if !strings.Contains(page, "<title>DeepSeek Harness Pro</title>") {
+		t.Fatal("DeepSeek wait page should use the configured runtime name")
+	}
+	if strings.Contains(page, "<title>OpenClaw</title>") || strings.Contains(page, "&#40857;&#34430;") {
+		t.Fatal("DeepSeek wait page should not contain OpenClaw branding")
+	}
+	if !strings.Contains(page, "const runtimeRequiresWarmup = false;") {
+		t.Fatal("DeepSeek wait page should redirect as soon as the runtime is ready")
 	}
 }

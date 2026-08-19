@@ -1,0 +1,40 @@
+instance_id: ""
+bootstrap_token: ""
+control_plane_base_url: ""
+runtime_type: deepseek-harness
+runtime_name: DeepSeek Harness Pro
+desktop_base: webtop
+runtime_port: 3080
+agent_data_dir: /var/lib/openclaw-agent
+initial_config_revision_id: ""
+protocol_version: v1
+local_http_bind: 0.0.0.0:18080
+log_file_path: /var/log/openclaw-agent/agent.log
+openclaw_command:
+  - /usr/local/bin/start-deepseek-harness-pro
+openclaw_doctor_command:
+  - /bin/true
+openclaw_doctor_policy: auto
+startup_notification_message: DeepSeek Harness is starting
+startup_repair_notification_message: DeepSeek Harness is recovering
+# The reused supervisor validates an OpenClaw-shaped JSON file before starting
+# its managed command. The Webtop seed already places this compatibility file
+# on every fresh /config volume; DSH itself keeps its settings under DSH_HOME.
+openclaw_config_path: /config/.dsh/openclaw.json
+openclaw_workspace_path: /config/workspace
+openclaw_skills_path: /config/.dsh/skills
+openclaw_health_url: http://127.0.0.1:3080/
+openclaw_startup_health_timeout: 120s
+heartbeat_interval: 15s
+state_report_interval: 45s
+command_poll_interval: 5s
+command_poll_backoff_max: 60s
+register_retry_interval: 10s
+process_stop_timeout: 20s
+skill_incremental_interval: 30s
+skill_full_sync_interval: 12h
+max_auto_restart: 3
+browser_executable: /usr/local/bin/wrapped-chromium
+browser_url: http://127.0.0.1:3080
+browser_auto_launch_enabled: true
+browser_launch_extra_delay: 5s

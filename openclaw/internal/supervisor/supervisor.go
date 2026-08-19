@@ -69,7 +69,7 @@ func New(cfg appconfig.Config) (*Supervisor, error) {
 	configManager := configmanager.New(cfg, client, st)
 	skillManager := skills.New(cfg, client, st)
 	executor := command.New(client, proc, prof, configManager, skillManager, st)
-	httpServer := httpserver.New(cfg.LocalHTTPBind, proc, prof, inspector, st)
+	httpServer := httpserver.New(cfg, proc, prof, inspector, st)
 
 	return &Supervisor{
 		cfg:       cfg,

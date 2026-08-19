@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+gateway_port="${CLAWMANAGER_GATEWAY_PORT:-${PORT:-}}"
+case "${gateway_port}" in
+  ''|*[!0-9]*)
+    echo "CLAWMANAGER_GATEWAY_PORT must be a numeric port" >&2
+    exit 2
+    ;;
+esac
+if [ "${gateway_port}" -lt 1 ] || [ "${gateway_port}" -gt 65535 ]; then
+  echo "CLAWMANAGER_GATEWAY_PORT is outside 1-65535" >&2
+  exit 2
+fi
+
+export DSH_HOME="${DSH_HOME:-${HOME:-/tmp}/.dsh}"
+export DSH_BIND_HOST="${DSH_BIND_HOST:-0.0.0.0}"
+export DSH_TELEMETRY_DISABLED="${DSH_TELEMETRY_DISABLED:-1}"
+mkdir -p "${DSH_HOME}" "${DSH_HOME}/skills"
+
+# Runtime-agent credentials belong to the supervisor, not the DSH child.
+unset RUNTIME_AGENT_CONTROL_TOKEN RUNTIME_AGENT_REPORT_TOKEN
+unset CLAWMANAGER_AGENT_CONTROL_TOKEN CLAWMANAGER_AGENT_REPORT_TOKEN
+
+exec dsh web \
+  --patch /usr/local/share/deepseek-harness/managed.cordis.patch.yml \
+  --port "${gateway_port}"
