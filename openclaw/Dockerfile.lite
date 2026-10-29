@@ -1,0 +1,136 @@
+# syntax=docker/dockerfile:1.7
+# Build from the AgentsRuntime repository root; the runtime composes the shared core.
+FROM --platform=$BUILDPLATFORM golang:1.26.8-bookworm@sha256:9fdc884aacc3bec89b20ffc69f4bb369c78210e3e4f600387b5128b12c199f81 AS agent-builder
+ARG TARGETOS=linux
+ARG TARGETARCH
+ARG AGENT_VERSION=dev
+COPY clawmanager-agent/ /src/clawmanager-agent/
+COPY openclaw/ /src/openclaw/
+WORKDIR /src/openclaw
+RUN go mod download
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH:-amd64} \
+    go build -trimpath -ldflags="-s -w -X main.version=${AGENT_VERSION}" \
+    -o /out/clawmanager-agent ./cmd/openclaw-lite-agent
+
+FROM node:24.21.0-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20 AS node-runtime
+
+RUN test "$(node --version)" = "v24.21.0"
+COPY openclaw/openclaw102.lock.json /pinned/openclaw102.lock.json
+COPY openclaw/scripts/install-pinned-openclaw.mjs /pinned/scripts/install-pinned-openclaw.mjs
+RUN node /pinned/scripts/install-pinned-openclaw.mjs
+
+FROM node-runtime
+ARG DEBIAN_FRONTEND=noninteractive
+ENV CLAWMANAGER_RUNTIME_TYPE=openclaw \
+    CLAWMANAGER_OPENCLAW_VERSION=2026.10.2 \
+    RUNTIME_WORKSPACE_ROOT=/workspaces \
+    RUNTIME_AGENT_DATA_DIR=/var/lib/clawmanager-agent
+LABEL io.clawmanager.runtime.type="openclaw" \
+    io.clawmanager.openclaw.version="2026.10.2" \
+    io.clawmanager.upgrade.strategy="openclaw-sqlite-v1" \
+    io.clawmanager.upgrade.protocol="openclaw-upgrade-v3"
+# Chromium is headless gateway tooling. No display server or desktop services.
+# Compilers, Python and npm support user tasks and native plugin installs.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash bubblewrap build-essential ca-certificates chromium curl fonts-liberation \
+    git iproute2 jq nftables openssh-client procps python3 python3-pip ripgrep tini unzip util-linux xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY openclaw/patches/ /usr/local/share/openclaw/patches/
+RUN node /usr/local/share/openclaw/patches/test_managed_proxy_policy.mjs \
+    && node /usr/local/share/openclaw/patches/patch_managed_proxy_policy.mjs --patch --install-marker \
+    && node /usr/local/share/openclaw/patches/test_managed_proxy_auth_snapshot_102.mjs \
+    && node /usr/local/share/openclaw/patches/test_managed_browser_snapshot_102.mjs \
+    && node /usr/local/share/openclaw/patches/test_managed_proxy_metadata.mjs
+
+# NFS no-replace fallback must settle its own open temporary name before the
+# unchanged final hardlink/identity checks. Verify the installed dependency.
+RUN node /usr/local/share/openclaw/patches/patch_workspace_publication_102.mjs --patch \
+    && node /usr/local/share/openclaw/patches/patch_workspace_publication_102.mjs --verify \
+    && node /usr/local/share/openclaw/patches/test_workspace_publication_102.mjs \
+    && node /usr/local/share/openclaw/patches/test_upgrade_publication_102.mjs \
+    && node --check /usr/local/share/openclaw/patches/isolate_upgrade_plugin_metadata_102.mjs
+
+RUN node /usr/local/share/openclaw/patches/patch_upgrade_plugin_scratch_102.mjs --patch \
+    && node /usr/local/share/openclaw/patches/patch_upgrade_plugin_scratch_102.mjs --verify \
+    && node /usr/local/share/openclaw/patches/test_upgrade_plugin_scratch_102.mjs
+
+# 10.2 owns this repair upstream. Retain the legacy patch for 8.1 only and
+# verify the real Doctor path here instead of bypassing its migration gate.
+RUN node /usr/local/share/openclaw/patches/test_exec_approvals_doctor_migration.mjs
+
+RUN node /usr/local/share/openclaw/patches/patch_memory_core_startup_migration.mjs --patch \
+  && node /usr/local/share/openclaw/patches/patch_memory_core_startup_migration.mjs --verify \
+  && node /usr/local/share/openclaw/patches/test_memory_core_startup_migration.mjs
+
+# Native Tasks are retired in 10.2; ClawManager Team remains independent.
+
+RUN node /usr/local/share/openclaw/patches/patch_browser_proxy_navigation.mjs --patch \
+  && node /usr/local/share/openclaw/patches/patch_browser_proxy_navigation.mjs --verify \
+  && node /usr/local/share/openclaw/patches/test_browser_proxy_navigation.mjs \
+  && node /usr/local/share/openclaw/patches/test_browser_proxy_navigation_integration.mjs
+
+COPY plugins/openclaw-redis-team/ /tmp/openclaw-redis-team/
+COPY plugins/openclaw-redis-team/ /usr/local/lib/node_modules/openclaw/dist/extensions/redis-team/
+RUN mkdir -p /usr/local/lib/node_modules/openclaw/dist/extensions/redis-team/node_modules \
+  && ln -s /usr/local/lib/node_modules/openclaw /usr/local/lib/node_modules/openclaw/dist/extensions/redis-team/node_modules/openclaw
+# Seed the runtime template under /defaults so the first /config sync gets the
+# tracked OpenClaw config plus any files the image expects to manage.
+COPY openclaw/defaults-template/.openclaw /defaults/.openclaw
+COPY openclaw/config/openclaw-agent /defaults/openclaw-agent
+COPY --from=agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent
+COPY openclaw/scripts/install-openclaw-plugin /usr/local/bin/install-openclaw-plugin
+
+ENV CLAWMANAGER_REDIS_TEAM_PLUGIN_VERSION=0.3.1
+
+# Preinstall the DingTalk channel so its channel id validates before the
+# agent's first startup reconciliation.
+COPY openclaw/scripts/openclaw-lite-entrypoint /usr/local/bin/openclaw-lite-entrypoint
+RUN sed -i 's/\r$//' /usr/local/bin/install-openclaw-plugin /usr/local/bin/openclaw-lite-entrypoint \
+  && chmod 0755 /usr/local/bin/clawmanager-agent /usr/local/bin/install-openclaw-plugin /usr/local/bin/openclaw-lite-entrypoint \
+  && mkdir -p /tmp/openclaw-plugin-pack \
+  && cd /tmp/openclaw-redis-team \
+  && npm pack --pack-destination /tmp/openclaw-plugin-pack \
+  && redis_team_tgz="$(find /tmp/openclaw-plugin-pack -maxdepth 1 -name '*.tgz' -print -quit)" \
+  && test -n "${redis_team_tgz}" \
+  && if HOME=/defaults install-openclaw-plugin "${redis_team_tgz}" --force >/tmp/plugin-consent-negative.log 2>&1; then exit 1; fi \
+  && HOME=/defaults install-openclaw-plugin "${redis_team_tgz}" --force --accept-capabilities \
+  && HOME=/defaults install-openclaw-plugin @dingtalk-real-ai/dingtalk-connector@0.8.26 --force --accept-capabilities \
+  && HOME=/defaults install-openclaw-plugin @wecom/wecom-openclaw-plugin@2026.9.15 --force --accept-capabilities \
+  && HOME=/defaults install-openclaw-plugin @openclaw/feishu@2026.10.2 --force --accept-capabilities \
+  && cp /defaults/.openclaw/openclaw.json /tmp/openclaw-default.json \
+  && node /usr/local/share/openclaw/patches/test_redis_team_channel_config.mjs /defaults/.openclaw/openclaw.json \
+  && HOME=/defaults openclaw config validate \
+  && mv /tmp/openclaw-default.json /defaults/.openclaw/openclaw.json \
+  && HOME=/defaults openclaw config validate \
+  && cd / \
+  && rm -rf /tmp/openclaw-redis-team /tmp/openclaw-plugin-pack \
+  && chown -R root:root /defaults/.openclaw \
+  && chmod 0755 /defaults /defaults/.openclaw \
+  && chmod -R a+rX /defaults/.openclaw/npm \
+  && mkdir -p /defaults/.openclaw/npm/node_modules \
+  && ln -s /usr/local/lib/node_modules/openclaw /defaults/.openclaw/npm/node_modules/openclaw \
+  && for plugin_package in \
+    @dingtalk-real-ai/dingtalk-connector \
+    @openclaw/feishu \
+    @wecom/wecom-openclaw-plugin; do \
+      package_dir="$(find /defaults/.openclaw/npm/projects -path "*/node_modules/${plugin_package}" -type d -print -quit)"; \
+      test -n "${package_dir}"; \
+      chown -R root:root "${package_dir}"; \
+      legacy_dir="/defaults/.openclaw/npm/node_modules/${plugin_package}"; \
+      mkdir -p "$(dirname "${legacy_dir}")"; \
+      if [ ! -e "${legacy_dir}" ] && [ ! -L "${legacy_dir}" ]; then \
+        ln -s "${package_dir}" "${legacy_dir}"; \
+      fi; \
+      test -d "${legacy_dir}"; \
+      chown -h root:root "${legacy_dir}"; \
+    done \
+  && chown -h root:root /defaults/.openclaw/npm/node_modules/openclaw \
+  && node /usr/local/share/openclaw/patches/test_redis_team_plugin_hooks.mjs \
+  && node /usr/local/share/openclaw/patches/test_managed_plugin_payload_102.mjs --write-manifest \
+  && npm cache clean --force \
+  && rm -rf /root/.npm /tmp/plugin-consent-negative.log \
+  && mkdir -p /var/lib/openclaw-agent /var/lib/clawmanager-agent /var/log/openclaw-agent /etc/openclaw-agent /workspaces
+
+EXPOSE 19090 20000-20299
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/openclaw-lite-entrypoint"]

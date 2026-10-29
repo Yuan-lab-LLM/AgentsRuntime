@@ -11,6 +11,8 @@ try {
   const now = 100000;
   const config = { gateway: { trustedProxies: ['10.244.0.0/16'], allowRealIpFallback: true, auth: { mode: 'token' } }, agents: { keep: true } };
   assert.equal(withManagedProxyPolicy(config, {}, now), config);
+  assert.deepEqual(withManagedProxyPolicy(config, {CLAWMANAGER_NETWORK_ISOLATED:'1'}, now).gateway.trustedProxies, [], 'private network must deny when policy path is missing');
+  assert.throws(() => withManagedStartupPolicy(config, {CLAWMANAGER_NETWORK_ISOLATED:'1'}, now), /PROXY_POLICY_NOT_READY/);
   const verify = expected => {
     const result = withManagedProxyPolicy(config, env, now);
     assert.deepEqual(result.gateway.trustedProxies, expected);
@@ -24,6 +26,19 @@ try {
   assert.equal(withManagedStartupPolicy(config, {}, now), config, 'standalone/Pro is unchanged');
   const publish = (proxies, expires = now + 60000) => fs.writeFileSync(file, JSON.stringify({ contract: 1, proxies, expires_at_ms: expires }));
   publish(['10.244.166.131', '2001:db8::1']); verify(['10.244.166.131', '2001:db8::1']);
+  const isolatedEnv = {...env, CLAWMANAGER_NETWORK_ISOLATED: '1'};
+  assert.deepEqual(withManagedProxyPolicy(config, isolatedEnv, now).gateway.trustedProxies, ['127.0.0.1', '::1']);
+  const relayConfig = {...config, gateway: {...config.gateway, auth: {mode:'trusted-proxy', trustedProxy: {userHeader:'x-user', allowUsers:['instance-1']}}}};
+  const relay = withManagedProxyPolicy(relayConfig, isolatedEnv, now);
+  assert.equal(relay.gateway.auth.trustedProxy.allowLoopback, true, 'private authenticated ingress relay must be admitted by native auth');
+  assert.equal(relayConfig.gateway.auth.trustedProxy.allowLoopback, undefined, 'overlay must not mutate persisted config');
+  assert.equal(withManagedProxyPolicy(relayConfig, env, now).gateway.auth.trustedProxy.allowLoopback, undefined, 'legacy shared NET keeps native same-host rejection');
+  assert.deepEqual(relay.gateway.auth.trustedProxy.allowUsers, ['instance-1']);
+  assert.equal(withManagedProxyPolicy(relayConfig, isolatedEnv, now + 60000).gateway.auth.trustedProxy.allowLoopback, false, 'expired lease removes same-host admission');
+  assert.notEqual(withManagedProxyPolicy(relayConfig, env, now), relay, 'relay and legacy snapshots must never share auth overlays');
+  assert.deepEqual(withManagedProxyPolicy(config, env, now).gateway.trustedProxies, ['10.244.166.131', '2001:db8::1']);
+  assert.deepEqual(withManagedProxyPolicy(config, isolatedEnv, now + 60000).gateway.trustedProxies, []);
+  assert.throws(() => withManagedStartupPolicy(config, isolatedEnv, now + 60000), /PROXY_POLICY_NOT_READY/);
   const first = withManagedProxyPolicy(config, env, now);
   assert.equal(withManagedProxyPolicy(config, env, now), first, 'unchanged managed config must retain native snapshot identity');
   publish(['2001:db8::1', '10.244.166.131', '10.244.166.131'], now + 70000);

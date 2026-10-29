@@ -15,6 +15,7 @@ import stat
 import time
 import unicodedata
 import uuid
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1107,7 +1108,60 @@ async def _tool_team_artifact_mkdir(args: dict[str, Any], **_kwargs) -> str:
         return _team_tool_json_result(settings, "team_artifact_mkdir", {"ok": False, "error": str(exc)})
 
 
+class _NoPreviewRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _managed_preview_url(relative: str, mode: str) -> str:
+    try:
+        body = json.dumps({"path": relative, "mode": mode}).encode("utf-8")
+        if len(body) > 4096:
+            raise ValueError("request too large")
+        request = urllib.request.Request(
+            "http://clawmanager-local-services.invalid:31282/team/preview-sign",
+            data=body, headers={"Content-Type": "application/json"}, method="POST",
+        )
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoPreviewRedirect())
+        deadline = time.monotonic() + 5
+        with opener.open(request, timeout=5) as response:
+            chunks = []
+            size = 0
+            while True:
+                if time.monotonic() >= deadline:
+                    raise ValueError("response timeout")
+                # read1 performs at most one socket read; a drip feed cannot
+                # extend an unbounded read-all. Each socket wait is <=5s.
+                chunk = response.read1(8193 - size)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+                if size > 8192:
+                    raise ValueError("invalid response")
+            raw = b"".join(chunks)
+            if response.status != 200:
+                raise ValueError("invalid response")
+        grant = json.loads(raw)
+        parsed = urlparse(grant["url"])
+        labels = (parsed.hostname or "").split(".")
+        expires = datetime.fromisoformat(grant["expiresAt"].replace("Z", "+00:00")).timestamp()
+        if (parsed.scheme != "http" or len(labels) < 3 or labels[0] != "clawmanager-egress-proxy"
+                or not labels[1] or labels[2] != "svc" or parsed.username or parsed.password
+                or parsed.query or parsed.fragment or not parsed.path.startswith(f"/v3/{mode}/")
+                or grant["mode"] != mode or not time.time() < expires <= time.time() + 300):
+            raise ValueError("invalid grant")
+        return grant["url"]
+    except Exception:
+        # Do not expose response grants or transport internals through tool errors.
+        raise ValueError("Managed Team preview is unavailable") from None
+
+
 def _preview_url(settings: RedisTeamSettings, target: Path) -> str:
+    if (os.environ.get("CLAWMANAGER_NETWORK_ISOLATED") == "1"
+            or os.environ.get("CLAWMANAGER_MANAGED_SERVICES_URL", "").rstrip("/") == "http://clawmanager-local-services.invalid:31282"):
+        relative = canonical_artifact_ref(settings, target)[len("/team/"):]
+        return _managed_preview_url(relative, "interactive" if target.suffix.lower() == ".html" else "static")
     origin = settings.preview_origin.rstrip("/")
     parsed = urlparse(origin)
     hostname = (parsed.hostname or "").lower().rstrip(".")

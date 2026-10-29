@@ -53,6 +53,16 @@ replace(start,
   'const sharedGatewaySessionGenerationState = new SharedGatewaySessionGenerationState({\n\t\tcurrent: resolveCurrentSharedGatewaySessionGeneration(),\n\t\trequired: null,\n\t\t// CLAWMANAGER_MANAGED_SHARED_AUTH_V1\n\t\tbeforeRead: () => clawmanagerSyncManagedAuth({ state: sharedGatewaySessionGenerationState, resolveGeneration: resolveCurrentSharedGatewaySessionGeneration, capture: s => s.capture(), replaceOwned: (s, owner, next) => s.replace(owner, next), disconnect: clawmanagerDisconnectStaleAuth, clients: connectionState.clients })\n\t});',
   `import { synchronizeManagedSharedAuth as clawmanagerSyncManagedAuth, withManagedProxyPolicy as clawmanagerAuthProxyPolicy } from "./clawmanager-managed-proxy-policy.mjs";\nimport { n as clawmanagerDisconnectStaleAuth } from "${nativeModule}";\n`);
 replace(start, '}), config.gateway?.trustedProxies);', '}), clawmanagerAuthProxyPolicy(config).gateway?.trustedProxies);');
+// Native 10.2 prefers its committed secrets snapshot over getRuntimeConfig.
+// Overlay the read-only auth input at that boundary as well; never mutate the
+// secrets manager's owned snapshot or persist an ephemeral proxy exception.
+replace(start,
+  'authConfig: getActiveSecretsRuntimeConfigSnapshot()?.config.gateway?.auth ?? getRuntimeConfig().gateway?.auth,',
+  'authConfig: clawmanagerAuthProxyPolicy({ gateway: { auth: getActiveSecretsRuntimeConfigSnapshot()?.config.gateway?.auth ?? getRuntimeConfig().gateway?.auth } }).gateway?.auth,');
+replace(start,
+  'authConfig: config.gateway?.auth,',
+  'authConfig: clawmanagerAuthProxyPolicy(config).gateway?.auth,');
+
 // 10.2 also fences requests against the config reloader's committed snapshot,
 // deliberately separate from getRuntimeConfig(). Apply the ephemeral policy at
 // the auth capture boundary, not by replacing the reloader's writer-owned data.
@@ -61,6 +71,26 @@ replace(authPolicy,
   'function captureGatewayAuthPolicy(config, principal) {',
   'function captureGatewayAuthPolicy(config, principal) {\n\t// CLAWMANAGER_MANAGED_AUTH_POLICY_V1\n\tconfig = clawmanagerAuthProxyPolicy(config);',
   'import { withManagedProxyPolicy as clawmanagerAuthProxyPolicy } from "./clawmanager-managed-proxy-policy.mjs";\n');
+// The native Browser refresh prefers the writer-owned source snapshot. In an
+// isolated runtime that snapshot may lag the managed Browser configuration.
+// Both service startup and route refresh already share this reader; retain the
+// native lifecycle/fences and leave legacy source preference unchanged.
+const browserContext = find('server-context-', 'function loadBrowserConfigForRuntimeRefresh()');
+const browserNativeReader = 'function loadBrowserConfigForRuntimeRefresh() {\n\treturn getRuntimeConfigSourceSnapshot() ?? getRuntimeConfig();\n}';
+const browserSnapshotReader = 'function loadBrowserConfigForRuntimeRefresh() {\n\t// CLAWMANAGER_MANAGED_BROWSER_SNAPSHOT_V1\n\treturn process.env.CLAWMANAGER_NETWORK_ISOLATED === "1" ? getRuntimeConfig() : getRuntimeConfigSourceSnapshot() ?? getRuntimeConfig();\n}';
+// getRuntimeConfig() itself pins the active secrets runtime snapshot. The
+// native pin:false reader is needed to observe manager-published disk changes.
+// This browser-only reader never publishes or changes the auth-owned snapshot.
+const browserFreshReader = 'function loadBrowserConfigForRuntimeRefresh() {\n\t// CLAWMANAGER_MANAGED_BROWSER_UNPINNED_V2\n\treturn process.env.CLAWMANAGER_NETWORK_ISOLATED === "1" ? getRuntimeConfig({ pin: false }) : getRuntimeConfigSourceSnapshot() ?? getRuntimeConfig();\n}';
+replace(browserContext, fs.readFileSync(browserContext, 'utf8').includes(browserSnapshotReader) ? browserSnapshotReader : browserNativeReader, browserFreshReader);
+// The native SSRF guard rejects link-local broker addresses even when their
+// hostname is trusted. Derive a grant only for this exact CDP control endpoint;
+// the shared Browser navigation policy must retain its original semantics.
+const cdpPolicyModule = fs.readFileSync(browserContext, 'utf8').match(/from "(\.\/cdp-reachability-policy-[^"]+)";/)?.[1];
+if (!cdpPolicyModule) throw new Error('10.2 Browser CDP policy owner changed');
+replace(path.join(dist, cdpPolicyModule),
+  'function resolveCdpReachabilityPolicy(profile, ssrfPolicy) {',
+  'function resolveCdpReachabilityPolicy(profile, ssrfPolicy) {\n\t// CLAWMANAGER_MANAGED_CDP_BROKER_V1\n\tconst brokerHost = "clawmanager-local-services.invalid";\n\tif (process.env.CLAWMANAGER_NETWORK_ISOLATED === "1" && profile.cdpUrl === "http://clawmanager-local-services.invalid:31282" && profile.cdpHost === brokerHost && profile.cdpPort === 31282 && profile.driver === "openclaw" && profile.attachOnly === true && ssrfPolicy?.allowedHostnames?.includes(brokerHost)) {\n\t\tssrfPolicy = { ...ssrfPolicy, allowedHostnames: [brokerHost], hostnameAllowlist: [brokerHost], dangerouslyAllowPrivateNetwork: true };\n\t}');
 const helperPath = path.join(dist, 'clawmanager-managed-proxy-policy.mjs');
 if (patching) fs.writeFileSync(helperPath, helper);
 if (!fs.readFileSync(helperPath).equals(helper)) throw new Error('10.2 managed policy helper differs');

@@ -428,6 +428,33 @@ class BoundaryTests(unittest.TestCase):
         headers = [(b"origin", origin.encode())] if origin is not None else []
         return {"type": kind, "method": method, "client": (peer, 1234), "headers": headers + list(extra)}
 
+    def test_private_relay_requires_valid_policy_and_isolated_mode(self):
+        forwarded = [(b"x-forwarded-host", b"manager.example"), (b"x-forwarded-proto", b"https")]
+        with tempfile.TemporaryDirectory() as temporary:
+            file = Path(temporary) / "policy.json"
+            env = {"CLAWMANAGER_PROXY_POLICY_FILE": str(file), "CLAWMANAGER_PROXY_POLICY_NAMESPACE": "tenant", "CLAWMANAGER_NETWORK_ISOLATED": "1"}
+            with patch.dict(os.environ, env), patch.object(boundary.time, "time", return_value=100):
+                guard = boundary.LiteGatewayBoundary(None)
+                def publish(expires=160000, namespace="tenant"):
+                    file.write_text(json.dumps({"contract":1, "namespace":namespace, "proxies":["10.23.4.8"], "expires_at_ms":expires}))
+                publish()
+                for peer in ("127.0.0.1", "::1"):
+                    self.assertIsNone(guard.denial(self.scope(peer=peer, extra=forwarded)))
+                self.assertEqual("untrusted_gateway_peer", guard.denial(self.scope(extra=forwarded)))
+                publish(expires=100000)
+                self.assertEqual("untrusted_gateway_peer", guard.denial(self.scope(peer="127.0.0.1", extra=forwarded)))
+                publish(namespace="other")
+                self.assertEqual("untrusted_gateway_peer", guard.denial(self.scope(peer="127.0.0.1", extra=forwarded)))
+                file.write_text("{broken")
+                self.assertEqual("untrusted_gateway_peer", guard.denial(self.scope(peer="127.0.0.1", extra=forwarded)))
+                publish()
+                with patch.dict(os.environ, {"CLAWMANAGER_NETWORK_ISOLATED":"0"}):
+                    legacy=boundary.LiteGatewayBoundary(None)
+                    self.assertEqual("untrusted_gateway_peer", legacy.denial(self.scope(peer="127.0.0.1", extra=forwarded)))
+                    self.assertIsNone(legacy.denial(self.scope(extra=forwarded)))
+        with patch.dict(os.environ, {"CLAWMANAGER_NETWORK_ISOLATED":"1", "CLAWMANAGER_PROXY_POLICY_FILE":""}), self.assertRaises(RuntimeError):
+            boundary.LiteGatewayBoundary(None)
+
     def test_trusted_proxy_and_local_probe_are_accepted(self):
         self.assertIsNone(self.guard.denial(self.scope()))
         self.assertIsNone(self.guard.denial(self.scope(peer="127.0.0.1")))

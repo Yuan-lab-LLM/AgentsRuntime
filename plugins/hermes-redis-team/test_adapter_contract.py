@@ -761,6 +761,33 @@ class HermesRedisTeamContractTests(unittest.TestCase):
 
         asyncio.run(run_test())
 
+    def test_protected_preview_uses_fixed_bounded_service_without_legacy_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.settings(Path(tmp))
+            target = Path(tmp) / "site" / "index.html"
+            target.parent.mkdir(parents=True)
+            target.write_text("ok", encoding="utf-8")
+            grant = {"url": "http://clawmanager-egress-proxy.system.svc.cluster.local:3128/v3/interactive/42/_/opaque/index.html", "mode": "interactive", "expiresAt": "2099-01-01T00:00:00Z"}
+            from datetime import datetime, timedelta, timezone
+            grant["expiresAt"] = (datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat()
+            response = mock.MagicMock()
+            response.__enter__.return_value = response
+            response.status = 200
+            response.read1.side_effect = [json.dumps(grant).encode(), b""]
+            opener = mock.MagicMock()
+            opener.open.return_value = response
+            with mock.patch.dict(os.environ, {"CLAWMANAGER_NETWORK_ISOLATED": "1", "CLAWMANAGER_MANAGED_SERVICES_URL": "http://attacker.invalid", "HTTP_PROXY": "http://attacker.invalid"}), mock.patch("urllib.request.build_opener", return_value=opener):
+                self.assertEqual(adapter._preview_url(settings, target), grant["url"])
+                request = opener.open.call_args.args[0]
+                self.assertEqual(request.full_url, "http://clawmanager-local-services.invalid:31282/team/preview-sign")
+                self.assertEqual(json.loads(request.data), {"path": "site/index.html", "mode": "interactive"})
+                self.assertIsNone(request.get_header("Authorization"))
+                self.assertEqual(opener.open.call_args.kwargs["timeout"], 5)
+                self.assertEqual(response.read1.call_args_list[0], mock.call(8193))
+                opener.open.side_effect = OSError("unavailable")
+                with self.assertRaises(ValueError):
+                    adapter._preview_url(settings, target)
+
     def test_preview_uses_same_persistent_managed_url_contract_as_openclaw(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = self.settings(Path(tmp))

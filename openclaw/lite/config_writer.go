@@ -1,0 +1,1225 @@
+package openclaw
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+
+	"github.com/iamlovingit/clawmanager-agent/gateway"
+	"github.com/iamlovingit/clawmanager-agent/llmconfig"
+	"github.com/iamlovingit/clawmanager-agent/openclawcompat"
+)
+
+const openClawTrustedProxyUserHeader = "x-forwarded-prefix"
+const openClawTrustedProxyRequiredHeader = "x-forwarded-proto"
+const openClawTrustedProxyDefaultPassword = "9fb3edf4bf38bb834227d41fe9cc1196"
+const openClawAutoProviderName = "auto"
+const openClawRedisTeamPluginID = "redis-team"
+const openClawRedisTeamPluginPackage = "@clawmanager/openclaw-redis-team"
+const openClawRedisTeamPluginDirEnv = "CLAWMANAGER_OPENCLAW_REDIS_TEAM_PLUGIN_DIR"
+const openClawBrowserExecutablePath = "/usr/bin/chromium"
+const openClawBrowserProxyEnv = "CLAWMANAGER_BROWSER_PROXY_URL"
+const openClawManagedBrowserProfile = "openclaw"
+const openClawManagedBrowserColor = "#FF4500"
+const openClawChannelsEnv = "CLAWMANAGER_OPENCLAW_CHANNELS_JSON"
+
+var openClawDefaultDeniedNodeCommands = []string{
+	"camera.snap",
+	"camera.clip",
+	"screen.record",
+	"contacts.add",
+	"calendar.add",
+	"reminders.add",
+	"sms.send",
+}
+
+var openClawTrustedProxyDeviceScopes = []string{
+	"operator.read",
+	"operator.write",
+	"operator.approvals",
+	"operator.questions",
+}
+
+var openClawDefaultDisabledPlugins = []string{
+	"bonjour",
+	"talk-voice",
+	"device-pair",
+	"dingtalk-connector",
+	"wecom-openclaw-plugin",
+	"redis-team",
+	"a2a",
+	"workboard",
+}
+
+var openClawEnvManagedChannelPlugins = map[string][]string{
+	"dingtalk":              {"dingtalk-connector"},
+	"dingtalk-connector":    {"dingtalk-connector"},
+	"feishu":                {"feishu"},
+	"lark":                  {"feishu"},
+	"wecom":                 {"wecom-openclaw-plugin"},
+	"wecom-openclaw-plugin": {"wecom-openclaw-plugin"},
+}
+
+func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, workspacePath string, port int) error {
+	if port <= 0 {
+		return fmt.Errorf("invalid gateway port %d", port)
+	}
+	if port > 65533 {
+		return fmt.Errorf("invalid gateway port %d: managed OpenClaw Lite port block exceeds 65535", port)
+	}
+	if cfg.WorkspaceRoot != "" {
+		checked := req
+		checked.WorkspacePath = workspacePath
+		runtimeType := cfg.RuntimeType
+		if runtimeType == "" {
+			runtimeType = "openclaw"
+		}
+		if _, err := gateway.ValidateWorkspacePath(cfg.WorkspaceRoot, runtimeType, checked); err != nil {
+			return err
+		}
+	}
+	s, err := openOpenClawIO(workspacePath, cfg.WorkspaceRoot)
+	if err != nil {
+		return fmt.Errorf("open bounded OpenClaw workspace: %w", err)
+	}
+	defer s.Close()
+	if err := writeTeamConfig(cfg, req, workspacePath); err != nil {
+		return err
+	}
+	resolvedCfg, err := configWithRequestLLMEnv(cfg, req)
+	if err != nil {
+		return err
+	}
+	cfg = resolvedCfg
+
+	instancePaths, err := resolveOpenClawInstancePaths(req, workspacePath)
+	if err != nil {
+		return err
+	}
+	configPath := filepath.Join(instancePaths.Persistent, "openclaw.json")
+	if err := s.MkdirAll(filepath.Dir(configPath), 0o750); err != nil {
+		return fmt.Errorf("create openclaw config dir: %w", err)
+	}
+	if err := s.seedOpenClawPluginRuntime(req, instancePaths.Persistent); err != nil {
+		return err
+	}
+
+	config := map[string]any{}
+	if data, err := s.ReadFile(configPath); err == nil && len(data) > 0 {
+		if err := json.Unmarshal(data, &config); err != nil {
+			return fmt.Errorf("parse openclaw config: %w", err)
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("read openclaw config: %w", err)
+	}
+	openClawVersion := resolveOpenClawVersion(cfg, req)
+	configureManagedOpenClawBrowser(config, req, port)
+	mergeOpenClawLiteDefaults(config, openClawVersion)
+	reconcileOpenClawBrowserPlugin(config)
+	if err := mergeOpenClawChannelsFromRequest(config, req); err != nil {
+		return err
+	}
+
+	mergePlatformDefaults(config, port, openClawVersion)
+	agentDefaults := ensureObject(ensureObject(config, "agents"), "defaults")
+	agentDefaults["workspace"] = filepath.ToSlash(instancePaths.OpenClawWorkspace)
+	if teamEnabledFromRequest(req) {
+		if err := configureOpenClawRedisTeam(config, req, workspacePath); err != nil {
+			return err
+		}
+		if err := s.seedOpenClawRedisTeamPlugin(req, workspacePath); err != nil {
+			return err
+		}
+		if IsOpenClawAtLeast(openClawVersion, "2026.10.2") {
+			legacyTarget := filepath.Join(instancePaths.Persistent, "extensions", openClawRedisTeamPluginID)
+			// The synchronizer deliberately preserves an unrecognized extension.
+			// Do not silently override that user-owned implementation either.
+			if s.validateRedisTeamPlugin(legacyTarget, false) == nil {
+				if err := selectBundledRedisTeamPlugin(config); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	gatewayConfig := ensureObject(config, "gateway")
+	auth := ensureObject(gatewayConfig, "auth")
+	basePath := "/api/v1/instances/" + strconv.Itoa(req.InstanceID) + "/proxy"
+	if cfg.GatewayAuthMode == "token" {
+		auth["mode"] = "token"
+	} else {
+		auth["mode"] = "trusted-proxy"
+		delete(auth, "token")
+		if managedPassword, managed := managedOpenClawGatewayPassword(req); managed {
+			// ClawManager-managed Lite instances use the same per-instance
+			// credential for the Gateway process and its local Browser client.
+			// Reconcile persisted legacy values here so a recreated instance
+			// cannot start the two sides with different passwords.
+			auth["password"] = managedPassword
+		} else if strings.TrimSpace(configStringValue(auth["password"])) == "" {
+			auth["password"] = openClawTrustedProxyDefaultPassword
+		}
+		trustedProxy := ensureObject(auth, "trustedProxy")
+		trustedProxy["userHeader"] = openClawTrustedProxyUserHeader
+		trustedProxy["requiredHeaders"] = []string{openClawTrustedProxyRequiredHeader}
+		trustedProxy["allowUsers"] = []string{basePath}
+		if IsOpenClawAtLeast(openClawVersion, OpenClaw81Version) {
+			// OpenClaw 8.1 retired dangerouslyDisableDeviceAuth. Enroll only
+			// browser devices that have already passed ClawManager's
+			// instance-scoped trusted-proxy authentication, and keep the
+			// persistent device grant below operator.admin. Full Control UI
+			// access is granted dynamically to this exact proxy identity, as
+			// recommended by the 8.1 trusted-proxy contract.
+			trustedProxy["deviceAutoApprove"] = map[string]any{
+				"enabled": true,
+				"scopes":  append([]string(nil), openClawTrustedProxyDeviceScopes...),
+			}
+			identityScopes := ensureObject(auth, "identityScopes")
+			identityScopes[basePath] = []string{"operator.admin"}
+		} else {
+			delete(trustedProxy, "deviceAutoApprove")
+			delete(auth, "identityScopes")
+		}
+	}
+
+	controlUI := ensureObject(gatewayConfig, "controlUi")
+	controlUI["basePath"] = basePath
+	if IsOpenClawAtLeast(openClawVersion, OpenClaw81Version) {
+		delete(controlUI, "dangerouslyDisableDeviceAuth")
+	} else if cfg.GatewayAuthMode == "trusted-proxy" {
+		controlUI["dangerouslyDisableDeviceAuth"] = true
+	}
+	origins := cfg.AllowedOrigins
+	if len(origins) == 0 && cfg.PublicOrigin != "" {
+		origins = []string{cfg.PublicOrigin}
+	}
+	if len(origins) > 0 {
+		controlUI["allowedOrigins"] = appendUniqueStringArray(controlUI["allowedOrigins"], origins...)
+	}
+	if len(cfg.TrustedProxies) > 0 {
+		gatewayConfig["trustedProxies"] = appendUniqueStringArray(gatewayConfig["trustedProxies"], cfg.TrustedProxies...)
+	}
+	mergeOpenClawLLMConfig(config, cfg)
+	if IsOpenClawAtLeast(openClawVersion, OpenClaw81Version) {
+		openclawcompat.Normalize81(config)
+	}
+
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal openclaw config: %w", err)
+	}
+	if err := s.WriteFile(configPath, append(data, '\n'), 0o600); err != nil {
+		return fmt.Errorf("write openclaw config: %w", err)
+	}
+	if err := s.Chmod(configPath, 0o600); err != nil {
+		return fmt.Errorf("chmod openclaw config: %w", err)
+	}
+	if err := s.Chown(filepath.Dir(configPath), req.UID, req.GID); err != nil {
+		return fmt.Errorf("chown openclaw config dir: %w", err)
+	}
+	if err := s.Chown(configPath, req.UID, req.GID); err != nil {
+		return fmt.Errorf("chown openclaw config: %w", err)
+	}
+	if teamEnabledFromRequest(req) {
+		if err := NewProfile(cfg.RuntimeType).prepareTeamWorkspace(cfg, req, workspacePath); err != nil {
+			return err
+		}
+	}
+	openclawHome := filepath.Join(workspacePath, "home", ".openclaw")
+	if IsOpenClawAtLeast(openClawVersion, OpenClaw81Version) {
+		// OpenClaw 8.1 owns its SQLite-backed Automation store through the
+		// Gateway. The manager reconciles declarations after readiness; writing
+		// cron/jobs.json here would race the upstream migration and duplicate jobs.
+		return nil
+	}
+	result := s.applyScheduledTasks(openclawHome, func(key string) string {
+		if req.Environment != nil {
+			if value, ok := req.Environment[key]; ok {
+				return value
+			}
+		}
+		if req.Env != nil {
+			if value, ok := req.Env[key]; ok {
+				return value
+			}
+		}
+		return os.Getenv(key)
+	}, req.UID, req.GID)
+	if result.Error != "" {
+		log.Printf("apply openclaw scheduled tasks failed (continuing): source_env=%s error=%s", result.SourceEnv, result.Error)
+	}
+	// Apply writes jobs.json as the agent user (often root). Gateway runs as
+	// instance UID, so chown the whole cron tree — not only the directory inode.
+	cronDir := filepath.Join(openclawHome, "cron")
+	if _, err := s.Stat(cronDir); err == nil {
+		if err := s.chownTree(cronDir, req.UID, req.GID); err != nil {
+			return fmt.Errorf("chown openclaw cron tree: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat openclaw cron dir: %w", err)
+	}
+	return nil
+}
+
+// 10.2's native channel startup uses source/ownership facts in addition to an
+// allowlist. Pin this platform-owned plugin to the immutable image bundle using
+// the upstream load-path selector, never by trusting arbitrary global plugins.
+func selectBundledRedisTeamPlugin(config map[string]any) error {
+	root := filepath.Join(openClawGlobalPackageDir, "dist", "extensions", openClawRedisTeamPluginID)
+	if err := validateOpenClawRedisTeamPlugin(root, true); err != nil {
+		return fmt.Errorf("managed Team bundle is missing or invalid: %w", err)
+	}
+	load := ensureObject(ensureObject(config, "plugins"), "load")
+	load["paths"] = appendUniqueStringArray(load["paths"], filepath.ToSlash(root))
+	return nil
+}
+
+func managedOpenClawGatewayPassword(req gateway.CreateGatewayRequest) (string, bool) {
+	value, ok := requestEnvValue(req, "CLAWMANAGER_INSTANCE_TOKEN")
+	value = strings.TrimSpace(value)
+	return value, ok && value != ""
+}
+
+// configureManagedOpenClawBrowser supplies the safe Lite runtime defaults that
+// are present in the image template without replacing an instance's explicit
+// browser choices. The managed local openclaw profile always receives the CDP
+// port allocated inside this gateway's 3-port block. Team workers can also be
+// forced through ClawManager's managed egress proxy when that proxy is present.
+func configureManagedOpenClawBrowser(config map[string]any, req gateway.CreateGatewayRequest, gatewayPort int) {
+	browser := ensureObject(config, "browser")
+	setDefaultObjectValue(browser, "enabled", true)
+	setDefaultObjectValue(browser, "executablePath", openClawBrowserExecutablePath)
+	setDefaultObjectValue(browser, "headless", true)
+	setDefaultObjectValue(browser, "noSandbox", true)
+
+	profiles := ensureObject(browser, "profiles")
+	profile := ensureObject(profiles, openClawManagedBrowserProfile)
+	profile["driver"] = "openclaw"
+	profile["cdpPort"] = gatewayPort + 1
+	setDefaultObjectValue(profile, "color", openClawManagedBrowserColor)
+
+	proxyURL, managed := managedOpenClawBrowserProxy(req)
+	if !managed {
+		return
+	}
+
+	// Team workers must all have a functioning Browser. Chromium is forced
+	// through ClawManager's DNS-pinning egress proxy, so OpenClaw may permit
+	// the proxy's internal service address without exposing arbitrary pod or
+	// cluster addresses to the page being reviewed.
+	browser["enabled"] = true
+	browser["executablePath"] = openClawBrowserExecutablePath
+	browser["headless"] = true
+	browser["noSandbox"] = true
+	browser["extraArgs"] = managedOpenClawBrowserArgs(browser["extraArgs"], proxyURL)
+	ssrfPolicy := ensureObject(browser, "ssrfPolicy")
+	ssrfPolicy["dangerouslyAllowPrivateNetwork"] = true
+	// Do not add a hostnameAllowlist here. In OpenClaw it is an exclusive
+	// navigation allowlist, not an additive DNS exception. The version-locked
+	// image patch recognizes only ClawManager's signature-derived interactive
+	// Preview host while keeping ordinary destinations on the upstream path.
+}
+
+// reconcileOpenClawBrowserPlugin keeps the 2026.7.1 pluginized Browser tool
+// aligned with the long-standing browser.enabled runtime setting. Without
+// this, an upgraded instance can launch Chromium but silently lose the Browser
+// tool because older managed defaults explicitly disabled the plugin entry.
+func reconcileOpenClawBrowserPlugin(config map[string]any) {
+	browser := ensureObject(config, "browser")
+	enabled, ok := browser["enabled"].(bool)
+	if !ok {
+		return
+	}
+	plugins := ensureObject(config, "plugins")
+	entries := ensureObject(plugins, "entries")
+	entry := ensureObject(entries, "browser")
+	entry["enabled"] = enabled
+}
+
+func managedOpenClawBrowserProxy(req gateway.CreateGatewayRequest) (string, bool) {
+	if !teamEnabledFromRequest(req) {
+		return "", false
+	}
+	raw, explicitlyManaged := requestEnvValue(req, openClawBrowserProxyEnv)
+	if !explicitlyManaged {
+		raw, _ = requestEnvValue(req, "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")
+	}
+	raw = strings.TrimSpace(raw)
+	parsed, err := url.Parse(raw)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || strings.TrimSpace(parsed.Host) == "" {
+		return "", false
+	}
+	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	if host != "clawmanager-egress-proxy" && !strings.HasPrefix(host, "clawmanager-egress-proxy.") {
+		return "", false
+	}
+	parsed.Path = ""
+	parsed.RawPath = ""
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return strings.TrimRight(parsed.String(), "/"), true
+}
+
+func managedOpenClawBrowserArgs(existing any, proxyURL string) []string {
+	current := appendUniqueStringArray(existing)
+	filtered := make([]string, 0, len(current)+4)
+	for _, argument := range current {
+		normalized := strings.ToLower(strings.TrimSpace(argument))
+		if normalized == "--no-proxy-server" ||
+			strings.HasPrefix(normalized, "--proxy-") {
+			continue
+		}
+		filtered = append(filtered, argument)
+	}
+	return append(filtered,
+		"--proxy-server="+proxyURL,
+		"--proxy-bypass-list=<-loopback>",
+		"--disable-quic",
+		"--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+	)
+}
+
+func setDefaultObjectValue(object map[string]any, key string, value any) {
+	if _, exists := object[key]; exists {
+		return
+	}
+	object[key] = value
+}
+
+// mergeOpenClawLiteDefaults supplies the instance defaults that Pro receives
+// from /defaults/.openclaw/openclaw.json. Lite workspaces start with an empty
+// config, so these defaults must be added when the instance is created.
+//
+// Values are only filled when absent so recreating an existing Lite instance
+// does not discard explicit user choices. Environment-managed model, channel,
+// Team, gateway port, and authentication settings are applied afterwards.
+func mergeOpenClawLiteDefaults(config map[string]any, openClawVersion string) {
+	models := ensureObject(config, "models")
+	setDefaultObjectValue(models, "mode", "merge")
+
+	agentDefaults := ensureObject(ensureObject(config, "agents"), "defaults")
+	memorySearch := ensureObject(agentDefaults, "memorySearch")
+	setDefaultObjectValue(memorySearch, "enabled", true)
+	setDefaultObjectValue(memorySearch, "provider", "none")
+
+	compaction := ensureObject(agentDefaults, "compaction")
+	setDefaultObjectValue(compaction, "mode", "default")
+	setDefaultObjectValue(compaction, "reserveTokens", 32768)
+	setDefaultObjectValue(compaction, "reserveTokensFloor", 20000)
+	setDefaultObjectValue(compaction, "keepRecentTokens", 30000)
+	setDefaultObjectValue(compaction, "maxHistoryShare", 0.65)
+	setDefaultObjectValue(compaction, "notifyUser", true)
+	memoryFlush := ensureObject(compaction, "memoryFlush")
+	setDefaultObjectValue(memoryFlush, "enabled", true)
+
+	setDefaultObjectValue(agentDefaults, "maxConcurrent", 4)
+	subagents := ensureObject(agentDefaults, "subagents")
+	setDefaultObjectValue(subagents, "maxConcurrent", 8)
+
+	tools := ensureObject(config, "tools")
+	setDefaultObjectValue(tools, "profile", "full")
+	if IsOpenClawAtLeast(openClawVersion, OpenClaw81Version) {
+		swarm := ensureObject(tools, "swarm")
+		swarm["enabled"] = false
+	}
+
+	commands := ensureObject(config, "commands")
+	setDefaultObjectValue(commands, "native", "auto")
+	setDefaultObjectValue(commands, "nativeSkills", "auto")
+	setDefaultObjectValue(commands, "restart", true)
+	setDefaultObjectValue(commands, "ownerDisplay", "raw")
+
+	messages := ensureObject(config, "messages")
+	groupChat := ensureObject(messages, "groupChat")
+	setDefaultObjectValue(groupChat, "visibleReplies", "automatic")
+
+	gatewayConfig := ensureObject(config, "gateway")
+	setDefaultObjectValue(gatewayConfig, "mode", "local")
+	tailscale := ensureObject(gatewayConfig, "tailscale")
+	setDefaultObjectValue(tailscale, "mode", "off")
+	setDefaultObjectValue(tailscale, "resetOnExit", false)
+	nodes := ensureObject(gatewayConfig, "nodes")
+	if IsOpenClawAtLeast(openClawVersion, OpenClaw81Version) {
+		commands := ensureObject(nodes, "commands")
+		legacyDenied := appendUniqueStringArray(nodes["denyCommands"])
+		commands["deny"] = appendUniqueStringArray(commands["deny"], append(legacyDenied, openClawDefaultDeniedNodeCommands...)...)
+		delete(nodes, "denyCommands")
+		delete(config, "cloudWorkers")
+		delete(gatewayConfig, "roles")
+	} else {
+		nodes["denyCommands"] = appendUniqueStringArray(nodes["denyCommands"], openClawDefaultDeniedNodeCommands...)
+	}
+
+	entries := ensureObject(ensureObject(config, "plugins"), "entries")
+	for _, pluginID := range openClawDefaultDisabledPlugins {
+		entry := ensureObject(entries, pluginID)
+		setDefaultObjectValue(entry, "enabled", false)
+	}
+	memoryCore := ensureObject(entries, "memory-core")
+	dreaming := ensureObject(ensureObject(memoryCore, "config"), "dreaming")
+	setDefaultObjectValue(dreaming, "enabled", true)
+	setDefaultObjectValue(dreaming, "frequency", "0 3 * * *")
+	setDefaultObjectValue(dreaming, "timezone", "Asia/Shanghai")
+
+	if IsOpenClawAtLeast(openClawVersion, OpenClaw81Version) {
+		openclawcompat.Normalize81(config)
+	}
+}
+
+func mergeOpenClawChannelsFromRequest(config map[string]any, req gateway.CreateGatewayRequest) error {
+	raw, ok := requestEnvValue(req, openClawChannelsEnv)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return nil
+	}
+
+	var payload any
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return fmt.Errorf("parse %s: %w", openClawChannelsEnv, err)
+	}
+	channelsPayload, ok := payload.(map[string]any)
+	if !ok {
+		return fmt.Errorf("%s must be a JSON object", openClawChannelsEnv)
+	}
+
+	channels := ensureObject(config, "channels")
+	for name, channel := range channelsPayload {
+		channels[name] = channel
+	}
+	reconcileOpenClawChannelPlugins(config, channelsPayload)
+	applyOpenClawChannelDefaults(config, channelsPayload)
+	return nil
+}
+
+func applyOpenClawChannelDefaults(config map[string]any, channelsPayload map[string]any) {
+	if _, ok := channelsPayload["dingtalk"]; !ok {
+		if _, ok := channelsPayload["dingtalk-connector"]; !ok {
+			return
+		}
+	}
+
+	messages := ensureObject(config, "messages")
+	groupChat := ensureObject(messages, "groupChat")
+	if value, ok := groupChat["visibleReplies"].(string); ok && strings.TrimSpace(value) != "" {
+		return
+	}
+	groupChat["visibleReplies"] = "automatic"
+}
+
+func reconcileOpenClawChannelPlugins(config map[string]any, channelsPayload map[string]any) {
+	plugins := ensureObject(config, "plugins")
+	entries := ensureObject(plugins, "entries")
+	enabledPlugins := map[string]struct{}{}
+	for channelID := range channelsPayload {
+		for _, pluginID := range openClawEnvManagedChannelPlugins[channelID] {
+			enabledPlugins[pluginID] = struct{}{}
+		}
+	}
+	managedPlugins := map[string]struct{}{}
+	for _, pluginIDs := range openClawEnvManagedChannelPlugins {
+		for _, pluginID := range pluginIDs {
+			managedPlugins[pluginID] = struct{}{}
+		}
+	}
+	for pluginID := range managedPlugins {
+		entry := ensureObject(entries, pluginID)
+		_, enabled := enabledPlugins[pluginID]
+		entry["enabled"] = enabled
+	}
+}
+
+func mergePlatformDefaults(config map[string]any, port int, openClawVersion string) {
+	gatewayConfig := ensureObject(config, "gateway")
+	gatewayConfig["port"] = port
+
+	cron := ensureObject(config, "cron")
+	cron["enabled"] = true
+	cron["sessionRetention"] = "24h"
+	if IsOpenClawAtLeast(openClawVersion, OpenClaw81Version) {
+		delete(cron, "maxConcurrentRuns")
+		delete(cron, "runLog")
+	} else {
+		cron["maxConcurrentRuns"] = 2
+		runLog := ensureObject(cron, "runLog")
+		runLog["keepLines"] = 2000
+		runLog["maxBytes"] = "2mb"
+	}
+
+	update := ensureObject(config, "update")
+	update["checkOnStart"] = false
+	auto := ensureObject(update, "auto")
+	auto["enabled"] = false
+
+	hooks := ensureObject(config, "hooks")
+	internal := ensureObject(hooks, "internal")
+	internal["enabled"] = true
+	entries := ensureObject(internal, "entries")
+	sessionMemory := ensureObject(entries, "session-memory")
+	sessionMemory["enabled"] = true
+	sessionMemory["messages"] = 50
+
+	session := ensureObject(config, "session")
+	reset := ensureObject(session, "reset")
+	reset["idleMinutes"] = 10080
+	reset["mode"] = "idle"
+	maintenance := ensureObject(session, "maintenance")
+	maintenance["maxEntries"] = 2000
+	maintenance["pruneAfter"] = "180d"
+}
+
+func configureOpenClawRedisTeam(config map[string]any, req gateway.CreateGatewayRequest, workspacePath string) error {
+	plugins := ensureObject(config, "plugins")
+	entries := ensureObject(plugins, "entries")
+	entry := ensureObject(entries, openClawRedisTeamPluginID)
+	entry["enabled"] = true
+
+	channels := ensureObject(config, "channels")
+	channel := ensureObject(channels, openClawRedisTeamPluginID)
+	accounts := ensureObject(channel, "accounts")
+	account := ensureObject(accounts, "default")
+	account["fromEnv"] = true
+	account["enabled"] = true
+
+	setTeamStringAccountValue(account, req, "CLAWMANAGER_TEAM_REDIS_URL", "redisUrl")
+	setTeamStringAccountValue(account, req, "CLAWMANAGER_TEAM_ID", "teamId")
+	setTeamStringAccountValue(account, req, "CLAWMANAGER_TEAM_MEMBER_ID", "memberId")
+	setTeamStringAccountValue(account, req, "CLAWMANAGER_TEAM_ROLE", "role")
+	setTeamStringAccountValue(account, req, "CLAWMANAGER_TEAM_MANAGER_URL", "managerUrl")
+	setTeamStringAccountValue(account, req, "CLAWMANAGER_TEAM_CONSUMER_GROUP", "consumerGroup")
+	setTeamStringAccountValue(account, req, "CLAWMANAGER_TEAM_INBOX_KEY", "inboxKey")
+	setTeamStringAccountValue(account, req, "CLAWMANAGER_TEAM_EVENTS_KEY", "eventsKey")
+	setTeamStringAccountValue(account, req, "CLAWMANAGER_TEAM_PRESENCE_KEY", "presenceKey")
+	setTeamStringAccountValue(account, req, "CLAWMANAGER_TEAM_DLQ_KEY", "dlqKey")
+	setTeamBoolAccountValue(account, req, "CLAWMANAGER_TEAM_AUTORUN", "autoRun")
+	setTeamIntAccountValue(account, req, "CLAWMANAGER_TEAM_EMBEDDED_TIMEOUT_SECONDS", "embeddedTimeoutSeconds")
+
+	if _, sharedDir, ok := gateway.LiteTeamEnvironment(req, workspacePath); ok && strings.TrimSpace(sharedDir) != "" {
+		account["sharedDir"] = sharedDir
+	}
+	return nil
+}
+
+func setTeamStringAccountValue(account map[string]any, req gateway.CreateGatewayRequest, envKey, configKey string) {
+	value, ok := requestEnvValue(req, envKey)
+	if !ok {
+		return
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return
+	}
+	account[configKey] = value
+}
+
+func setTeamBoolAccountValue(account map[string]any, req gateway.CreateGatewayRequest, envKey, configKey string) {
+	value, ok := requestEnvValue(req, envKey)
+	if !ok {
+		return
+	}
+	account[configKey] = truthyOpenClawTeamEnv(value)
+}
+
+func setTeamIntAccountValue(account map[string]any, req gateway.CreateGatewayRequest, envKey, configKey string) {
+	value, ok := requestEnvValue(req, envKey)
+	if !ok {
+		return
+	}
+	parsed, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || parsed <= 0 {
+		return
+	}
+	account[configKey] = parsed
+}
+
+func teamEnabledFromRequest(req gateway.CreateGatewayRequest) bool {
+	value, ok := requestEnvValue(req, "CLAWMANAGER_TEAM_ENABLED")
+	return ok && truthyOpenClawTeamEnv(value)
+}
+
+func truthyOpenClawTeamEnv(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "y", "on", "enabled":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *openClawIO) seedOpenClawRedisTeamPlugin(req gateway.CreateGatewayRequest, workspacePath string) error {
+	source, ok, err := findOpenClawRedisTeamPluginSource()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("redis-team plugin source not found; checked %s and default OpenClaw extension locations", openClawRedisTeamPluginDirEnv)
+	}
+	if err := validateOpenClawRedisTeamPlugin(source, true); err != nil {
+		return fmt.Errorf("invalid managed redis-team plugin source: %w", err)
+	}
+	extensionsDir := filepath.Join(workspacePath, "home", ".openclaw", "extensions")
+	target := filepath.Join(extensionsDir, openClawRedisTeamPluginID)
+	targetExists := false
+	if _, err := s.Stat(target); err == nil {
+		targetExists = true
+		if err := s.validateRedisTeamPlugin(target, false); err != nil {
+			// This path may contain a user-managed extension.  Never overwrite an
+			// unrecognized tree merely because it is named redis-team.
+			log.Printf("warning: preserving unrecognized redis-team extension at %s: %v", target, err)
+			return nil
+		}
+		if s.sameOpenClawRedisTeamPlugin(source, target) {
+			return s.chownTree(target, req.UID, req.GID)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat redis-team plugin target: %w", err)
+	}
+	if err := s.replaceOpenClawRedisTeamPlugin(source, target, extensionsDir); err != nil {
+		if targetExists {
+			log.Printf("warning: keeping previous redis-team plugin after managed update failed: %v", err)
+			if err := s.chownTree(target, req.UID, req.GID); err != nil {
+				return fmt.Errorf("chown redis-team plugin: %w", err)
+			}
+			return nil
+		}
+		return fmt.Errorf("seed redis-team plugin: %w", err)
+	}
+	if err := s.chownTree(extensionsDir, req.UID, req.GID); err != nil {
+		return fmt.Errorf("chown redis-team plugin: %w", err)
+	}
+	return nil
+}
+
+func findOpenClawRedisTeamPluginSource() (string, bool, error) {
+	candidates := []string{}
+	if value := strings.TrimSpace(os.Getenv(openClawRedisTeamPluginDirEnv)); value != "" {
+		candidates = append(candidates, value)
+	}
+	candidates = append(candidates,
+		"/defaults/.openclaw/extensions/redis-team",
+	)
+	for _, candidate := range candidates {
+		clean := filepath.Clean(candidate)
+		info, err := os.Stat(clean)
+		if err == nil {
+			if !info.IsDir() {
+				return "", false, fmt.Errorf("redis-team plugin source is not a directory: %s", clean)
+			}
+			return clean, true, nil
+		}
+		if os.IsNotExist(err) {
+			continue
+		}
+		return "", false, fmt.Errorf("stat redis-team plugin source %s: %w", clean, err)
+	}
+	return "", false, nil
+}
+
+func validateOpenClawRedisTeamPlugin(root string, requireCurrentPackage bool) error {
+	return validateRedisTeamFiles(root, requireCurrentPackage, os.ReadFile, os.Stat)
+}
+func (s *openClawIO) validateRedisTeamPlugin(root string, requireCurrentPackage bool) error {
+	return validateRedisTeamFiles(root, requireCurrentPackage, s.ReadFile, s.Stat)
+}
+func validateRedisTeamFiles(root string, requireCurrentPackage bool, readFile func(string) ([]byte, error), stat func(string) (os.FileInfo, error)) error {
+	packageData, err := readFile(filepath.Join(root, "package.json"))
+	if err != nil {
+		return fmt.Errorf("read package.json: %w", err)
+	}
+	var pkg struct {
+		Name    string `json:"name"`
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(packageData, &pkg); err != nil {
+		return fmt.Errorf("parse package.json: %w", err)
+	}
+	if pkg.Name != openClawRedisTeamPluginPackage {
+		if requireCurrentPackage || pkg.Name != "@clawmanager/redis-team" {
+			return fmt.Errorf("unexpected package name %q", pkg.Name)
+		}
+	}
+	if strings.TrimSpace(pkg.Version) == "" {
+		return fmt.Errorf("package version is empty")
+	}
+	manifestData, err := readFile(filepath.Join(root, "openclaw.plugin.json"))
+	if err != nil {
+		return fmt.Errorf("read manifest: %w", err)
+	}
+	var manifest struct {
+		ID       string   `json:"id"`
+		Channels []string `json:"channels"`
+	}
+	if err := json.Unmarshal(manifestData, &manifest); err != nil {
+		return fmt.Errorf("parse manifest: %w", err)
+	}
+	if manifest.ID != openClawRedisTeamPluginID {
+		return fmt.Errorf("unexpected manifest id %q", manifest.ID)
+	}
+	channelOK := false
+	for _, channel := range manifest.Channels {
+		if channel == openClawRedisTeamPluginID {
+			channelOK = true
+			break
+		}
+	}
+	if !channelOK {
+		return fmt.Errorf("manifest does not declare redis-team channel")
+	}
+	entry, err := stat(filepath.Join(root, "dist", "index.js"))
+	if err != nil {
+		return fmt.Errorf("stat dist/index.js: %w", err)
+	}
+	if !entry.Mode().IsRegular() || entry.Size() == 0 {
+		return fmt.Errorf("dist/index.js is missing or empty")
+	}
+	return nil
+}
+
+func (s *openClawIO) sameOpenClawRedisTeamPlugin(source, target string) bool {
+	for _, rel := range []string{"package.json", "openclaw.plugin.json", filepath.Join("dist", "index.js")} {
+		sourceHash, err := openClawRedisTeamFileHash(filepath.Join(source, rel))
+		if err != nil {
+			return false
+		}
+		targetData, err := s.ReadFile(filepath.Join(target, rel))
+		targetDigest := sha256.Sum256(targetData)
+		targetHash := hex.EncodeToString(targetDigest[:])
+		if err != nil || sourceHash != targetHash {
+			return false
+		}
+	}
+	return true
+}
+
+func openClawRedisTeamFileHash(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func (s *openClawIO) replaceOpenClawRedisTeamPlugin(source, target, extensionsDir string) error {
+	if err := s.MkdirAll(extensionsDir, 0o750); err != nil {
+		return err
+	}
+	staging, err := s.mkdirTemp(extensionsDir, ".redis-team-staging-")
+	if err != nil {
+		return err
+	}
+	defer s.RemoveAll(staging)
+	if err := s.copyDir(source, staging); err != nil {
+		return err
+	}
+	if err := s.validateRedisTeamPlugin(staging, true); err != nil {
+		return fmt.Errorf("validate staged redis-team plugin: %w", err)
+	}
+	backup, err := s.mkdirTemp(extensionsDir, ".redis-team-backup-")
+	if err != nil {
+		return err
+	}
+	if err := s.Remove(backup); err != nil {
+		return err
+	}
+	defer s.RemoveAll(backup)
+	hadTarget := false
+	if _, err := s.Stat(target); err == nil {
+		hadTarget = true
+		if err := s.Rename(target, backup); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := s.Rename(staging, target); err != nil {
+		if hadTarget {
+			_ = s.Rename(backup, target)
+		}
+		return err
+	}
+	if hadTarget {
+		_ = s.RemoveAll(backup)
+	}
+	return nil
+}
+
+func (s *openClawIO) copyDir(source, target string) error {
+	info, err := os.Stat(source)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", source)
+	}
+	if err := s.MkdirAll(target, info.Mode().Perm()); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(source)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		srcPath := filepath.Join(source, entry.Name())
+		dstPath := filepath.Join(target, entry.Name())
+		entryInfo, err := os.Lstat(srcPath)
+		if err != nil {
+			return err
+		}
+		if entryInfo.Mode()&os.ModeSymlink != 0 {
+			linkTarget, err := os.Readlink(srcPath)
+			if err != nil {
+				return err
+			}
+			if err := s.Symlink(linkTarget, dstPath); err != nil {
+				return err
+			}
+			continue
+		}
+		if entryInfo.IsDir() {
+			if err := s.copyDir(srcPath, dstPath); err != nil {
+				return err
+			}
+			continue
+		}
+		if !entryInfo.Mode().IsRegular() {
+			continue
+		}
+		if err := s.copyRegularFile(srcPath, dstPath, entryInfo.Mode().Perm()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *openClawIO) copyRegularFile(source, target string, mode os.FileMode) error {
+	data, err := os.ReadFile(source) // source is an immutable image/default tree
+	if err != nil {
+		return err
+	}
+	if err := s.MkdirAll(filepath.Dir(target), 0o750); err != nil {
+		return err
+	}
+	return s.WriteFileAtomic(target, data, mode)
+}
+
+func (s *openClawIO) chownTree(root string, uid, gid int) error {
+	return s.ChownTree(root, uid, gid)
+}
+
+func configWithRequestLLMEnv(cfg gateway.Config, req gateway.CreateGatewayRequest) (gateway.Config, error) {
+	settings, err := llmconfig.ResolveGateway(cfg, req, llmconfig.ResolveOptions{})
+	if err != nil {
+		return gateway.Config{}, err
+	}
+	return settings.ApplyTo(cfg), nil
+}
+
+func requestEnvValue(req gateway.CreateGatewayRequest, keys ...string) (string, bool) {
+	return gateway.RequestEnvValue(req, keys...)
+}
+
+func resolveOpenClawVersion(cfg gateway.Config, req gateway.CreateGatewayRequest) string {
+	if version := strings.TrimSpace(cfg.OpenClawVersion); version != "" {
+		return version
+	}
+	if version, ok := requestEnvValue(req, "CLAWMANAGER_OPENCLAW_VERSION"); ok {
+		return strings.TrimSpace(version)
+	}
+	return strings.TrimSpace(os.Getenv("CLAWMANAGER_OPENCLAW_VERSION"))
+}
+
+func mergeOpenClawLLMConfig(config map[string]any, cfg gateway.Config) {
+	if cfg.LLMBaseURL == "" && !cfg.LLMAPIKeySet && len(cfg.LLMModelIDs) == 0 {
+		normalizeOpenClawProviderAuthContracts(config)
+		return
+	}
+
+	models := ensureObject(config, "models")
+	providers := ensureObject(models, "providers")
+	modelRefs := llmconfig.FromGatewayConfig(cfg).ModelRefs(openClawAutoProviderName)
+	providerGroups := llmconfig.GroupModelRefs(modelRefs)
+
+	if len(modelRefs) > 0 {
+		providerReasoning := make(map[string]map[string]bool)
+		providerReasoningControl := make(map[string]map[string]string)
+		for _, ref := range modelRefs {
+			if _, exists := providerReasoning[ref.ProviderID]; !exists {
+				providerReasoning[ref.ProviderID] = make(map[string]bool)
+				providerReasoningControl[ref.ProviderID] = make(map[string]string)
+			}
+			if value, exists := openClawReasoningForRef(cfg.LLMReasoning, ref); exists {
+				providerReasoning[ref.ProviderID][ref.ModelID] = value
+			}
+			if value, exists := openClawReasoningControlForRef(cfg.LLMReasoningControl, ref); exists {
+				providerReasoningControl[ref.ProviderID][ref.ModelID] = value
+			}
+		}
+
+		for _, group := range providerGroups {
+			provider := mergeOpenClawProviderConnection(providers, group.ProviderID, cfg)
+			provider["models"] = buildOpenClawProviderModels(
+				provider["models"],
+				group.ModelIDs,
+				providerReasoning[group.ProviderID],
+				providerReasoningControl[group.ProviderID],
+			)
+			for _, entry := range provider["models"].([]any) {
+				model := entry.(map[string]any)
+				id := configStringValue(model["id"])
+				ref := llmconfig.ModelRef{ModelID: id, Qualified: group.ProviderID + "/" + id}
+				if vision, managed := openClawSettingForRef(cfg.LLMVision, ref); managed {
+					model["input"] = gateway.VisionInputModalities(model["input"], vision)
+				}
+			}
+		}
+
+		agents := ensureObject(config, "agents")
+		defaults := ensureObject(agents, "defaults")
+		model := ensureObject(defaults, "model")
+		primaryModel := modelRefs[0].Qualified
+		model["primary"] = primaryModel
+		defaults["models"] = buildOpenClawAgentModelsFromRefs(defaults["models"], modelRefs)
+		// OpenClaw 2026.7.1 auto-discovers a built-in OpenAI image fallback when
+		// imageModel is unset. ClawManager also exports OPENAI_* compatibility
+		// aliases, so that fallback can look configured even though the user did
+		// not enable it. Keep image calls on the managed provider while preserving
+		// an explicit custom image model.
+		if rawImageModel, exists := defaults["imageModel"]; !exists || rawImageModel == nil {
+			defaults["imageModel"] = map[string]any{"primary": primaryModel}
+		}
+	} else {
+		mergeOpenClawProviderConnection(providers, openClawAutoProviderName, cfg)
+	}
+	normalizeOpenClawProviderAuthContracts(config)
+}
+
+func mergeOpenClawProviderConnection(providers map[string]any, providerID string, cfg gateway.Config) map[string]any {
+	provider := ensureObject(providers, providerID)
+	if cfg.LLMBaseURL != "" {
+		provider["baseUrl"] = cfg.LLMBaseURL
+	}
+	if cfg.LLMAPIKeySet {
+		provider["apiKey"] = cfg.LLMAPIKey
+	}
+	if strings.TrimSpace(configStringValue(provider["api"])) == "" {
+		provider["api"] = "openai-completions"
+	}
+	if strings.TrimSpace(configStringValue(provider["auth"])) == "" && strings.TrimSpace(cfg.LLMAPIKey) != "" {
+		provider["auth"] = "api-key"
+	}
+	return provider
+}
+
+func openClawReasoningForRef(settings map[string]bool, ref llmconfig.ModelRef) (bool, bool) {
+	return openClawSettingForRef(settings, ref)
+}
+
+func openClawReasoningControlForRef(settings map[string]string, ref llmconfig.ModelRef) (string, bool) {
+	return openClawSettingForRef(settings, ref)
+}
+
+func openClawSettingForRef[T any](settings map[string]T, ref llmconfig.ModelRef) (T, bool) {
+	if value, exists := settings[ref.Qualified]; exists {
+		return value, true
+	}
+	value, exists := settings[ref.ModelID]
+	return value, exists
+}
+
+func normalizeOpenClawProviderAuthContracts(config map[string]any) {
+	models, ok := config["models"].(map[string]any)
+	if !ok {
+		return
+	}
+	providers, ok := models["providers"].(map[string]any)
+	if !ok {
+		return
+	}
+	for _, raw := range providers {
+		provider, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(configStringValue(provider["auth"])) != "" {
+			continue
+		}
+		if strings.TrimSpace(configStringValue(provider["apiKey"])) == "" {
+			continue
+		}
+		provider["auth"] = "api-key"
+	}
+}
+
+func buildOpenClawProviderModels(existing any, modelIDs []string, reasoningByID map[string]bool, reasoningControlByID map[string]string) []any {
+	byID := indexOpenClawModelsByID(existing)
+	models := make([]any, 0, len(modelIDs))
+	for _, id := range modelIDs {
+		if current, ok := byID[id]; ok {
+			cloned := cloneOpenClawMap(current)
+			cloned["id"] = id
+			if reasoning, managed := reasoningByID[id]; managed {
+				cloned["reasoning"] = reasoning
+			}
+			applyOpenClawReasoningControlCompat(cloned, reasoningByID[id], reasoningControlByID[id])
+			if strings.EqualFold(id, "auto") || strings.TrimSpace(configStringValue(cloned["name"])) == "" {
+				cloned["name"] = displayOpenClawModelName(id)
+			}
+			models = append(models, cloned)
+			continue
+		}
+		model := defaultOpenClawProviderModel(id, reasoningByID[id])
+		applyOpenClawReasoningControlCompat(model, reasoningByID[id], reasoningControlByID[id])
+		models = append(models, model)
+	}
+	return models
+}
+
+func applyOpenClawReasoningControlCompat(model map[string]any, enabled bool, control string) {
+	if model == nil || control != "deepseek-thinking" {
+		return
+	}
+	if !enabled {
+		return
+	}
+	compat, _ := model["compat"].(map[string]any)
+	if compat == nil {
+		compat = map[string]any{}
+		model["compat"] = compat
+	}
+	compat["supportsReasoningEffort"] = true
+	compat["supportedReasoningEfforts"] = []any{"high", "max"}
+	compat["reasoningEffortMap"] = map[string]any{
+		"off": "none", "minimal": "high", "low": "high", "medium": "high",
+		"high": "high", "xhigh": "max", "max": "max",
+	}
+}
+
+func indexOpenClawModelsByID(existing any) map[string]map[string]any {
+	items, ok := existing.([]any)
+	if !ok {
+		return map[string]map[string]any{}
+	}
+	index := make(map[string]map[string]any, len(items))
+	for _, item := range items {
+		model, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		id := strings.TrimSpace(configStringValue(model["id"]))
+		if id != "" {
+			index[id] = model
+		}
+	}
+	return index
+}
+
+func buildOpenClawAgentModelsFromRefs(existing any, refs []llmconfig.ModelRef) map[string]any {
+	current, _ := existing.(map[string]any)
+	models := make(map[string]any, len(refs))
+	for _, ref := range refs {
+		if current != nil {
+			if value, ok := current[ref.Qualified]; ok {
+				models[ref.Qualified] = value
+				continue
+			}
+		}
+		models[ref.Qualified] = map[string]any{}
+	}
+	return models
+}
+
+func defaultOpenClawProviderModel(id string, reasoning bool) map[string]any {
+	return map[string]any{
+		"id":        id,
+		"name":      displayOpenClawModelName(id),
+		"reasoning": reasoning,
+		"input": []any{
+			"text",
+		},
+		"cost": map[string]any{
+			"input":      0,
+			"output":     0,
+			"cacheRead":  0,
+			"cacheWrite": 0,
+		},
+		"contextWindow": 1000000,
+		"maxTokens":     65536,
+	}
+}
+
+func displayOpenClawModelName(id string) string {
+	if strings.EqualFold(id, "auto") {
+		return "Auto"
+	}
+	return id
+}
+
+func cloneOpenClawMap(source map[string]any) map[string]any {
+	cloned := make(map[string]any, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func configStringValue(value any) string {
+	switch raw := value.(type) {
+	case string:
+		return raw
+	case nil:
+		return ""
+	default:
+		return strings.TrimSpace(fmt.Sprint(value))
+	}
+}
+
+func ensureObject(parent map[string]any, key string) map[string]any {
+	if existing, ok := parent[key].(map[string]any); ok {
+		return existing
+	}
+	next := map[string]any{}
+	parent[key] = next
+	return next
+}
+
+func appendUniqueStringArray(existing any, values ...string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	switch typed := existing.(type) {
+	case []any:
+		for _, item := range typed {
+			text, ok := item.(string)
+			if ok && text != "" && !seen[text] {
+				seen[text] = true
+				out = append(out, text)
+			}
+		}
+	case []string:
+		for _, text := range typed {
+			if text != "" && !seen[text] {
+				seen[text] = true
+				out = append(out, text)
+			}
+		}
+	}
+	for _, text := range values {
+		if text != "" && !seen[text] {
+			seen[text] = true
+			out = append(out, text)
+		}
+	}
+	return out
+}
+
+func writeTeamConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, workspace string) error {
+	if cfg.RuntimeType != "openclaw" {
+		return nil
+	}
+	return gateway.WriteLiteTeamConfigJSON(req, workspace)
+}

@@ -8,9 +8,12 @@ name: Build and push runtime images
       - ".github/workflows/docker-ghcr.yml"
       - ".dockerignore"
       - "clawmanager-agent/**"
+      - "legacy-agent/**"
       - "deepseek-harness/**"
       - "hermes/**"
       - "openclaw/**"
+      - "opencode/**"
+      - "tests/lite/**"
   workflow_dispatch:
     inputs:
       image_namespace:
@@ -54,6 +57,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Verify Lite image build contracts
+        run: |
+          python3 tests/lite/check_build_contract.py
+          python3 tests/lite/check_entrypoints.py
+
       - name: Resolve image matrix
         id: prepare
         shell: bash
@@ -82,22 +90,23 @@ jobs:
             "hermes|.|./hermes/Dockerfile|hermes"
             "hermes-lite|.|./hermes/Dockerfile.lite|hermes-lite"
             "openclaw|.|./openclaw/Dockerfile.openclaw|openclaw"
-            "openclaw-lite|.|./openclaw/Dockerfile.openclaw|openclaw-lite"
+            "openclaw-lite|.|./openclaw/Dockerfile.lite|openclaw-lite"
             "opencode|.|./opencode/Dockerfile|opencode"
-            "opencode-lite|.|./opencode/Dockerfile|opencode-lite"
+            "opencode-lite|.|./opencode/Dockerfile.lite|opencode-lite"
             "deepseek-harness|.|./deepseek-harness/Dockerfile.pro|deepseek-harness"
             "deepseek-harness-lite|.|./deepseek-harness/Dockerfile.lite|deepseek-harness-lite"
           )
 
-          # Changes on the default branch publish the managed Hermes, OpenClaw
-          # and DeepSeek variants selected by the workflow path filter. Manual
+          # Changes on the default branch publish all four Lite runtimes and the
+          # existing Pro variants selected by the workflow path filter. Manual
           # dispatches may publish either the full matrix or one selected runtime.
           if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
             specs=(
               "hermes|.|./hermes/Dockerfile|hermes"
               "hermes-lite|.|./hermes/Dockerfile.lite|hermes-lite"
               "openclaw|.|./openclaw/Dockerfile.openclaw|openclaw"
-              "openclaw-lite|.|./openclaw/Dockerfile.openclaw|openclaw-lite"
+              "openclaw-lite|.|./openclaw/Dockerfile.lite|openclaw-lite"
+              "opencode-lite|.|./opencode/Dockerfile.lite|opencode-lite"
               "deepseek-harness|.|./deepseek-harness/Dockerfile.pro|deepseek-harness"
               "deepseek-harness-lite|.|./deepseek-harness/Dockerfile.lite|deepseek-harness-lite"
             )

@@ -1,0 +1,12 @@
+# Keep the deployed native runtime payload and configuration; replace only its Lite manager.
+# Use an immutable BASE_IMAGE from the same runtime type.
+ARG BASE_IMAGE
+FROM golang:1.26.8-bookworm@sha256:9fdc884aacc3bec89b20ffc69f4bb369c78210e3e4f600387b5128b12c199f81 AS manager-builder
+ARG GOPROXY=https://proxy.golang.org,direct
+ARG GOSUMDB=sum.golang.org
+COPY clawmanager-agent /src/clawmanager-agent
+COPY opencode /src/opencode
+WORKDIR /src/opencode
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/clawmanager-agent ./cmd/opencode-lite-agent
+FROM ${BASE_IMAGE}
+COPY --from=manager-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent

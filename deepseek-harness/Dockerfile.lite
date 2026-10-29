@@ -1,20 +1,16 @@
 # syntax=docker/dockerfile:1.7
-
-FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS clawmanager-agent-builder
-
-WORKDIR /src/clawmanager-agent
-
+# Build from the AgentsRuntime repository root; the runtime composes the shared core.
+FROM --platform=$BUILDPLATFORM golang:1.26.8-bookworm@sha256:9fdc884aacc3bec89b20ffc69f4bb369c78210e3e4f600387b5128b12c199f81 AS agent-builder
 ARG TARGETOS=linux
 ARG TARGETARCH
 ARG AGENT_VERSION=dev
-
-COPY clawmanager-agent ./
+COPY clawmanager-agent/ /src/clawmanager-agent/
+COPY deepseek-harness/ /src/deepseek-harness/
+WORKDIR /src/deepseek-harness
 RUN go mod download
-RUN set -eux; \
-    arch="${TARGETARCH:-amd64}"; \
-    CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${arch}" \
-      go build -trimpath -ldflags="-s -w -X main.version=${AGENT_VERSION}" \
-      -o /out/clawmanager-agent ./cmd/clawmanager-agent
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH:-amd64} \
+    go build -mod=readonly -trimpath -ldflags="-s -w -X main.version=${AGENT_VERSION}" \
+    -o /out/clawmanager-agent ./cmd/deepseek-harness-lite-agent
 
 FROM node:22-bookworm-slim@sha256:53ada149d435c38b14476cb57e4a7da73c15595aba79bd6971b547ceb6d018bf
 
@@ -32,6 +28,9 @@ RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
       bash \
+      bubblewrap \
+      iproute2 \
+      nftables \
       build-essential \
       ca-certificates \
       curl \
@@ -42,7 +41,8 @@ RUN set -eux; \
       python3-pip \
       ripgrep \
       tini \
-      unzip; \
+      unzip \
+      util-linux; \
     rm -rf /var/lib/apt/lists/*
 
 # Lite gateways run as instance-specific, unprivileged UIDs. Keep pnpm in the
@@ -55,8 +55,18 @@ RUN set -eux; \
     pnpm --version; \
     npm cache clean --force
 
-COPY --from=clawmanager-agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent
-COPY --from=clawmanager-agent-builder /out/clawmanager-agent /usr/local/libexec/clawmanager-agent-image
+COPY deepseek-harness/cordis.lock.json deepseek-harness/scripts/install-pinned-cordis.py /usr/local/share/deepseek-harness/
+RUN --mount=type=bind,source=deepseek-harness/vendor/cordis,target=/pinned/cordis \
+    python3 /usr/local/share/deepseek-harness/install-pinned-cordis.py /pinned/cordis
+
+# DSH runs inside the instance's existing namespace. Keep its nested writable
+# sandbox on that private persistent /tmp; never disable the sandbox itself.
+COPY deepseek-harness/scripts/patch-persistent-tmp.py /usr/local/share/deepseek-harness/patch-persistent-tmp.py
+RUN python3 /usr/local/share/deepseek-harness/patch-persistent-tmp.py \
+    /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-sandbox-local/lib/index.js
+
+COPY --from=agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent
+COPY --from=agent-builder /out/clawmanager-agent /usr/local/libexec/clawmanager-agent-image
 COPY deepseek-harness/config/managed.cordis.patch.yml /usr/local/share/deepseek-harness/managed.cordis.patch.yml
 COPY deepseek-harness/scripts/prepare-deepseek-harness-resources /usr/local/bin/prepare-deepseek-harness-resources
 COPY deepseek-harness/scripts/start-deepseek-harness-gateway /usr/local/bin/start-deepseek-harness-gateway

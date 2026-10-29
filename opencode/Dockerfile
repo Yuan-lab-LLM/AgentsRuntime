@@ -1,20 +1,30 @@
 
 FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS clawmanager-agent-builder
 
-WORKDIR /src/clawmanager-agent
+WORKDIR /src/legacy-agent
 
 ARG TARGETOS=linux
 ARG TARGETARCH
 ARG AGENT_VERSION=dev
 
-COPY clawmanager-agent ./
+COPY clawmanager-agent /src/clawmanager-agent
+COPY legacy-agent /src/legacy-agent
+COPY openclaw/go.mod openclaw/go.sum /src/openclaw/
+COPY openclaw/lite /src/openclaw/lite
+COPY hermes/go.mod hermes/go.sum /src/hermes/
+COPY hermes/lite /src/hermes/lite
+COPY opencode/go.mod /src/opencode/
+COPY opencode/lite /src/opencode/lite
+COPY deepseek-harness/go.mod /src/deepseek-harness/
+COPY deepseek-harness/lite /src/deepseek-harness/lite
+COPY deepseek-harness/dshproxy /src/deepseek-harness/dshproxy
 RUN go mod download
 
 RUN set -eux; \
     arch="${TARGETARCH:-amd64}"; \
     CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${arch}" \
         go build -trimpath -ldflags="-s -w -X main.version=${AGENT_VERSION}" \
-        -o /out/clawmanager-agent ./cmd/clawmanager-agent
+        -o /out/clawmanager-agent ./cmd
 
 FROM lscr.io/linuxserver/webtop:ubuntu-kde
 

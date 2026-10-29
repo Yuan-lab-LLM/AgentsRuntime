@@ -2,6 +2,7 @@ import { createHash, createHmac, randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs/promises";
 import net from "node:net";
+import http from "node:http";
 import path from "node:path";
 import tls from "node:tls";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
@@ -1179,14 +1180,50 @@ function managedTeamPreviewOrigin() {
   return proxy;
 }
 
-function previewUrlForTeamArtifact(cfg, file) {
-  const token = trim(process.env.CLAWMANAGER_TEAM_TOKEN);
-  const teamId = trim(cfg?.teamId || process.env.CLAWMANAGER_TEAM_ID);
-  if (!token || !teamId) {
-    throw new Error("Team artifact Browser preview is unavailable in this Runtime");
-  }
-  const origin = managedTeamPreviewOrigin();
+function managedPreviewRuntime() {
+  return process.env.CLAWMANAGER_NETWORK_ISOLATED === "1" ||
+    trim(process.env.CLAWMANAGER_MANAGED_SERVICES_URL).replace(/\/$/, "") === "http://clawmanager-local-services.invalid:31282";
+}
 
+function requestManagedPreview(relative, mode) {
+  const body = JSON.stringify({ path: relative, mode });
+  if (Buffer.byteLength(body) > 4096) return Promise.reject(new Error("Managed Team preview request is too large"));
+  return new Promise((resolve, reject) => {
+    const fail = () => reject(new Error("Managed Team preview is unavailable"));
+    // Native HTTP does not use environment proxies or follow redirects. No
+    // caller origin or credential can select or authenticate this fixed entry.
+    const request = http.request(new URL("http://clawmanager-local-services.invalid:31282/team/preview-sign"), {
+      method: "POST", headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
+    }, response => {
+      let size = 0;
+      const chunks = [];
+      response.on("data", chunk => {
+        size += chunk.length;
+        if (size > 8192) { response.destroy(); request.destroy(); fail(); return; }
+        chunks.push(chunk);
+      });
+      response.on("error", fail);
+      response.on("end", () => {
+        if (response.statusCode !== 200) { fail(); return; }
+        try {
+          const grant = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          const target = new URL(grant.url);
+          const expires = Date.parse(grant.expiresAt);
+          if (target.protocol !== "http:" || !isManagedClusterServiceHost(target.hostname, EGRESS_PROXY_SERVICE_NAME) ||
+              target.username || target.password || target.search || target.hash || !target.pathname.startsWith(`/v3/${mode}/`) ||
+              grant.mode !== mode || !Number.isFinite(expires) || expires <= Date.now() || expires > Date.now() + 300000) { fail(); return; }
+          resolve({ url: target.toString(), mode: grant.mode, expiresAt: grant.expiresAt });
+        } catch { fail(); }
+      });
+    });
+    const timer = setTimeout(() => { request.destroy(); fail(); }, 5000);
+    request.on("error", fail);
+    request.on("close", () => clearTimeout(timer));
+    request.end(body);
+  });
+}
+
+async function previewUrlForTeamArtifact(cfg, file) {
   const root = path.resolve(cfg.sharedDir);
   const relative = path.relative(root, path.resolve(file));
   if (!relative || relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) {
@@ -1194,6 +1231,13 @@ function previewUrlForTeamArtifact(cfg, file) {
   }
   const relativeParts = relative.split(path.sep).filter(Boolean);
   if (!relativeParts.length) throw new Error("Team artifact preview requires a file");
+  if (managedPreviewRuntime()) {
+    return requestManagedPreview(relativeParts.join("/"), path.extname(file).toLowerCase() === ".html" ? "interactive" : "static");
+  }
+  const token = trim(process.env.CLAWMANAGER_TEAM_TOKEN);
+  const teamId = trim(cfg?.teamId || process.env.CLAWMANAGER_TEAM_ID);
+  if (!token || !teamId) throw new Error("Team artifact Browser preview is unavailable in this Runtime");
+  const origin = managedTeamPreviewOrigin();
 
   const signedPrefix = relativeParts.slice(0, -1).join("/");
   const encodedPrefix = signedPrefix
@@ -1260,9 +1304,9 @@ async function canonicalizeReviewerCompletionReport(cfg, envelope, rootTaskId, a
 	return mirrored;
 }
 
-function optionalPreviewFields(cfg, file) {
+async function optionalPreviewFields(cfg, file) {
   try {
-    const preview = previewUrlForTeamArtifact(cfg, file);
+    const preview = await previewUrlForTeamArtifact(cfg, file);
     return {
       previewUrl: preview.url,
     };
@@ -2440,7 +2484,7 @@ function isManagedInteractivePreviewUrl(value) {
     const host = parsed.hostname.toLowerCase();
     const managedHost = isManagedClusterServiceHost(host, EGRESS_PROXY_SERVICE_NAME);
     const isolatedHost = host.endsWith("." + LEGACY_TEAM_PREVIEW_HOST);
-    return (managedHost || isolatedHost) && parsed.pathname.startsWith("/v2/interactive/");
+    return (managedHost || isolatedHost) && (parsed.pathname.startsWith("/v2/interactive/") || parsed.pathname.startsWith("/v3/interactive/"));
   } catch {
     return false;
   }
@@ -5929,7 +5973,7 @@ function createRuntime(api) {
       return {
         path: resolved.canonical,
         bytes: Buffer.byteLength(String(params?.content ?? ""), "utf8"),
-        ...optionalPreviewFields(cfg, resolved.candidate),
+        ...await optionalPreviewFields(cfg, resolved.candidate),
       };
     },
 
@@ -5960,7 +6004,7 @@ function createRuntime(api) {
           offset,
           truncated: nextOffset < stat.size,
           nextOffset: nextOffset < stat.size ? nextOffset : undefined,
-          ...optionalPreviewFields(cfg, resolved.candidate),
+          ...await optionalPreviewFields(cfg, resolved.candidate),
         };
       } finally {
         await handle.close();
@@ -5984,7 +6028,7 @@ function createRuntime(api) {
           type: entry.isDirectory() ? "directory" : entry.isFile() ? "file" : "other",
           path: canonicalArtifactRef(cfg, candidate),
           bytes: entry.isFile() ? stat.size : undefined,
-          ...(entry.isFile() ? optionalPreviewFields(cfg, candidate) : {}),
+          ...(entry.isFile() ? await optionalPreviewFields(cfg, candidate) : {}),
         });
       }
       return { path: resolved.canonical, entries: result };
@@ -5997,7 +6041,7 @@ function createRuntime(api) {
       const resolved = await resolveTeamArtifactPath(cfg, params || {}, currentEnvelope, "team");
       const stat = await fs.stat(resolved.candidate);
       if (!stat.isFile()) throw new Error("Team artifact is not a file: " + resolved.canonical);
-      const preview = previewUrlForTeamArtifact(cfg, resolved.candidate);
+      const preview = await previewUrlForTeamArtifact(cfg, resolved.candidate);
       if (["evidence", "code-review"].includes(resolveRedisTeamVerificationRole(currentEnvelope))) {
 		activeReviewVerification = mergeBrowserVerificationState(activeReviewVerification, {
           previewGenerated: true,

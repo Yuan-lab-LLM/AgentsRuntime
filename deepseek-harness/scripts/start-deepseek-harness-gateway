@@ -42,7 +42,7 @@ exec /usr/local/libexec/clawmanager-agent-image dsh-web-proxy \
 	--listen-host "${proxy_bind_host}" \
 	--port "${gateway_port}" \
 	-- \
-	dsh web \
+	node --expose-internals /usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js web \
   --patch /usr/local/share/deepseek-harness/managed.cordis.patch.yml \
 	--host 127.0.0.1 \
 	--port 0 \

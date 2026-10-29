@@ -16,12 +16,42 @@ required by dsh-market so pooled non-root instances never need to modify the
 system Node installation at runtime. ClawManager supplies the OpenAI-compatible
 base URL, instance credential, and allowed model list at runtime.
 
+Lite also locks the Cordis core family in `cordis.lock.json`. Pinning the DSH
+CLI alone permits incompatible transitive patch releases: newer HMR packages
+remove `registerConfig`, and newer Loader packages change activation ordering.
+The small official archives in `vendor/cordis` are checked against SHA256 and
+registry SHA512 integrity before installation. DSH starts with Node's explicit
+`--expose-internals` flag, which its HMR service requires. The Lite image
+applies one SHA-pinned sandbox-local patch: workspace-write commands bind the
+outer instance-private `/tmp` instead of creating another temporary filesystem.
+The read-only profile and Landlock grants retain their existing constraints.
+
+On the cluster build node, verify a built image with
+`python3 tests/lite/test_deepseek_startup.py <image>`. It starts a fresh non-root
+container without networking or user storage, checks authenticated HTTP, then
+checks plugin activation and disposal through live configuration edits.
+
 Build both images from the repository root:
 
 ```bash
 docker build -f deepseek-harness/Dockerfile.lite -t deepseek-harness-lite:local .
 docker build -f deepseek-harness/Dockerfile.pro -t deepseek-harness:local .
 ```
+
+## Lite temporary files
+
+The shared Lite manager mounts an instance-owned PVC directory at `/tmp`. Its
+identity uses the runtime, user and instance IDs, so ordinary files and metadata
+survive restarts and confirmed Pod migrations. DSH commands share that directory.
+`/run` and `/dev/shm` are recreated; running processes, sockets and IPC state do
+not migrate.
+
+Existing pools built before this support still use tmpfs. Before updating those
+pools, retain the old tmp directory through a supervisor file descriptor, stop
+and confirm the old writer, then export its final files. Restore only while
+holding the exact stopped generation's maintenance writer lease, and refuse to
+overwrite existing files. Replacing the old Pod before exporting destroys tmpfs
+contents.
 
 ## CI images
 

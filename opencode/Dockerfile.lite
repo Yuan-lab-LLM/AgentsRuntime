@@ -1,0 +1,54 @@
+# syntax=docker/dockerfile:1.7
+# Build from the AgentsRuntime repository root; the runtime composes the shared core.
+FROM --platform=$BUILDPLATFORM golang:1.26.8-bookworm@sha256:9fdc884aacc3bec89b20ffc69f4bb369c78210e3e4f600387b5128b12c199f81 AS agent-builder
+ARG TARGETOS=linux
+ARG TARGETARCH
+ARG AGENT_VERSION=dev
+COPY clawmanager-agent/ /src/clawmanager-agent/
+COPY opencode/ /src/opencode/
+WORKDIR /src/opencode
+RUN go mod download
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH:-amd64} \
+    go build -trimpath -ldflags="-s -w -X main.version=${AGENT_VERSION}" \
+    -o /out/clawmanager-agent ./cmd/opencode-lite-agent
+
+# Node/npm are user development and package tools, provided by pinned Debian slim.
+FROM node:22.23.2-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5
+ARG OPENCODE_VERSION=1.18.13
+ARG TARGETARCH
+ARG DEBIAN_FRONTEND=noninteractive
+ENV CLAWMANAGER_RUNTIME_TYPE=opencode \
+    RUNTIME_WORKSPACE_ROOT=/workspaces \
+    RUNTIME_AGENT_DATA_DIR=/var/lib/clawmanager-agent \
+    SHELL=/bin/bash
+# OpenCode's native PTY serves terminals; build tools support user project tasks.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash bubblewrap build-essential ca-certificates curl git iproute2 jq nftables openssh-client \
+    procps python3 python3-pip ripgrep tar tini unzip util-linux xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+    case "${arch}" in \
+        amd64|x86_64) oc_arch="x64" ;; \
+        arm64|aarch64) oc_arch="arm64" ;; \
+        *) echo "Unsupported architecture for OpenCode: ${arch}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-${oc_arch}.tar.gz" \
+        -o /tmp/opencode.tar.gz; \
+    mkdir -p /tmp/opencode-extract; \
+    tar -xzf /tmp/opencode.tar.gz -C /tmp/opencode-extract; \
+    bin="$(find /tmp/opencode-extract -type f -name opencode | head -1)"; \
+    test -n "${bin}"; \
+    install -m 0755 "${bin}" /usr/local/bin/opencode; \
+    opencode --version || opencode --help >/dev/null; \
+    rm -rf /tmp/opencode.tar.gz /tmp/opencode-extract
+
+COPY --from=agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent
+COPY opencode/rootfs/usr/local/bin/start-opencode-web /usr/local/bin/start-opencode-web
+COPY opencode/scripts/opencode-lite-entrypoint /usr/local/bin/opencode-lite-entrypoint
+RUN sed -i 's/\r$//' /usr/local/bin/start-opencode-web /usr/local/bin/opencode-lite-entrypoint \
+    && chmod 0755 /usr/local/bin/clawmanager-agent /usr/local/bin/start-opencode-web /usr/local/bin/opencode-lite-entrypoint \
+    && mkdir -p /var/lib/clawmanager-agent /workspaces
+EXPOSE 19090 20000-20299
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/opencode-lite-entrypoint"]

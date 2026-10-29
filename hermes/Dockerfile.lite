@@ -1,15 +1,16 @@
 # syntax=docker/dockerfile:1.7
-# Separate shared Lite runtime. The Webtop/Pro Dockerfiles are intentionally independent.
+# Build from the AgentsRuntime repository root; the runtime composes the shared core.
 FROM --platform=$BUILDPLATFORM golang:1.26.8-bookworm@sha256:9fdc884aacc3bec89b20ffc69f4bb369c78210e3e4f600387b5128b12c199f81 AS agent-builder
 ARG TARGETOS=linux
 ARG TARGETARCH
 ARG AGENT_VERSION=dev
-WORKDIR /src/clawmanager-agent
-COPY clawmanager-agent/ ./
+COPY clawmanager-agent/ /src/clawmanager-agent/
+COPY hermes/ /src/hermes/
+WORKDIR /src/hermes
 RUN go mod download
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH:-amd64} \
     go build -trimpath -ldflags="-s -w -X main.version=${AGENT_VERSION}" \
-    -o /out/clawmanager-agent ./cmd/clawmanager-agent
+    -o /out/clawmanager-agent ./cmd/hermes-lite-agent
 
 FROM ghcr.io/astral-sh/uv:0.12.10@sha256:2bb3ebca0a796a155094a27773d290c4b074572e6107f171d88d086682fd2500 AS uv
 FROM python:3.13-slim-bookworm@sha256:ed86c82274b3c69b52fb5820f358f0bd7df0b603332063cb5c6e32bd220c3e6e AS source
@@ -86,7 +87,7 @@ ENV PATH=/opt/hermes-agent/.venv/bin:/usr/local/bin:$PATH \
     RUNTIME_AGENT_LISTEN_ADDR=0.0.0.0:19090 \
     RUNTIME_GATEWAY_PORT_START=20000 RUNTIME_GATEWAY_PORT_END=20299 \
     RUNTIME_GATEWAY_PORT_BLOCK_SIZE=1 RUNTIME_GATEWAY_CAPACITY=100
-RUN apt-get update && apt-get install -y --no-install-recommends bash ca-certificates git ripgrep tini \
+RUN apt-get update && apt-get install -y --no-install-recommends bash bubblewrap build-essential ca-certificates curl git iproute2 jq libatomic1 libstdc++6 nftables openssh-client procps ripgrep tini unzip util-linux \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=python-builder /opt/hermes-agent/ /opt/hermes-agent/
 COPY --from=session-worker-builder /opt/hermes-agent/ui-tui/dist/entry.js /opt/hermes-agent/hermes_cli/tui_dist/entry.js
