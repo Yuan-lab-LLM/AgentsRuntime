@@ -2,6 +2,7 @@ package hermes
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -221,13 +222,17 @@ func mergeDesktopWebYAML(existing []byte, cfg gateway.Config, publicURL string, 
 	if len(refs) == 0 {
 		refs = []llmconfig.ModelRef{{ProviderID: "clawmanager", ModelID: "auto"}}
 	}
-	if cfg.LLMModelsQualified {
-		for index := range refs {
-			// Pinned upstream reserves auto and builtin vendor IDs before its
-			// custom-runtime resolver. A managed namespace always selects the
-			// configured OpenAI-compatible endpoint and its instance key_env.
-			refs[index].ProviderID = "clawmanager-" + strings.ToLower(refs[index].ProviderID)
+	displayNames := map[string]string{}
+	for index := range refs {
+		name := refs[index].ProviderID
+		if cfg.LLMModelsQualified {
+			// Keep the namespace required by Hermes's custom-runtime resolver.
+			refs[index].ProviderID = "clawmanager-" + strings.ToLower(name)
 		}
+		if name == "auto" || name == "clawmanager" {
+			name = "ClawManager"
+		}
+		displayNames[refs[index].ProviderID] = name
 	}
 	providers := map[string]any{}
 	for _, group := range llmconfig.GroupModelRefs(refs) {
@@ -236,8 +241,13 @@ func mergeDesktopWebYAML(existing []byte, cfg gateway.Config, publicURL string, 
 			models[model] = map[string]any{}
 		}
 		providers[group.ProviderID] = map[string]any{
-			"name": group.ProviderID, "base_url": cfg.LLMBaseURL,
-			"enabled": true, "api": "", "url": "", "key_cmd": "",
+			"name": displayNames[group.ProviderID], "base_url": cfg.LLMBaseURL,
+			// Hermes groups endpoints by URL, credentials, protocol and extra
+			// headers. This inert metadata distinguishes logical CM providers;
+			// it is never a routing or authorization input.
+			"extra_headers":   map[string]any{"X-CM-Catalog-Provider": fmt.Sprintf("%x", sha256.Sum256([]byte(group.ProviderID)))},
+			"discover_models": false,
+			"enabled":         true, "api": "", "url": "", "key_cmd": "",
 			"default_model": group.ModelIDs[0], "transport": "openai_chat",
 			"api_mode": "chat_completions", "key_env": "OPENAI_API_KEY",
 			"api_key": "", "api_key_env": "OPENAI_API_KEY", "models": models,
@@ -259,6 +269,26 @@ func mergeDesktopWebYAML(existing []byte, cfg gateway.Config, publicURL string, 
 		return nil, fmt.Errorf("workspace_unavailable: encode managed Hermes YAML")
 	}
 	mergeDesktopWebYAMLNode(document.Content[0], &overlay)
+	// The managed inventory is authoritative. Preserve metadata for retained
+	// models, but remove obsolete/sibling entries left by recursive overlays.
+	providerNode := desktopWebYAMLMappingValue(document.Content[0], "providers")
+	for _, group := range llmconfig.GroupModelRefs(refs) {
+		node := desktopWebYAMLMappingValue(desktopWebYAMLMappingValue(providerNode, group.ProviderID), "models")
+		if node == nil || node.Kind != yaml.MappingNode {
+			continue
+		}
+		allowed := map[string]bool{}
+		for _, id := range group.ModelIDs {
+			allowed[id] = true
+		}
+		content := make([]*yaml.Node, 0, len(node.Content))
+		for index := 0; index+1 < len(node.Content); index += 2 {
+			if allowed[node.Content[index].Value] {
+				content = append(content, node.Content[index], node.Content[index+1])
+			}
+		}
+		node.Content = content
+	}
 	if err := applyManagedVisionYAML(document.Content[0], cfg); err != nil {
 		return nil, err
 	}

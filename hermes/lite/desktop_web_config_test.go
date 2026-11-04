@@ -2,6 +2,7 @@ package hermes
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -503,5 +504,68 @@ func TestDesktopWebQualifiedProvidersUseManagedCustomNamespace(t *testing.T) {
 	}
 	if _, exists := providers["deepseek"]; exists {
 		t.Fatal("emitted upstream builtin deepseek provider")
+	}
+}
+
+func TestDesktopWebManagedCatalogKeepsProviderGroupsSeparate(t *testing.T) {
+	before := []byte(`providers:
+  clawmanager-auto:
+    models:
+      auto: {context_length: 12345}
+      stale-model: {}
+  clawmanager-icompify:
+    models:
+      icompify: {}
+      model-a: {supports_tools: true}
+  user-provider:
+    models: {user-model: {}}
+`)
+	cfg := gateway.Config{LLMBaseURL: "http://gateway.platform.svc/v1", LLMModelsQualified: true, LLMModelIDs: []string{"auto/auto", "icompify/model-a", "icompify/model-b", "second-vendor/model-c"}}
+	raw, err := mergeDesktopWebYAML(before, cfg, "http://backend.platform.svc/proxy", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err = yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	ps := doc["providers"].(map[string]any)
+	identities := map[string]bool{}
+	for provider, ids := range map[string][]string{"auto": {"auto"}, "icompify": {"model-a", "model-b"}, "second-vendor": {"model-c"}} {
+		p := ps["clawmanager-"+provider].(map[string]any)
+		displayName := provider
+		if provider == "auto" {
+			displayName = "ClawManager"
+		}
+		if p["name"] != displayName {
+			t.Fatalf("display name conceals provider: %v", p["name"])
+		}
+		if p["discover_models"] != false {
+			t.Fatal("managed catalog can expand through upstream discovery")
+		}
+		headers, ok := p["extra_headers"].(map[string]any)
+		if !ok || len(headers) == 0 {
+			t.Fatal("same-endpoint providers will be merged by Hermes")
+		}
+		identity := fmt.Sprint(headers["X-CM-Catalog-Provider"])
+		if identity == "" || identity == "<nil>" || identities[identity] {
+			t.Fatal("provider grouping identity is not distinct")
+		}
+		identities[identity] = true
+		models := p["models"].(map[string]any)
+		if len(models) != len(ids) {
+			t.Fatalf("managed inventory retained stale or foreign models: %s %v", provider, models)
+		}
+		for _, id := range ids {
+			if _, ok := models[id]; !ok {
+				t.Fatalf("missing %s/%s", provider, id)
+			}
+		}
+	}
+	if ps["clawmanager-auto"].(map[string]any)["models"].(map[string]any)["auto"].(map[string]any)["context_length"] != 12345 {
+		t.Fatal("valid model metadata lost")
+	}
+	if _, ok := ps["user-provider"].(map[string]any)["models"].(map[string]any)["user-model"]; !ok {
+		t.Fatal("user-owned provider was removed")
 	}
 }
