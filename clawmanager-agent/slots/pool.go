@@ -23,6 +23,8 @@ import (
 type Call func(context.Context, int, string, string, []byte) (int, []byte, error)
 
 type Assignment struct {
+	PodUID     string `json:"pod_uid,omitempty"`
+	IdleStop   bool   `json:"idle_stop,omitempty"`
 	GatewayID  string `json:"gateway_id"`
 	InstanceID int    `json:"instance_id"`
 	UserID     int    `json:"user_id"`
@@ -207,6 +209,37 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		req.PortRange = gateway.PortRange{Start: req.GatewayPort, End: req.GatewayPort + p.cfg.GatewayPortBlockSize - 1}
 		body, _ = json.Marshal(req)
 		p.forward(w, r, index, body)
+		return
+	}
+
+	if id, operation := idleOperation(r.URL.Path); operation != "" {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		req, err := decodeIdleRequest(body, id, p.cfg.PodUID)
+		if err != nil {
+			http.Error(w, "invalid idle-stop identity", 400)
+			return
+		}
+		snapshots, _ := p.snapshots(r.Context())
+		selected := -1
+		for i, s := range snapshots {
+			if a := s.Assignment; a != nil && a.GatewayID == id {
+				if selected != -1 || a.InstanceID != req.InstanceID || a.Generation != req.Generation {
+					http.Error(w, "ambiguous idle-stop source", 409)
+					return
+				}
+				selected = i
+			}
+		}
+		if selected < 0 {
+			http.Error(w, "idle-stop source is unknown", 409)
+			return
+		}
+		// Preserve method and path, including a 404/405 from an old worker. Never
+		// translate this operation to the forceful manual stop protocol.
+		p.forward(w, r, selected, body)
 		return
 	}
 	snapshots, _ := p.snapshots(r.Context())

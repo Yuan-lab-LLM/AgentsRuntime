@@ -15,6 +15,10 @@ import (
 )
 
 type gatewayRecord struct {
+	idleStop             bool
+	idleChecking         bool
+	activeCommands       int
+	idleRelease          func()
 	stopOperation        string
 	stopBusy             bool
 	stopConfirmed        bool
@@ -365,9 +369,24 @@ func (m *GatewayManager) gatewayAutomationsForAttempt(req CreateGatewayRequest, 
 	if !ok {
 		return m.gatewayAutomations(req)
 	}
-	execute := func(ctx context.Context, command, overrides []string) ([]byte, error) {
+	return provider.ManagedGatewayAutomations(m.cfg, req, m.gatewayCommandExecutor(spec, process, true))
+}
+
+func (m *GatewayManager) gatewayCommandExecutor(spec GatewayStartSpec, process ManagedProcess, business bool) GatewayAutomationExecutor {
+	return func(ctx context.Context, command, overrides []string) ([]byte, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
+		}
+		if business {
+			m.mu.Lock()
+			record := m.gateways[spec.GatewayID]
+			if record == nil || record.process.PID != process.PID || record.idleStop || record.idleChecking {
+				m.mu.Unlock()
+				return nil, ErrGatewayIdleBusy
+			}
+			record.activeCommands++
+			m.mu.Unlock()
+			defer func() { m.mu.Lock(); record.activeCommands--; m.mu.Unlock() }()
 		}
 		runner, ok := m.starter.(GatewayCommandRunner)
 		if !ok || process.VerifyListeners == nil {
@@ -387,9 +406,16 @@ func (m *GatewayManager) gatewayAutomationsForAttempt(req CreateGatewayRequest, 
 			}
 			commandSpec.Env = setEnv(commandSpec.Env, key, value)
 		}
-		return runner.RunGatewayCommand(ctx, commandSpec)
+		output, err := runner.RunGatewayCommand(ctx, commandSpec)
+		if errors.Is(err, ErrGatewayStopFailed) {
+			m.mu.Lock()
+			if record := m.gateways[spec.GatewayID]; record != nil && record.process.PID == process.PID {
+				record.automationStopFailed = true
+			}
+			m.mu.Unlock()
+		}
+		return output, err
 	}
-	return provider.ManagedGatewayAutomations(m.cfg, req, execute)
 }
 
 func (m *GatewayManager) gatewayIsRunning(id string) bool {
