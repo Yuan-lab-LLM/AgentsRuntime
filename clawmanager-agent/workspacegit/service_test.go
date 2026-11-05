@@ -677,3 +677,196 @@ func TestPushHonorsConfiguredPushRemote(t *testing.T) {
 		t.Fatal("configured push remote was not updated")
 	}
 }
+
+func TestUnbornUnstageAfterWorktreeEditPreservesFile(t *testing.T) {
+	root := t.TempDir()
+	gitTest(t, root, "init", "-b", "main")
+	s, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executeTest(t, s, Request{Operation: "import"})
+	path := filepath.Join(root, "new.txt")
+	writeTest(t, path, "staged version\n")
+	executeTest(t, s, Request{Operation: "stage", Paths: []string{"new.txt"}})
+	writeTest(t, path, "newer unstaged version\n")
+	res := executeTest(t, s, Request{Operation: "unstage", Paths: []string{"new.txt"}})
+	if len(res.Status.Changes) != 1 || res.Status.Changes[0].Path != "new.txt" || !res.Status.Changes[0].Untracked || res.Status.Changes[0].Staged {
+		t.Fatalf("unstaged change: %+v", res.Status.Changes)
+	}
+	if data, err := os.ReadFile(path); err != nil || string(data) != "newer unstaged version\n" {
+		t.Fatal("unstage changed the working file")
+	}
+	if files := gitTest(t, root, "ls-files"); files != "" {
+		t.Fatalf("index still contains %q", files)
+	}
+}
+
+func trackedRegistryTest(t *testing.T, repo string) {
+	t.Helper()
+	dir := filepath.Join(repo, ".clawmanager")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeTest(t, filepath.Join(dir, "git-projects.json"), `{"version":1,"projects":[]}`)
+	writeTest(t, filepath.Join(dir, "git-projects.lock"), "tracked lock contents\n")
+	gitTest(t, repo, "add", ".clawmanager/git-projects.json", ".clawmanager/git-projects.lock")
+	gitTest(t, repo, "commit", "-m", "track reserved metadata")
+}
+
+func registryPreservedTest(t *testing.T, root string, registry []byte, lock os.FileInfo) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(root, ".clawmanager", "git-projects.json"))
+	if err != nil || string(data) != string(registry) {
+		t.Fatal("Git replaced the project registry")
+	}
+	after, err := os.Stat(filepath.Join(root, ".clawmanager", "git-projects.lock"))
+	if err != nil || !os.SameFile(lock, after) {
+		t.Fatal("Git replaced the live registry lock inode")
+	}
+}
+
+func TestRootCheckoutRejectsReservedDestinationTree(t *testing.T) {
+	root := t.TempDir()
+	repoTest(t, root, "")
+	gitTest(t, root, "switch", "-c", "reserved")
+	trackedRegistryTest(t, root)
+	gitTest(t, root, "switch", "main")
+	s, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executeTest(t, s, Request{Operation: "import"})
+	registry, err := os.ReadFile(filepath.Join(root, ".clawmanager", "git-projects.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.Stat(filepath.Join(root, ".clawmanager", "git-projects.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	errorTest(t, s, Request{Operation: "checkout", Branch: "reserved"}, "reserved_metadata")
+	registryPreservedTest(t, root, registry, lock)
+	if branch := gitTest(t, root, "branch", "--show-current"); branch != "main" {
+		t.Fatalf("checkout changed branch to %q", branch)
+	}
+	if projects := executeTest(t, s, Request{Operation: "projects"}).Projects; len(projects) != 1 || projects[0].Path != "" {
+		t.Fatalf("registered root lost: %+v", projects)
+	}
+}
+
+func TestRootCheckoutCannotOverwriteTrackedRegistryAndLock(t *testing.T) {
+	root := t.TempDir()
+	repoTest(t, root, "")
+	trackedRegistryTest(t, root)
+	registryPath := filepath.Join(root, ".clawmanager", "git-projects.json")
+	lockPath := filepath.Join(root, ".clawmanager", "git-projects.lock")
+	writeTest(t, registryPath, `{"version":1,"projects":[{"path":"","name":"Root"}]}`)
+	gitTest(t, root, "add", ".clawmanager/git-projects.json")
+	gitTest(t, root, "commit", "-m", "registered root")
+	gitTest(t, root, "switch", "-c", "reserved")
+	writeTest(t, registryPath, `{"version":1,"projects":[]}`)
+	writeTest(t, lockPath, "replacement lock\n")
+	gitTest(t, root, "add", ".clawmanager")
+	gitTest(t, root, "commit", "-m", "different registry and lock")
+	gitTest(t, root, "switch", "main")
+	s, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := os.ReadFile(registryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.Stat(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	errorTest(t, s, Request{Operation: "checkout", Branch: "reserved"}, "reserved_metadata")
+	registryPreservedTest(t, root, registry, lock)
+	if projects := executeTest(t, s, Request{Operation: "projects"}).Projects; len(projects) != 1 {
+		t.Fatal("checkout removed root registration")
+	}
+}
+
+func TestRootImportRejectsTrackedReservedMetadata(t *testing.T) {
+	root := t.TempDir()
+	repoTest(t, root, "")
+	trackedRegistryTest(t, root)
+	registry, err := os.ReadFile(filepath.Join(root, ".clawmanager", "git-projects.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.Stat(filepath.Join(root, ".clawmanager", "git-projects.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	errorTest(t, s, Request{Operation: "import"}, "reserved_metadata")
+	registryPreservedTest(t, root, registry, lock)
+}
+
+func TestRootStageAndCommitRejectExternallyStagedRegistry(t *testing.T) {
+	root := t.TempDir()
+	repoTest(t, root, "")
+	s, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executeTest(t, s, Request{Operation: "import"})
+	registry, err := os.ReadFile(filepath.Join(root, ".clawmanager", "git-projects.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.Stat(filepath.Join(root, ".clawmanager", "git-projects.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, root, "add", ".clawmanager/git-projects.json", ".clawmanager/git-projects.lock")
+	writeTest(t, filepath.Join(root, "one.txt"), "business edit\n")
+	errorTest(t, s, Request{Operation: "stage", Paths: []string{"one.txt"}}, "reserved_metadata")
+	before := gitTest(t, root, "rev-parse", "HEAD")
+	errorTest(t, s, Request{Operation: "commit", Message: "must not commit management metadata"}, "reserved_metadata")
+	if after := gitTest(t, root, "rev-parse", "HEAD"); after != before {
+		t.Fatal("commit changed HEAD")
+	}
+	registryPreservedTest(t, root, registry, lock)
+}
+
+func TestRootPullRejectsReservedRemoteTree(t *testing.T) {
+	root := t.TempDir()
+	source := repoTest(t, root, "source")
+	target := filepath.Join(root, "working")
+	gitTest(t, root, "clone", source, target)
+	// A loopback Git server would be a valid external remote, but the focused
+	// fixture uses a workspace-local source so only repository semantics matter.
+	insideRemote := filepath.Join(target, "remote.git")
+	gitTest(t, target, "init", "--bare", insideRemote)
+	gitTest(t, source, "push", insideRemote, "main")
+	gitTest(t, target, "remote", "set-url", "origin", insideRemote)
+	writeTest(t, filepath.Join(target, ".git", "info", "exclude"), "remote.git/\n")
+	s, err := New(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executeTest(t, s, Request{Operation: "import"})
+	registry, err := os.ReadFile(filepath.Join(target, ".clawmanager", "git-projects.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.Stat(filepath.Join(target, ".clawmanager", "git-projects.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	trackedRegistryTest(t, source)
+	gitTest(t, source, "push", insideRemote, "main")
+	before := gitTest(t, target, "rev-parse", "HEAD")
+	errorTest(t, s, Request{Operation: "pull"}, "reserved_metadata")
+	if after := gitTest(t, target, "rev-parse", "HEAD"); after != before {
+		t.Fatal("pull changed HEAD")
+	}
+	registryPreservedTest(t, target, registry, lock)
+}

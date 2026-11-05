@@ -92,6 +92,11 @@ func (s *Service) Execute(ctx context.Context, req Request) (Response, error) {
 		return Response{}, err
 	}
 	res := Response{Project: project}
+	if req.Operation == "stage" || req.Operation == "commit" || req.Operation == "pull" {
+		if err = s.protectRegistry(ctx, dir); err != nil {
+			return Response{}, err
+		}
+	}
 	switch req.Operation {
 	case "status":
 		res.Status, err = s.status(ctx, dir)
@@ -122,7 +127,9 @@ func (s *Service) Execute(ctx context.Context, req Request) (Response, error) {
 			if born {
 				args = []string{"restore", "--staged", "--source=HEAD", "--"}
 			} else {
-				args = []string{"rm", "--cached", "--ignore-unmatch", "--"}
+				// Force applies only to index removal. Newer worktree content must
+				// survive even when it differs from the staged unborn version.
+				args = []string{"rm", "--cached", "--force", "--ignore-unmatch", "--"}
 			}
 		}
 		_, err = runGit(ctx, dir, streamLimit, "", append(args, paths...)...)
@@ -136,6 +143,9 @@ func (s *Service) Execute(ctx context.Context, req Request) (Response, error) {
 			break
 		}
 		if req.Operation == "checkout" {
+			if err = s.protectRegistry(ctx, dir, "refs/heads/"+req.Branch); err != nil {
+				break
+			}
 			if err = s.requireClean(ctx, dir); err != nil {
 				break
 			}
@@ -214,6 +224,9 @@ func (s *Service) register(ctx context.Context, reg *registry, req Request) (Res
 	}
 	dir, err = s.repository(ctx, req.Path)
 	if err != nil {
+		return Response{}, err
+	}
+	if err = s.protectRegistry(ctx, dir); err != nil {
 		return Response{}, err
 	}
 	name := req.Name
@@ -531,11 +544,14 @@ func (s *Service) syncRemote(ctx context.Context, dir, operation string) error {
 		if err != nil {
 			return err
 		}
-		if err = s.requireClean(ctx, dir); err != nil {
-			return err
-		}
 		fetched, err := runGit(ctx, dir, streamLimit, "", "rev-parse", "--verify", "FETCH_HEAD^{commit}")
 		if err != nil {
+			return err
+		}
+		if err = s.protectRegistry(ctx, dir, strings.TrimSpace(fetched.output)); err != nil {
+			return err
+		}
+		if err = s.requireClean(ctx, dir); err != nil {
 			return err
 		}
 		_, err = runGit(ctx, dir, streamLimit, "", "-c", "merge.autoStash=false", "merge", "--ff-only", "--no-autostash", "--no-edit", "--no-overwrite-ignore", "--", strings.TrimSpace(fetched.output))

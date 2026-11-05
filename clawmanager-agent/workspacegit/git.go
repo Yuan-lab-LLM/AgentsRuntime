@@ -230,7 +230,7 @@ func (s *Service) status(ctx context.Context, dir string) (*Status, error) {
 			}
 			c.PreviousPath = fields[i]
 		}
-		if s.managementPath(dir, c.Path) {
+		if c.Untracked && s.managementPath(dir, c.Path) {
 			continue
 		}
 		status.Changes = append(status.Changes, c)

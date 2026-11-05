@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -156,6 +157,55 @@ func (s *Service) saveRegistry(reg *registry) error {
 	defer d.Close()
 	if err = d.Sync(); err != nil {
 		return failure("registry_unavailable", "The Git project registry directory could not be synced.")
+	}
+	return nil
+}
+
+// Root repositories must never version the reserved directory: a whole-tree
+// switch or merge could otherwise replace both the registry and the inode on
+// which other helpers coordinate their lock. Check before any worktree write.
+func (s *Service) protectRegistry(ctx context.Context, dir string, targets ...string) error {
+	if dir != s.root {
+		return nil
+	}
+	index, err := runGit(ctx, dir, streamLimit, "", "ls-files", "-z", "--")
+	if err != nil {
+		return err
+	}
+	if err = checkReservedEntries(index.output); err != nil {
+		return err
+	}
+	born, err := hasHEAD(ctx, dir)
+	if err != nil {
+		return err
+	}
+	if born {
+		targets = append(targets, "HEAD")
+	}
+	for _, target := range targets {
+		tree, err := runGit(ctx, dir, streamLimit, "", "ls-tree", "-r", "-z", "--name-only", target, "--")
+		if err != nil {
+			return err
+		}
+		if err = checkReservedEntries(tree.output); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func checkReservedEntries(output string) error {
+	if output == "" {
+		return nil
+	}
+	if !strings.HasSuffix(output, "\x00") {
+		return failure("invalid_output", "Git returned incomplete tracked paths.")
+	}
+	for _, path := range strings.Split(strings.TrimSuffix(output, "\x00"), "\x00") {
+		first, _, _ := strings.Cut(path, "/")
+		if strings.EqualFold(first, ".clawmanager") {
+			return failure("reserved_metadata", "The workspace root repository tracks reserved .clawmanager metadata. Remove that directory from Git tracking before continuing.")
+		}
 	}
 	return nil
 }
