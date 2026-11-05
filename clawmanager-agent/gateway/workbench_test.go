@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"github.com/iamlovingit/clawmanager-agent/workbench"
+	"net"
 	"sync/atomic"
 	"testing"
 )
@@ -72,4 +73,52 @@ func TestWorkbenchScopeAndBusinessExecution(t *testing.T) {
 	if s.calls.Load() != 1 {
 		t.Fatal("business executor bypassed")
 	}
+}
+
+func TestWorkbenchPreviewLifetimeDoesNotPreventIdle(t *testing.T) {
+	s := &previewTestStarter{isolatedTestStarter: isolatedTestStarter{start: func(GatewayStartSpec) (ManagedProcess, error) {
+		return ManagedProcess{PID: 42, Stop: func(context.Context) error { return nil }, VerifyListeners: func(context.Context) error { return nil }}, nil
+	}}}
+	m := isolatedTestManager(t, isolatedTestProfile{}, s.isolatedTestStarter)
+	m.starter = s
+	created, err := m.CreateGateway(context.Background(), isolatedRequest(m, 1, 1, 20000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	awaitIsolatedState(t, m, created.GatewayID, "running")
+	req := workbench.Request{InstanceID: 1, UserID: 1, Generation: 1, GatewayID: created.GatewayID}
+	entered := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- m.WorkbenchPreviewWithAdmission(context.Background(), req, nil, func(ctx context.Context, _ func(context.Context, string, string) (net.Conn, error)) error {
+			close(entered)
+			<-ctx.Done()
+			return nil
+		})
+	}()
+	<-entered
+	m.mu.Lock()
+	record := m.gateways[created.GatewayID]
+	active := record.activeCommands
+	m.mu.Unlock()
+	if active != 0 {
+		t.Fatalf("preview blocked idle: %d", active)
+	}
+	if err = m.closeWorkbench(record); err != nil {
+		t.Fatal(err)
+	}
+	if err = <-done; err != nil {
+		t.Fatal(err)
+	}
+	req.Generation++
+	if err = m.WorkbenchPreviewWithAdmission(context.Background(), req, nil, nil); !errors.Is(err, ErrStaleGeneration) {
+		t.Fatalf("stale: %v", err)
+	}
+}
+
+type previewTestStarter struct{ isolatedTestStarter }
+
+func (*previewTestStarter) GatewayPreviewAvailable(GatewayStartSpec) bool { return true }
+func (*previewTestStarter) DialGatewayPreview(context.Context, GatewayStartSpec, string, string) (net.Conn, error) {
+	return nil, errors.New("unused")
 }

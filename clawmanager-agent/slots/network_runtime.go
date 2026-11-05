@@ -204,10 +204,15 @@ func prepareNetworkSession(parent context.Context, cfg gateway.Config, req gatew
 		}
 	}()
 	var ports []int
-	for offset := 0; offset < block; offset++ {
+	for offset := 0; offset <= block; offset++ {
 		nativePort := port + offset
-		ports = append(ports, nativePort)
 		path := filepath.Join(resources.privateDir, strconv.Itoa(nativePort)+".sock")
+		if offset == block {
+			path = filepath.Join(resources.privateDir, "preview.sock")
+			session.previewSocket = path
+		} else {
+			ports = append(ports, nativePort)
+		}
 		listener, e := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
 		if e != nil {
 			return session, fmt.Errorf("private native listener unavailable")
@@ -247,7 +252,7 @@ func prepareNetworkSession(parent context.Context, cfg gateway.Config, req gatew
 	if resources.rootless != nil {
 		helper.Cancel = func() error { return sandbox.SignalProcess(helper.Process, 65534, syscall.SIGKILL) }
 	}
-	data, _ := json.Marshal(netrelay.Config{Broker: net.JoinHostPort(parentIP, "31280"), IngressPorts: ports})
+	data, _ := json.Marshal(netrelay.Config{Broker: net.JoinHostPort(parentIP, "31280"), IngressPorts: ports, Preview: true})
 	helper.Stdin = bytes.NewReader(data)
 	helper.Stderr = io.Discard
 	output, err := helper.StdoutPipe()

@@ -95,6 +95,10 @@ func (w *Worker) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		http.Error(out, "unauthorized", 401)
 		return
 	}
+	if r.URL.Path == "/v1/workbench/preview" {
+		w.serveWorkbenchPreview(out, r)
+		return
+	}
 	if r.URL.Path == "/v1/workbench" {
 		w.serveWorkbench(out, r)
 		return

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"github.com/iamlovingit/clawmanager-agent/workbench"
 	"github.com/iamlovingit/clawmanager-agent/workspacegit"
+	"net"
 	"os"
 	"sync"
 	"time"
@@ -30,7 +31,20 @@ func (m *GatewayManager) Workbench(ctx context.Context, req workbench.Request) (
 // WorkbenchWithAdmission releases an external assignment fence only after the
 // manager has admitted or rejected the request. The worker uses this to close
 // the durable StopIntent/admission race without locking during business work.
-func (m *GatewayManager) WorkbenchWithAdmission(ctx context.Context, req workbench.Request, release func()) (result any, resultErr error) {
+type workbenchPreviewStarter interface {
+	GatewayPreviewAvailable(GatewayStartSpec) bool
+	DialGatewayPreview(context.Context, GatewayStartSpec, string, string) (net.Conn, error)
+}
+type previewHandler func(context.Context, func(context.Context, string, string) (net.Conn, error)) error
+
+func (m *GatewayManager) WorkbenchPreviewWithAdmission(ctx context.Context, req workbench.Request, release func(), serve previewHandler) error {
+	_, err := m.workbenchWithAdmission(ctx, req, release, serve, true)
+	return err
+}
+func (m *GatewayManager) WorkbenchWithAdmission(ctx context.Context, req workbench.Request, release func()) (any, error) {
+	return m.workbenchWithAdmission(ctx, req, release, nil, false)
+}
+func (m *GatewayManager) workbenchWithAdmission(ctx context.Context, req workbench.Request, release func(), serve previewHandler, preview bool) (result any, resultErr error) {
 	var releaseOnce sync.Once
 	unlock := func() {
 		if release != nil {
@@ -61,19 +75,27 @@ func (m *GatewayManager) WorkbenchWithAdmission(ctx context.Context, req workben
 		return nil, ErrGatewayIdleBusy
 	}
 	attempt.requests.Add(1)
-	record.activeCommands++
+	if !preview {
+		record.activeCommands++
+	}
 	m.mu.Unlock()
 	unlock()
 	defer func() {
 		m.mu.Lock()
-		record.activeCommands--
+		if !preview {
+			record.activeCommands--
+		}
 		if errors.Is(resultErr, ErrGatewayStopFailed) {
 			record.automationStopFailed = true
 		}
 		m.mu.Unlock()
 		attempt.requests.Done()
 	}()
-	joined, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	joined, cancel := context.WithCancel(ctx)
+	if !preview {
+		cancel()
+		joined, cancel = context.WithTimeout(ctx, 2*time.Minute)
+	}
 	stop := context.AfterFunc(attempt.ctx, cancel)
 	defer func() { stop(); cancel() }()
 	ctx = joined
@@ -83,11 +105,35 @@ func (m *GatewayManager) WorkbenchWithAdmission(ctx context.Context, req workben
 	if err := process.VerifyListeners(ctx); err != nil {
 		return nil, ErrGatewayIdleBusy
 	}
+	if preview {
+		runner, ok := m.starter.(workbenchPreviewStarter)
+		if !ok || !runner.GatewayPreviewAvailable(spec) || serve == nil {
+			return nil, workbench.Failure("unsupported_runtime", "Private preview transport is unavailable.")
+		}
+		return nil, serve(ctx, func(dialCtx context.Context, network, address string) (net.Conn, error) {
+			joined, cancel := context.WithCancel(dialCtx)
+			stop := context.AfterFunc(ctx, cancel)
+			conn, err := runner.DialGatewayPreview(joined, spec, network, address)
+			if err != nil {
+				stop()
+				cancel()
+				return nil, err
+			}
+			// Transport may detach dial cancellation. The admitted request lifetime is
+			// independently attached until the actual raw connection closes.
+			wrapped := &previewConn{Conn: conn, finish: func() { stop(); cancel() }}
+			stopConn := context.AfterFunc(ctx, func() { conn.Close() })
+			wrapped.finish = func() { stopConn(); stop(); cancel() }
+			return wrapped, nil
+		})
+	}
 	switch req.Operation {
 	case "capabilities":
 		_, terminal := m.starter.(workbenchTerminalStarter)
 		_, git := m.starter.(GatewayCommandRunner)
-		return map[string]any{"git": git, "terminal": terminal, "preview": false, "processes": true, "version": 1}, nil
+		previewRunner, ok := m.starter.(workbenchPreviewStarter)
+		available := ok && previewRunner.GatewayPreviewAvailable(spec)
+		return map[string]any{"git": git, "terminal": terminal, "preview": available, "processes": true, "version": 1}, nil
 	case "git":
 		var request workspacegit.Request
 		if json.Unmarshal(req.Data, &request) != nil {
@@ -158,4 +204,17 @@ func (m *GatewayManager) closeWorkbench(record *gatewayRecord) error {
 		return errors.Join(ErrGatewayStopFailed, err)
 	}
 	return nil
+}
+
+// Closing a connection releases the cancellation registration exactly once.
+type previewConn struct {
+	net.Conn
+	once   sync.Once
+	finish func()
+}
+
+func (c *previewConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(func() { c.finish() })
+	return err
 }

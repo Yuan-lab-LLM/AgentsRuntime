@@ -61,35 +61,9 @@ func (p *Pool) serveWorkbench(w http.ResponseWriter, r *http.Request) {
 		workbenchError(w, err)
 		return
 	}
-	p.mu.RLock()
-	draining := p.draining
-	p.mu.RUnlock()
-	if draining {
-		workbenchError(w, gateway.ErrGatewayIdleBusy)
-		return
-	}
-	snapshots, healthy := p.snapshots(r.Context())
-	selected := -1
-	matches := 0
-	// Unknown slots cannot prove that the requested identity has a unique owner.
-	if healthy != p.count {
-		workbenchError(w, gateway.ErrStaleGeneration)
-		return
-	}
-	for i, snapshot := range snapshots {
-		if a := snapshot.Assignment; a != nil && a.InstanceID == req.InstanceID && a.State != "stopped" {
-			matches++
-			if !snapshot.Quarantined && matchesWorkbench(a, req) {
-				for _, g := range snapshot.Gateways {
-					if g.GatewayID == req.GatewayID && g.InstanceID == req.InstanceID && g.UserID == req.UserID && g.Generation == req.Generation && g.State == "running" {
-						selected = i
-					}
-				}
-			}
-		}
-	}
-	if selected < 0 || matches != 1 {
-		workbenchError(w, gateway.ErrStaleGeneration)
+	selected, err := p.workbenchSlot(r.Context(), req)
+	if err != nil {
+		workbenchError(w, err)
 		return
 	}
 	p.forward(w, r, selected, raw)
@@ -113,4 +87,36 @@ func (w *Worker) serveWorkbench(out http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(out, 200, result)
+}
+
+func (p *Pool) workbenchSlot(ctx context.Context, req workbench.Request) (int, error) {
+	p.mu.RLock()
+	draining := p.draining
+	p.mu.RUnlock()
+	if draining {
+		return -1, gateway.ErrGatewayIdleBusy
+	}
+	snapshots, healthy := p.snapshots(ctx)
+	selected := -1
+	matches := 0
+	// Unknown slots cannot prove that the requested identity has a unique owner.
+	if healthy != p.count {
+		return -1, gateway.ErrStaleGeneration
+	}
+	for i, snapshot := range snapshots {
+		if a := snapshot.Assignment; a != nil && a.InstanceID == req.InstanceID && a.State != "stopped" {
+			matches++
+			if !snapshot.Quarantined && matchesWorkbench(a, req) {
+				for _, g := range snapshot.Gateways {
+					if g.GatewayID == req.GatewayID && g.InstanceID == req.InstanceID && g.UserID == req.UserID && g.Generation == req.Generation && g.State == "running" {
+						selected = i
+					}
+				}
+			}
+		}
+	}
+	if selected < 0 || matches != 1 {
+		return -1, gateway.ErrStaleGeneration
+	}
+	return selected, nil
 }
