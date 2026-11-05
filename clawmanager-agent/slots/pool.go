@@ -23,30 +23,36 @@ import (
 type Call func(context.Context, int, string, string, []byte) (int, []byte, error)
 
 type Assignment struct {
-	PodUID     string `json:"pod_uid,omitempty"`
-	IdleStop   bool   `json:"idle_stop,omitempty"`
-	GatewayID  string `json:"gateway_id"`
-	InstanceID int    `json:"instance_id"`
-	UserID     int    `json:"user_id"`
-	Generation int    `json:"generation"`
-	State      string `json:"state"`
+	WorkerEpoch string `json:"worker_epoch,omitempty"`
+	PodUID      string `json:"pod_uid,omitempty"`
+	IdleStop    bool   `json:"idle_stop,omitempty"`
+	GatewayID   string `json:"gateway_id"`
+	InstanceID  int    `json:"instance_id"`
+	UserID      int    `json:"user_id"`
+	Generation  int    `json:"generation"`
+	State       string `json:"state"`
 }
 
 type Snapshot struct {
-	Gateways    []gateway.GatewayState     `json:"gateways"`
-	Assignment  *Assignment                `json:"assignment,omitempty"`
-	Skills      gateway.SkillReportPayload `json:"skills"`
-	Quarantined bool                       `json:"quarantined"`
+	MaintenanceOperationID string                     `json:"maintenance_operation_id,omitempty"`
+	WorkerEpoch            string                     `json:"worker_epoch,omitempty"`
+	Digest                 string                     `json:"digest,omitempty"`
+	Gateways               []gateway.GatewayState     `json:"gateways"`
+	Assignment             *Assignment                `json:"assignment,omitempty"`
+	Skills                 gateway.SkillReportPayload `json:"skills"`
+	Quarantined            bool                       `json:"quarantined"`
 }
 
 type Pool struct {
-	cfg      gateway.Config
-	count    int
-	call     Call
-	metadata *gateway.GatewayManager
-	mu       sync.RWMutex
-	proxyMu  sync.Mutex
-	draining bool
+	maintenanceMu sync.Mutex
+	maintenance   map[string]*nativeUpgradeSession
+	cfg           gateway.Config
+	count         int
+	call          Call
+	metadata      *gateway.GatewayManager
+	mu            sync.RWMutex
+	proxyMu       sync.Mutex
+	draining      bool
 }
 
 func NewPool(cfg gateway.Config, count int, call Call) (*Pool, error) {
@@ -93,15 +99,56 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "upgrade activation pending", 503)
 			return
 		}
-		if _, healthy := p.snapshots(r.Context()); healthy == 0 {
-			http.Error(w, "no healthy slots", 503)
-			return
+		// NFS stop preparation holds the affected worker's assignment mutex.
+		// Management readiness must remain independent of that worker so an
+		// already assigned peer keeps its coordinator authority during reset.
+		if p.cfg.SandboxProfile != "nfs-rootless-v1" {
+			if _, healthy := p.snapshots(r.Context()); healthy == 0 {
+				http.Error(w, "no healthy slots", 503)
+				return
+			}
 		}
 		w.WriteHeader(200)
 		return
 	}
 	if subtle.ConstantTimeCompare([]byte(r.Header.Get(gateway.ControlTokenHeader)), []byte(p.cfg.ControlToken)) != 1 {
 		http.Error(w, "unauthorized", 401)
+		return
+	}
+	if p.serveNativeUpgrades(w, r) {
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/v1/slots/") {
+		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/v1/slots/"), "/")
+		if len(parts) != 2 || !strings.HasPrefix(parts[0], "slot-") {
+			http.NotFound(w, r)
+			return
+		}
+		index, err := slotIndex(strings.TrimPrefix(parts[0], "slot-"))
+		if err != nil || index >= p.count {
+			http.Error(w, "invalid slot", 400)
+			return
+		}
+		if parts[1] == "state" && r.Method == http.MethodGet {
+			copyReq := r.Clone(r.Context())
+			copyReq.URL.Path = "/v1/slot-state"
+			copyReq.URL.RawQuery = ""
+			p.forward(w, copyReq, index, nil)
+			return
+		}
+		if (parts[1] == "reconcile-stop" || parts[1] == "release-stop") && r.Method == http.MethodPost {
+			body, err := io.ReadAll(io.LimitReader(r.Body, 4097))
+			if err != nil || len(body) > 4096 {
+				http.Error(w, "invalid reconciliation", 400)
+				return
+			}
+			copyReq := r.Clone(r.Context())
+			copyReq.URL.Path = "/v1/" + parts[1]
+			copyReq.URL.RawQuery = ""
+			p.forward(w, copyReq, index, body)
+			return
+		}
+		http.NotFound(w, r)
 		return
 	}
 	if r.URL.Path == "/v1/health" && r.Method == http.MethodGet {

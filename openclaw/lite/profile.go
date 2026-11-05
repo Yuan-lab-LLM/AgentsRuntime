@@ -62,7 +62,7 @@ func (p Profile) GatewayEnv(base []string, cfg gateway.Config, req gateway.Creat
 }
 
 func (p Profile) PrepareWorkspace(cfg gateway.Config, req gateway.CreateGatewayRequest, workspacePath string) error {
-	prepared, err := gateway.PrepareWorkspace(cfg.WorkspaceRoot, cfg.RuntimeType, req)
+	prepared, err := gateway.PrepareWorkspaceForConfig(cfg, req)
 	if err != nil {
 		return err
 	}
@@ -90,5 +90,5 @@ func (p Profile) prepareTeamWorkspace(cfg gateway.Config, req gateway.CreateGate
 	if p.Type() != "openclaw" {
 		return nil
 	}
-	return gateway.PrepareLiteTeamSharedWorkspace(cfg.WorkspaceRoot, req, workspace, filepath.Join(workspace, "home", ".openclaw", "workspace"))
+	return gateway.PrepareLiteTeamSharedWorkspaceForConfig(cfg, req, workspace, filepath.Join(workspace, "home", ".openclaw", "workspace"))
 }

@@ -90,6 +90,12 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 		return fmt.Errorf("open bounded OpenClaw workspace: %w", err)
 	}
 	defer s.Close()
+	s.PreserveOwnership = cfg.SandboxProfile == "nfs-rootless-v1"
+	if s.PreserveOwnership {
+		if err := prepareNativePluginLayout(workspacePath); err != nil {
+			return err
+		}
+	}
 	if err := writeTeamConfig(cfg, req, workspacePath); err != nil {
 		return err
 	}

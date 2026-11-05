@@ -33,13 +33,17 @@ func BuildSkillReportPayloadForInstance(cfg Config, manager *GatewayManager, pod
 		if instanceID > 0 && state.InstanceID != instanceID {
 			continue
 		}
+		skills, err := scanInstanceSkills(cfg, state)
+		if err != nil {
+			continue
+		} // Failed NFS reads are omitted, never reported as empty/full.
 		instances = append(instances, SkillInstanceReport{
 			InstanceID:    state.InstanceID,
 			WorkspacePath: state.WorkspacePath,
-			Skills:        ScanSkillRoots(state.WorkspacePath, skillRoots(cfg, state.WorkspacePath)...),
+			Skills:        skills,
 		})
 	}
-	if instanceID > 0 && len(instances) == 0 {
+	if instanceID > 0 && len(instances) == 0 && cfg.SandboxProfile != "nfs-rootless-v1" {
 		instances = append(instances, SkillInstanceReport{
 			InstanceID: instanceID,
 			Skills:     []SkillRecord{},

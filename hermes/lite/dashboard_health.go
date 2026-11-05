@@ -60,7 +60,7 @@ func (h *healthChecker) waitDashboardReady(ctx context.Context, spec gateway.Gat
 	}
 	readyCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	probe, err := newDashboardProbe(h.cfg, spec)
+	probe, err := newDashboardProbe(ctx, h.cfg, spec)
 	if err != nil {
 		return err
 	}
@@ -101,7 +101,7 @@ func (h *healthChecker) CheckHealth(ctx context.Context, spec gateway.GatewaySta
 	if !truthy(envValue(spec.Env, "CLAWMANAGER_HERMES_DESKTOP_WEB_ENABLED")) {
 		return h.http.CheckHealth(ctx, spec)
 	}
-	probe, err := newDashboardProbe(h.cfg, spec)
+	probe, err := newDashboardProbe(ctx, h.cfg, spec)
 	if err != nil {
 		return err
 	}
@@ -109,7 +109,7 @@ func (h *healthChecker) CheckHealth(ctx context.Context, spec gateway.GatewaySta
 	return probe.check(ctx, spec)
 }
 
-func newDashboardProbe(cfg gateway.Config, spec gateway.GatewayStartSpec) (*dashboardProbe, error) {
+func newDashboardProbe(ctx context.Context, cfg gateway.Config, spec gateway.GatewayStartSpec) (*dashboardProbe, error) {
 	if spec.Port < 1 || spec.Port > 65535 || spec.InstanceID < 1 || spec.Generation < 1 {
 		return nil, dashboardError("invalid_gateway_identity", "managed instance, generation, and port are required")
 	}
@@ -131,7 +131,14 @@ func newDashboardProbe(cfg gateway.Config, spec gateway.GatewayStartSpec) (*dash
 		strings.TrimSpace(envValue(spec.Env, "CLAWMANAGER_LLM_BASE_URL")) == "" {
 		return nil, dashboardError("missing_llm_credentials", "instance LLM credentials and gateway URL are required")
 	}
-	if err := dashboardWorkspaceReadable(spec); err != nil {
+	if cfg.SandboxProfile == "nfs-rootless-v1" {
+		if cfg.WorkspaceHealthCheck == nil {
+			return nil, dashboardError("workspace_unusable", "scoped workspace health validator unavailable")
+		}
+		if err := cfg.WorkspaceHealthCheck(ctx, spec); err != nil {
+			return nil, err
+		}
+	} else if err := dashboardWorkspaceReadable(spec); err != nil {
 		return nil, err
 	}
 	transport := &http.Transport{
@@ -462,4 +469,9 @@ func readControlFrame(r io.Reader) (byte, []byte, error) {
 	payload := make([]byte, int(header[1]))
 	_, err := io.ReadFull(r, payload)
 	return opcode, payload, err
+}
+
+// CheckNativeWorkspaceHealth is the fixed readonly child-side half of NFS health.
+func (Profile) CheckNativeWorkspaceHealth(req gateway.CreateGatewayRequest) error {
+	return dashboardWorkspaceReadable(gateway.GatewayStartSpec{WorkspacePath: req.WorkspacePath, Env: []string{"HERMES_HOME=" + filepath.Join(req.WorkspacePath, "home", ".hermes")}})
 }

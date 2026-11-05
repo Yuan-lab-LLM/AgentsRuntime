@@ -218,7 +218,7 @@ func pathWithinWorkspace(root, candidate string) bool {
 }
 
 func (p Profile) PrepareWorkspace(cfg gateway.Config, req gateway.CreateGatewayRequest, workspacePath string) error {
-	prepared, err := gateway.PrepareWorkspace(cfg.WorkspaceRoot, cfg.RuntimeType, req)
+	prepared, err := gateway.PrepareWorkspaceForConfig(cfg, req)
 	if err != nil {
 		return err
 	}

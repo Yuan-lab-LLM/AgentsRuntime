@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/iamlovingit/clawmanager-agent/gateway"
 )
@@ -139,6 +140,52 @@ func TestUpgradePoolDoesNotBecomeReadyBeforeActivation(t *testing.T) {
 	p.ServeHTTP(w, httptest.NewRequest("GET", "/readyz", nil))
 	if w.Code != 200 {
 		t.Fatalf("activated pool not ready: %d", w.Code)
+	}
+}
+
+func TestPoolManagementRemainsReadyWhilePeerSlotResets(t *testing.T) {
+	cfg := gateway.Config{ControlToken: "secret", SandboxProfile: "nfs-rootless-v1", GatewayPortStart: 20000, GatewayPortEnd: 20001, GatewayPortBlockSize: 1, Capacity: 2}
+	p, err := NewPool(cfg, 2, func(_ context.Context, index int, _, path string, _ []byte) (int, []byte, error) {
+		if path != "/v1/slot-state" {
+			t.Fatalf("unexpected readiness request %s", path)
+		}
+		if index == 0 {
+			return 200, []byte(`{"quarantined":true}`), nil
+		}
+		return 200, []byte(`{"quarantined":false,"assignment":{"instance_id":8,"generation":1,"state":"running"}}`), nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	p.ServeHTTP(w, httptest.NewRequest("GET", "/readyz", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("healthy assigned peer lost coordinator readiness: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestNFSCoordinatorReadinessDoesNotDependOnWorkerLocks(t *testing.T) {
+	cfg := gateway.Config{ControlToken: "secret", SandboxProfile: "nfs-rootless-v1", GatewayPortStart: 20000, GatewayPortEnd: 20001, GatewayPortBlockSize: 1, Capacity: 2}
+	called := make(chan struct{}, 2)
+	p, err := NewPool(cfg, 2, func(ctx context.Context, _ int, _, _ string, _ []byte) (int, []byte, error) {
+		called <- struct{}{}
+		<-ctx.Done()
+		return 0, nil, ctx.Err()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	w := httptest.NewRecorder()
+	p.ServeHTTP(w, httptest.NewRequest("GET", "/readyz", nil).WithContext(ctx))
+	if w.Code != http.StatusOK {
+		t.Fatalf("management readiness waited on a worker reset mutex: %d %s", w.Code, w.Body.String())
+	}
+	select {
+	case <-called:
+		t.Fatal("management readiness queried worker state")
+	default:
 	}
 }
 

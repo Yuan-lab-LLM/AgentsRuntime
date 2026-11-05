@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 )
 
-func prepareHermesLiteTeamWorkerHome(workspacePath string, req gateway.CreateGatewayRequest) error {
+func prepareHermesLiteTeamWorkerHome(workspacePath string, req gateway.CreateGatewayRequest, preserve ...bool) error {
 	root, err := workspaceio.Open(workspacePath)
 	if err != nil {
 		return err
@@ -35,6 +35,7 @@ func prepareHermesLiteTeamWorkerHome(workspacePath string, req gateway.CreateGat
 		if !gateway.PathWithin(workspacePath, directory) {
 			return fmt.Errorf("Hermes Team worker directory escaped the instance workspace: %s", directory)
 		}
+		_, beforeErr := root.Lstat(directory)
 		if err := root.MkdirAll(directory, 0o750); err != nil {
 			return fmt.Errorf("create Hermes Team worker directory %s: %w", directory, err)
 		}
@@ -51,6 +52,9 @@ func prepareHermesLiteTeamWorkerHome(workspacePath string, req gateway.CreateGat
 		}
 		if !gateway.PathWithin(realWorkspace, realDirectory) {
 			return fmt.Errorf("Hermes Team worker directory real path escaped the instance workspace: %s", directory)
+		}
+		if len(preserve) > 0 && preserve[0] && beforeErr == nil {
+			continue
 		}
 		if err := root.Chown(directory, req.UID, req.GID); err != nil {
 			return fmt.Errorf("chown Hermes Team worker directory %s: %w", directory, err)
@@ -82,8 +86,8 @@ func prepareTeamWorkspace(cfg gateway.Config, req gateway.CreateGatewayRequest, 
 	if _, _, ok := gateway.LiteTeamEnvironment(req, workspace); !ok {
 		return nil
 	}
-	if err := prepareHermesLiteTeamWorkerHome(workspace, req); err != nil {
+	if err := prepareHermesLiteTeamWorkerHome(workspace, req, cfg.SandboxProfile == "nfs-rootless-v1"); err != nil {
 		return err
 	}
-	return gateway.PrepareLiteTeamSharedWorkspace(cfg.WorkspaceRoot, req, workspace, filepath.Join(workspace, "home", ".hermes"), filepath.Join(workspace, "home", ".clawmanager-team-worker", ".hermes"))
+	return gateway.PrepareLiteTeamSharedWorkspaceForConfig(cfg, req, workspace, filepath.Join(workspace, "home", ".hermes"), filepath.Join(workspace, "home", ".clawmanager-team-worker", ".hermes"))
 }

@@ -37,7 +37,7 @@ func (m *upgradeService) beginMutationIO(req WorkspaceUpgradeRequest) (func() er
 		return nil, err
 	}
 	state := m.io
-	if m.cfg.IsolatedLifecycle {
+	if m.cfg.IsolatedLifecycle && !m.scopedNative {
 		finish, err := slots.AcquireStoppedCommandWriter(m.cfg, req)
 		if err != nil {
 			closeIO()
@@ -71,6 +71,7 @@ func (m *upgradeService) beginIO(req WorkspaceUpgradeRequest, write bool) (func(
 	if err != nil {
 		return nil, err
 	}
+	own.PreserveOwnership = m.scopedNative
 	state := &upgradeIO{pool: m.cfg.WorkspaceRoot, operation: req, scopes: []upgradeScope{{own, write}}}
 	rollout := req.RolloutID
 	if rollout == "" {
@@ -81,7 +82,11 @@ func (m *upgradeService) beginIO(req WorkspaceUpgradeRequest, write bool) (func(
 	}
 	capsule := filepath.Join(m.host.UpgradeRoot(), "rollout-"+rollout, fmt.Sprintf("instance-%d", req.InstanceID))
 	var control *workspaceio.FS
-	if write {
+	if write && m.scopedNative {
+		// The parent grants the exact capsule before entering this read-only
+		// synthetic filesystem. No management-root repair belongs in a child.
+		control, err = workspaceio.OpenAt(m.cfg.WorkspaceRoot, capsule)
+	} else if write {
 		if err := workspaceio.PrepareManagementRoots(m.cfg.WorkspaceRoot, ".clawmanager-upgrades"); err != nil {
 			own.Close()
 			return nil, err
@@ -95,6 +100,7 @@ func (m *upgradeService) beginIO(req WorkspaceUpgradeRequest, write bool) (func(
 		return nil, err
 	}
 	if control != nil {
+		control.PreserveOwnership = m.scopedNative
 		state.scopes = append(state.scopes, upgradeScope{control, write})
 	}
 	if req.ResumeRolloutID != "" && req.ResumeRolloutID != req.RolloutID {
@@ -113,6 +119,7 @@ func (m *upgradeService) beginIO(req WorkspaceUpgradeRequest, write bool) (func(
 			return nil, priorErr
 		}
 		if prior != nil {
+			prior.PreserveOwnership = m.scopedNative
 			state.scopes = append(state.scopes, upgradeScope{prior, false})
 		}
 	}

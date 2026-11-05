@@ -54,7 +54,7 @@ func (runtimeNeutralProfile) GatewayEnv(base []string, cfg Config, req CreateGat
 	return GenericGatewayEnv(base, cfg, req, workspace, port)
 }
 func (runtimeNeutralProfile) PrepareWorkspace(cfg Config, req CreateGatewayRequest, workspace string) error {
-	prepared, err := PrepareWorkspace(cfg.WorkspaceRoot, cfg.RuntimeType, req)
+	prepared, err := PrepareWorkspaceForConfig(cfg, req)
 	if err != nil {
 		return err
 	}

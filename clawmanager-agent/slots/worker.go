@@ -15,10 +15,13 @@ import (
 
 	"github.com/iamlovingit/clawmanager-agent/control"
 	"github.com/iamlovingit/clawmanager-agent/gateway"
-	"github.com/iamlovingit/clawmanager-agent/workspaceio"
+	"github.com/iamlovingit/clawmanager-agent/netguard"
 )
 
 type Worker struct {
+	workerEpoch   string
+	reset         chan struct{}
+	resetReady    bool
 	network       *networkOwner
 	cfg           gateway.Config
 	manager       *gateway.GatewayManager
@@ -36,11 +39,16 @@ func NewWorker(cfg gateway.Config) (*Worker, error) {
 	if cfg.ControlToken == "" || cfg.Capacity != 1 {
 		return nil, fmt.Errorf("worker requires control token and capacity one")
 	}
+	if cfg.SandboxProfile == "nfs-rootless-v1" {
+		if err := netguard.ValidateRootlessTools(); err != nil {
+			return nil, err
+		}
+	}
 	children := []string{"teams"}
 	if cfg.RuntimeType != "" {
 		children = append(children, cfg.RuntimeType)
 	}
-	if err := workspaceio.PrepareManagementRoots(cfg.WorkspaceRoot, children...); err != nil {
+	if err := prepareWorkerStorage(cfg, children...); err != nil {
 		return nil, fmt.Errorf("prepare trusted runtime workspace: %w", err)
 	}
 	cfg.IsolatedLifecycle = true
@@ -50,7 +58,11 @@ func NewWorker(cfg gateway.Config) (*Worker, error) {
 		return nil, err
 	}
 	network := &networkOwner{}
-	manager := gateway.NewGatewayManager(cfg, sandboxStarter{cfg: cfg, network: network}, nil)
+	starter := sandboxStarter{cfg: cfg, network: network}
+	if cfg.SandboxProfile == "nfs-rootless-v1" {
+		cfg.WorkspaceHealthCheck = starter.CheckNativeWorkspaceHealth
+	}
+	manager := gateway.NewGatewayManager(cfg, starter, nil)
 	if cfg.Runtime != nil && cfg.Runtime.HealthChecker(cfg) != nil {
 		manager.SetHealthChecker(cfg.Runtime.HealthChecker(cfg))
 	} else {
@@ -61,6 +73,13 @@ func NewWorker(cfg gateway.Config) (*Worker, error) {
 		slot = "0"
 	}
 	worker := &Worker{cfg: cfg, network: network, manager: manager, book: b, slotName: "slot-" + slot, metrics: newMetricsSampler()}
+	if cfg.SandboxProfile == "nfs-rootless-v1" {
+		worker.workerEpoch, err = newExecutionToken()
+		if err != nil {
+			return nil, err
+		}
+		worker.reset = make(chan struct{})
+	}
 	worker.handler = control.NewControlHandler(cfg, manager, discardReporter{})
 	return worker, nil
 }
@@ -91,8 +110,31 @@ func (w *Worker) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/v1/slot-state" && r.Method == http.MethodGet {
 		w.mu.Lock()
 		defer w.mu.Unlock()
-		snapshot := Snapshot{Gateways: w.manager.GatewayStates(), Assignment: w.book.Assignment, Quarantined: w.book.quarantined || w.manager.Health() != nil || w.network.unavailable()}
+		snapshot := Snapshot{WorkerEpoch: w.workerEpoch, Digest: w.book.Digest, Gateways: w.manager.GatewayStates(), Assignment: w.book.Assignment, Quarantined: w.book.quarantined || w.book.StopIntent != nil && w.book.Assignment != nil && w.book.Assignment.State != "stopped" || w.manager.Health() != nil || w.network.unavailable()}
+		if w.book.Maintenance != nil {
+			snapshot.MaintenanceOperationID = w.book.Maintenance.OperationID
+		}
 		writeJSON(out, 200, snapshot)
+		return
+	}
+	if w.cfg.SandboxProfile == "nfs-rootless-v1" && r.URL.Path == "/v1/native-upgrade" {
+		w.serveNativeMaintenance(out, r)
+		return
+	}
+	if w.cfg.SandboxProfile == "nfs-rootless-v1" && r.URL.Path == "/v1/native-maintenance/reconcile" {
+		w.serveNativeMaintenanceReconcile(out, r)
+		return
+	}
+	if w.cfg.SandboxProfile == "nfs-rootless-v1" && r.URL.Path == "/v1/reconcile-stop" && r.Method == http.MethodPost {
+		w.serveContainerReconcile(out, r)
+		return
+	}
+	if w.cfg.SandboxProfile == "nfs-rootless-v1" && r.URL.Path == "/v1/release-stop" && r.Method == http.MethodPost {
+		w.serveContainerRelease(out, r)
+		return
+	}
+	if w.cfg.SandboxProfile == "nfs-rootless-v1" && w.containerStopFenced() && !(strings.HasPrefix(r.URL.Path, "/v1/gateways/") && (r.Method == http.MethodDelete || strings.HasSuffix(r.URL.Path, "/stop"))) {
+		http.Error(out, "container stop intent fences further work", 409)
 		return
 	}
 	if r.URL.Path == "/v1/gateways/cancel-pending" && r.Method == http.MethodPost {
@@ -112,7 +154,7 @@ func (w *Worker) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 			http.Error(out, "pending cancellation is not confirmed", 409)
 			return
 		}
-		writeJSON(out, 200, map[string]any{"gateway_id": fmt.Sprintf("gw-%d-%d", req.InstanceID, req.Generation), "stopped": true, "confirmed": true, "unmounted": true})
+		writeJSON(out, 200, map[string]any{"gateway_id": fmt.Sprintf("gw-%d-%d", req.InstanceID, req.Generation), "stopped": true, "confirmed": true, "unmounted": true, "never_started": w.cfg.SandboxProfile == "nfs-rootless-v1"})
 		return
 	}
 	if r.URL.Path == "/v1/gateways" && r.Method == http.MethodPost {
@@ -156,7 +198,7 @@ func (w *Worker) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		if err = w.book.begin(req); err != nil {
+		if err = w.book.begin(req, w.workerEpoch); err != nil {
 			if lease != nil {
 				_ = stopWriter(w.writerPath, w.writerRequest, w.slotName)
 				lease.Close()
@@ -166,6 +208,12 @@ func (w *Worker) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		}
 		if lease != nil {
 			w.lease = lease
+		}
+		if w.cfg.SandboxProfile == "nfs-rootless-v1" {
+			if err = PrepareInstanceStorage(w.cfg, req); err != nil {
+				http.Error(out, "instance storage preparation failed; writer reconciliation required", 409)
+				return
+			}
 		}
 		copyReq := r.Clone(r.Context())
 		copyReq.Body = io.NopCloser(bytes.NewReader(data))
@@ -181,6 +229,10 @@ func (w *Worker) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	stop := strings.HasPrefix(r.URL.Path, "/v1/gateways/") && (r.Method == http.MethodDelete || (r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/stop")))
 	if stop {
 		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/gateways/"), "/stop")
+		if w.cfg.SandboxProfile == "nfs-rootless-v1" {
+			w.serveContainerStop(out, r, id)
+			return
+		}
 		w.mu.Lock()
 		defer w.mu.Unlock()
 		if w.book.quarantined || w.book.Assignment == nil || w.book.Assignment.GatewayID != id {
@@ -272,6 +324,12 @@ func (w *Worker) acquire(req gateway.CreateGatewayRequest) (*os.File, error) {
 func (w *Worker) Shutdown(ctx context.Context) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.cfg.SandboxProfile == "nfs-rootless-v1" && w.book.Assignment != nil && w.book.Assignment.State != "stopped" {
+		if w.resetReady {
+			return nil
+		}
+		return fmt.Errorf("slot writer requires container termination reconciliation")
+	}
 	if w.idleStopFenced() {
 		return gateway.ErrGatewayStopConflict
 	}

@@ -24,6 +24,8 @@ type Mount struct {
 // and data mounts. Never populate Env with os.Environ(): controller credentials
 // belong outside the sandbox. UID and GID must be nonzero.
 type Spec struct {
+	// ContainerLifecycle uses the slot container as the final PID cleanup boundary.
+	ContainerLifecycle bool
 	// TmpSource is an explicit grant for one supervisor-prepared instance tmp.
 	// Empty preserves the ephemeral tmpfs used by maintenance sandboxes.
 	TmpSource string
@@ -94,9 +96,12 @@ func buildCommand(spec Spec, binary string, image []Mount) ([]string, error) {
 		return nil, err
 	}
 	args := []string{binary,
-		"--unshare-user", "--disable-userns", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+		"--unshare-user", "--unshare-ipc", "--unshare-uts",
 		"--die-with-parent", "--new-session", "--cap-drop", "ALL",
 		"--uid", strconv.Itoa(spec.UID), "--gid", strconv.Itoa(spec.GID), "--clearenv",
+	}
+	if !spec.ContainerLifecycle {
+		args = append(args, "--disable-userns", "--unshare-pid")
 	}
 	if spec.OfflineNetwork {
 		args = append(args, "--unshare-net")
@@ -110,7 +115,14 @@ func buildCommand(spec Spec, binary string, image []Mount) ([]string, error) {
 	if spec.NetworkHostsFile != "" {
 		args = append(args, "--ro-bind", spec.NetworkHostsFile, "/etc/hosts", "--ro-bind", spec.NetworkResolvConf, "/etc/resolv.conf")
 	}
-	args = append(args, "--proc", "/proc", "--dev", "/dev")
+	if spec.ContainerLifecycle {
+		// Preserve the ordinary Pod's existing proc masks. Seccomp installed by
+		// TrackContainer forbids further namespace creation after setup.
+		args = append(args, "--ro-bind", "/proc", "/proc")
+	} else {
+		args = append(args, "--proc", "/proc")
+	}
+	args = append(args, "--dev", "/dev")
 	if spec.TmpSource == "" {
 		args = append(args, "--perms", "1777", "--tmpfs", "/tmp")
 	} else {
@@ -121,6 +133,9 @@ func buildCommand(spec Spec, binary string, image []Mount) ([]string, error) {
 	// The outer supervisor must permit a fresh proc mount. Restore sensitive
 	// kernel masks inside that new PID proc before any business process starts.
 	for _, path := range []string{"/proc/acpi", "/proc/asound", "/proc/kcore", "/proc/keys", "/proc/latency_stats", "/proc/timer_list", "/proc/timer_stats", "/proc/sched_debug", "/proc/scsi"} {
+		if spec.ContainerLifecycle {
+			break
+		}
 		info, err := os.Stat(path)
 		if os.IsNotExist(err) {
 			continue
@@ -161,10 +176,14 @@ func validate(spec Spec) error {
 		return fmt.Errorf("offline maintenance cannot share business routing")
 	}
 	if spec.NetworkHostsFile != "" || spec.NetworkResolvConf != "" {
-		if err := validateNetworkRoutingFile(spec.NetworkHostsFile, "hosts", NetworkPublicRoot, 0); err != nil {
+		owner := uint32(0)
+		if spec.ContainerLifecycle {
+			owner = 10001
+		}
+		if err := validateNetworkRoutingFile(spec.NetworkHostsFile, "hosts", NetworkPublicRoot, owner); err != nil {
 			return err
 		}
-		if err := validateNetworkRoutingFile(spec.NetworkResolvConf, "resolv.conf", NetworkPublicRoot, 0); err != nil {
+		if err := validateNetworkRoutingFile(spec.NetworkResolvConf, "resolv.conf", NetworkPublicRoot, owner); err != nil {
 			return err
 		}
 		if filepath.Dir(spec.NetworkHostsFile) != filepath.Dir(spec.NetworkResolvConf) {

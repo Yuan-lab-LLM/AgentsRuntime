@@ -21,6 +21,13 @@ func prepareInstanceTmp(cfg gateway.Config, spec gateway.GatewayStartSpec) (stri
 	if spec.UserID < 1 || spec.InstanceID < 1 || spec.UID <= 0 || spec.GID <= 0 || uint64(spec.UID) >= 1<<32-1 || uint64(spec.GID) >= 1<<32-1 || (spec.RuntimeType != "" && spec.RuntimeType != cfg.RuntimeType) {
 		return "", fmt.Errorf("invalid persistent tmp identity")
 	}
+	if cfg.SandboxProfile == "nfs-rootless-v1" {
+		path, err := workspaceio.PrepareNFSTmp(cfg.WorkspaceRoot, cfg.RuntimeType, spec.UserID, spec.InstanceID, spec.UID, spec.GID)
+		if err != nil {
+			return "", err
+		}
+		return checkedSandboxSource(path)
+	}
 	if err := trustedDirectory(cfg.WorkspaceRoot); err != nil {
 		return "", err
 	}

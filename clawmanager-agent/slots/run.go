@@ -67,7 +67,13 @@ func runWorker(ctx context.Context, cfg gateway.Config) error {
 	}
 	// A durable idle fence quarantines a restarted worker. Legacy recovery may
 	// escalate to SIGKILL, so it must not touch this operation's survivors.
-	if !worker.idleStopFenced() {
+	if cfg.SandboxProfile == "nfs-rootless-v1" {
+		// Recovery is authorized only by the old container's termination proof.
+		// Never apply legacy numeric-PID process recovery to an emptyDir ledger.
+		if err = worker.manager.RefreshClock(ctx); err != nil {
+			return err
+		}
+	} else if !worker.idleStopFenced() {
 		if err = worker.manager.Initialize(); err != nil {
 			return err
 		}
@@ -91,7 +97,18 @@ func runWorker(ctx context.Context, cfg gateway.Config) error {
 		listener.Close()
 		return err
 	}
-	return serve(ctx, listener, worker, func(stop context.Context) error { return worker.Shutdown(stop) }, cfg.ProcessStopTimeout)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if worker.reset != nil {
+		go func() {
+			select {
+			case <-worker.reset:
+				cancel()
+			case <-runCtx.Done():
+			}
+		}()
+	}
+	return serve(runCtx, listener, worker, func(stop context.Context) error { return worker.Shutdown(stop) }, cfg.ProcessStopTimeout)
 }
 
 func runPool(ctx context.Context, cfg gateway.Config) error {

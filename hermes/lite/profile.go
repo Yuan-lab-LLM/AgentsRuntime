@@ -98,7 +98,7 @@ func (p Profile) PrepareWorkspace(cfg gateway.Config, req gateway.CreateGatewayR
 			return err
 		}
 		if desktopWebTeamRequest(req) {
-			prepared, err := gateway.PrepareWorkspace(cfg.WorkspaceRoot, cfg.RuntimeType, req)
+			prepared, err := gateway.PrepareWorkspaceForConfig(cfg, req)
 			if err != nil {
 				return err
 			}
@@ -111,7 +111,7 @@ func (p Profile) PrepareWorkspace(cfg gateway.Config, req gateway.CreateGatewayR
 		}
 		return prepareDesktopWebWorkspace(cfg, req, workspacePath)
 	}
-	prepared, err := gateway.PrepareWorkspace(cfg.WorkspaceRoot, cfg.RuntimeType, req)
+	prepared, err := gateway.PrepareWorkspaceForConfig(cfg, req)
 	if err != nil {
 		return err
 	}

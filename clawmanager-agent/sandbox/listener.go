@@ -28,8 +28,25 @@ func (t *Tracker) VerifyListeners(ctx context.Context, first, count int) error {
 	if err != nil || !alive {
 		return fmt.Errorf("sandbox namespace init is unavailable")
 	}
+	if err := t.pinListenerNetwork(); err != nil {
+		return err
+	}
+	listeners, primary, err := t.businessListeners(first, count)
+	if err != nil {
+		return err
+	}
+	if !primary {
+		return fmt.Errorf("primary gateway listener is not present")
+	}
+	// The info-fd rendezvous precedes bubblewrap's final user namespace setup.
+	// A listener proves business code has executed after that setup; retain the
+	// namespace pin from this point rather than an intermediate startup namespace.
 	if t.namespaceFile == nil {
-		file, err := os.Open(filepath.Join(t.procRoot, strconv.Itoa(t.identity.PID), "ns", "pid"))
+		namespace := "pid"
+		if t.containerLifecycle {
+			namespace = "user"
+		}
+		file, err := os.Open(filepath.Join(t.procRoot, strconv.Itoa(t.identity.PID), "ns", namespace))
 		if err != nil {
 			return fmt.Errorf("pin sandbox PID namespace: %w", err)
 		}
@@ -41,16 +58,6 @@ func (t *Tracker) VerifyListeners(ctx context.Context, first, count int) error {
 		// Holding this namespace FD prevents inode reuse. It is opened after
 		// command exec and is never inherited by the gateway.
 		t.namespaceFile, t.namespaceInfo = file, info
-	}
-	if err := t.pinListenerNetwork(); err != nil {
-		return err
-	}
-	listeners, primary, err := t.businessListeners(first, count)
-	if err != nil {
-		return err
-	}
-	if !primary {
-		return fmt.Errorf("primary gateway listener is not present")
 	}
 	entries, err := os.ReadDir(t.procRoot)
 	if err != nil {
@@ -71,11 +78,19 @@ func (t *Tracker) VerifyListeners(ctx context.Context, first, count int) error {
 		if err != nil {
 			return err
 		}
-		info, err := os.Stat(filepath.Join(t.procRoot, entry.Name(), "ns", "pid"))
+		namespace := "pid"
+		if t.containerLifecycle {
+			namespace = "user"
+		}
+		info, err := os.Stat(filepath.Join(t.procRoot, entry.Name(), "ns", namespace))
 		if err != nil || !os.SameFile(t.namespaceInfo, info) {
 			continue
 		}
-		fds, err := os.ReadDir(filepath.Join(t.procRoot, entry.Name(), "fd"))
+		uid := uint32(0)
+		if t.containerLifecycle {
+			uid = t.businessUID
+		}
+		descriptors, err := readProcessDescriptors(t.procRoot, pid, uid, t.containerLifecycle)
 		if os.IsNotExist(err) {
 			continue
 		}
@@ -83,16 +98,9 @@ func (t *Tracker) VerifyListeners(ctx context.Context, first, count int) error {
 			return fmt.Errorf("inspect sandbox listener descriptors: %w", err)
 		}
 		owned := map[string]bool{}
-		for _, fd := range fds {
+		for _, target := range descriptors {
 			if err := ctx.Err(); err != nil {
 				return err
-			}
-			target, err := os.Readlink(filepath.Join(t.procRoot, entry.Name(), "fd", fd.Name()))
-			if os.IsNotExist(err) {
-				continue
-			}
-			if err != nil {
-				return fmt.Errorf("attribute sandbox listener descriptor: %w", err)
 			}
 			if strings.HasPrefix(target, "socket:[") && strings.HasSuffix(target, "]") {
 				inode := strings.TrimSuffix(strings.TrimPrefix(target, "socket:["), "]")
@@ -134,6 +142,26 @@ func (t *Tracker) VerifyListeners(ctx context.Context, first, count int) error {
 		return err
 	}
 	return nil
+}
+
+func processDescriptorLinks(procRoot string, pid int) ([]string, error) {
+	dir := filepath.Join(procRoot, strconv.Itoa(pid), "fd")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	links := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		target, err := os.Readlink(filepath.Join(dir, entry.Name()))
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		links = append(links, target)
+	}
+	return links, nil
 }
 
 func (t *Tracker) pinListenerNetwork() error {

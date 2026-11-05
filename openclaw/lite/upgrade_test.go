@@ -203,7 +203,14 @@ func TestSessionSQLiteRestoreReceiptModeMustMatchRequest(t *testing.T) {
 func TestRestoreSessionSQLitePreservesExistingDatabaseFor81Source(t *testing.T) {
 	root := t.TempDir()
 	mgr := NewGatewayManager(Config{RuntimeType: "openclaw", WorkspaceRoot: root, PodUID: "pod-target", OpenClawVersion: OpenClaw81Version}, &upgradeTestStarter{}, nil)
-	req := WorkspaceUpgradeRequest{RolloutID: "rollout-preserve", InstanceID: 209, UserID: 1, Generation: 3, LeaseToken: "lease-preserve", PreserveSessionSQLite: true, UID: os.Geteuid(), GID: os.Getegid()}
+	uid, gid := os.Geteuid(), os.Getegid()
+	if uid <= 0 {
+		uid = 200209
+	}
+	if gid <= 0 {
+		gid = 200209
+	}
+	req := WorkspaceUpgradeRequest{RolloutID: "rollout-preserve", InstanceID: 209, UserID: 1, Generation: 3, LeaseToken: "lease-preserve", PreserveSessionSQLite: true, UID: uid, GID: gid}
 	workspace, err := mgr.workspaceForUpgrade(req)
 	if err != nil {
 		t.Fatal(err)
