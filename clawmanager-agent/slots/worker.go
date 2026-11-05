@@ -95,6 +95,10 @@ func (w *Worker) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		http.Error(out, "unauthorized", 401)
 		return
 	}
+	if r.URL.Path == "/v1/workbench" {
+		w.serveWorkbench(out, r)
+		return
+	}
 	if r.URL.Path == "/v1/slot-skills" && r.Method == http.MethodGet {
 		writeJSON(out, 200, gateway.BuildSkillReportPayload(w.cfg, w.manager, 0, "full"))
 		return

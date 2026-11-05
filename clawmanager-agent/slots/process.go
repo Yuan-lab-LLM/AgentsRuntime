@@ -173,6 +173,7 @@ func (s sandboxStarter) StartGateway(_ context.Context, spec gateway.GatewayStar
 		}
 		process.ConfirmStopped = func(context.Context) error { return sandbox.ErrContainerResetRequired }
 	}
+	attachWorkbenchProcesses(&process, tracker, spec)
 	return process, startErr
 }
 

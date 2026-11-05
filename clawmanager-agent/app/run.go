@@ -16,6 +16,7 @@ import (
 	"github.com/iamlovingit/clawmanager-agent/netguard"
 	"github.com/iamlovingit/clawmanager-agent/netrelay"
 	"github.com/iamlovingit/clawmanager-agent/slots"
+	"github.com/iamlovingit/clawmanager-agent/workbench"
 )
 
 var Version = "dev"
@@ -29,6 +30,18 @@ const (
 )
 
 func Run(profile gateway.RuntimeProfile) {
+	if handled, err := workbench.RunTerminalHelper(os.Args[1:], os.Stdin, os.Stdout); handled {
+		if err != nil {
+			os.Exit(2)
+		}
+		return
+	}
+	if handled, err := workbench.RunGitHelper(context.Background(), os.Args[1:], os.Stdin, os.Stdout); handled {
+		if err != nil {
+			os.Exit(2)
+		}
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == netguard.RootlessCommand {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()

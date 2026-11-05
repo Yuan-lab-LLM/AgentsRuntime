@@ -1,6 +1,7 @@
 package slots
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -20,6 +22,14 @@ import (
 // stopped-workspace lease: the primary gateway is still running. Its caller must
 // join this command before releasing that lease or acknowledging gateway stop.
 func (s sandboxStarter) RunGatewayCommand(ctx context.Context, spec gateway.GatewayStartSpec) (result []byte, resultErr error) {
+	notified := false
+	if spec.Terminal != nil {
+		defer func() {
+			if !notified {
+				spec.Terminal.Started(resultErr)
+			}
+		}()
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -47,9 +57,23 @@ func (s sandboxStarter) RunGatewayCommand(ctx context.Context, spec gateway.Gate
 	if err != nil {
 		return nil, err
 	}
+	if spec.WorkingDir != "" {
+		if !inside(spec.WorkspacePath, spec.WorkingDir) {
+			return nil, fmt.Errorf("working directory escapes workspace")
+		}
+		commandSpec.Dir = spec.WorkingDir
+	}
 	argv, err := sandbox.Command(commandSpec)
 	if err != nil {
 		return nil, err
+	}
+	if spec.Terminal != nil {
+		for i, arg := range argv {
+			if arg == "--new-session" {
+				argv = append(argv[:i], argv[i+1:]...)
+				break
+			}
+		}
 	}
 	cmd := exec.Command(argv[0], argv[1:]...)
 	if spec.Stdin != nil {
@@ -63,6 +87,9 @@ func (s sandboxStarter) RunGatewayCommand(ctx context.Context, spec gateway.Gate
 	}
 	cmd.Env = []string{"PATH=/usr/local/bin:/usr/bin:/bin", "LANG=C.UTF-8"}
 	var output boundedCommandOutput
+	if spec.OutputLimit > 0 && spec.OutputLimit <= 2<<20 {
+		output.stdout.limit = spec.OutputLimit
+	}
 	cmd.Stdout, cmd.Stderr = output.Stdout(), output.Stderr()
 	if err = configureSandboxProcess(cmd, spec.UID, spec.GID, groups); err != nil {
 		return nil, err
@@ -81,6 +108,12 @@ func (s sandboxStarter) RunGatewayCommand(ctx context.Context, spec gateway.Gate
 			return nil, err
 		}
 	}
+	if spec.Terminal != nil {
+		cmd.Stdin = spec.Terminal.Slave
+		cmd.Stdout = spec.Terminal.Slave
+		cmd.Stderr = spec.Terminal.Slave
+		configureTerminal(cmd)
+	}
 	// Preparation/identity checks can take time; cancellation must also be checked
 	// immediately before spawn. Any concurrent cancellation after Start is joined.
 	if err = ctx.Err(); err != nil {
@@ -98,6 +131,24 @@ func (s sandboxStarter) RunGatewayCommand(ctx context.Context, spec gateway.Gate
 	startedCtx, cancelStarted := context.WithTimeout(ctx, 10*time.Second)
 	commandErr := tracker.Started(startedCtx)
 	cancelStarted()
+	if commandErr == nil && spec.Terminal != nil {
+		master := spec.Terminal.Master
+		_ = master.SetReadDeadline(time.Now().Add(10 * time.Second))
+		line, readyErr := bufio.NewReaderSize(io.LimitReader(master, 128), 128).ReadString('\n')
+		_ = master.SetReadDeadline(time.Time{})
+		if readyErr != nil || strings.TrimSpace(line) != spec.Terminal.ReadyToken {
+			commandErr = fmt.Errorf("terminal readiness failed")
+		} else if err := tracker.PinWorkbenchNamespace(); err != nil {
+			commandErr = err
+		} else {
+			_, commandErr = master.Write([]byte("\n"))
+		}
+	}
+	if spec.Terminal != nil {
+		spec.Terminal.Slave.Close()
+		notified = true
+		spec.Terminal.Started(commandErr)
+	}
 	waited := make(chan error, 1)
 	go func() { waited <- cmd.Wait() }()
 	exited := false
@@ -135,6 +186,8 @@ func (s sandboxStarter) RunGatewayCommand(ctx context.Context, spec gateway.Gate
 	var stopErr error
 	if s.cfg.SandboxProfile != "nfs-rootless-v1" {
 		stopErr = tracker.WaitStopped(stopCtx)
+	} else if spec.Terminal != nil {
+		stopErr = tracker.StopWorkbenchScope(stopCtx, uint32(spec.UID))
 	}
 	cancelStop()
 	if stopErr != nil {
@@ -153,7 +206,7 @@ func (b *boundedCommandOutput) Stdout() io.Writer { return &b.stdout }
 func (b *boundedCommandOutput) Stderr() io.Writer { b.stderr.tail = true; return &b.stderr }
 func (b *boundedCommandOutput) Result(err error) ([]byte, error) {
 	if err == nil && b.stdout.truncated {
-		err = fmt.Errorf("business command stdout exceeded %d-byte limit", commandOutputLimit)
+		err = fmt.Errorf("business command stdout exceeded %d-byte limit", b.stdout.max())
 	}
 	stdout, stderr := b.stdout.buffer.Bytes(), b.stderr.buffer.Bytes()
 	if err == nil || len(stderr) == 0 {
@@ -177,20 +230,29 @@ type boundedCommandStream struct {
 	mu              sync.Mutex
 	buffer          bytes.Buffer
 	tail, truncated bool
+	limit           int
+}
+
+func (b *boundedCommandStream) max() int {
+	if b.limit > 0 {
+		return b.limit
+	}
+	return commandOutputLimit
 }
 
 func (b *boundedCommandStream) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	n := len(p)
-	remaining := commandOutputLimit - b.buffer.Len()
+	limit := b.max()
+	remaining := limit - b.buffer.Len()
 	if n > remaining {
 		b.truncated = true
 	}
 	if b.tail {
-		if n >= commandOutputLimit {
+		if n >= limit {
 			b.buffer.Reset()
-			p = p[n-commandOutputLimit:]
+			p = p[n-limit:]
 		} else if n > remaining {
 			b.buffer.Next(n - remaining)
 		}

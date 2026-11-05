@@ -27,6 +27,7 @@ import (
 	"github.com/iamlovingit/clawmanager-agent/netguard"
 	"github.com/iamlovingit/clawmanager-agent/netrelay"
 	"github.com/iamlovingit/clawmanager-agent/runtime/generic"
+	"github.com/iamlovingit/clawmanager-agent/workbench"
 )
 
 const slotProbeControl = "cm-only-fake-control-sentinel-acceptance"
@@ -37,6 +38,18 @@ const slotProbeOffline = "--cm-slot-network-offline"
 // Only the explicitly env-gated Linux acceptance test launches these modes.
 // They let the real worker execute this static test binary inside its sandbox.
 func TestMain(m *testing.M) {
+	if handled, err := workbench.RunTerminalHelper(os.Args[1:], os.Stdin, os.Stdout); handled {
+		if err != nil {
+			os.Exit(2)
+		}
+		return
+	}
+	if handled, err := workbench.RunGitHelper(context.Background(), os.Args[1:], os.Stdin, os.Stdout); handled {
+		if err != nil {
+			os.Exit(2)
+		}
+		return
+	}
 	if handled, err := gateway.RunNativeStorageHelper(slotNetworkProbeProfile{generic.NewProfile("opencode")}, os.Args[1:], os.Stdin, os.Stdout); handled {
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)

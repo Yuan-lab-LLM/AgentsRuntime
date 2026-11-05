@@ -115,6 +115,10 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", 401)
 		return
 	}
+	if r.URL.Path == "/v1/workbench" {
+		p.serveWorkbench(w, r)
+		return
+	}
 	if p.serveNativeUpgrades(w, r) {
 		return
 	}

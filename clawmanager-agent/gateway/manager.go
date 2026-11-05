@@ -15,6 +15,7 @@ import (
 )
 
 type gatewayRecord struct {
+	workbench            *workbenchAttempt
 	idleStop             bool
 	idleChecking         bool
 	activeCommands       int
