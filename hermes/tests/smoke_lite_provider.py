@@ -51,6 +51,32 @@ def main():
         os.environ["CLAWMANAGER_HERMES_DESKTOP_WEB_ENABLED"] = "false"
         legacy_mode = resolve_runtime_provider(requested="clawmanager", target_model="auto")
         assert legacy_mode["api_key"] == old_key and legacy_mode.get("credential_pool"), "flag-off provider pool behavior changed"
+        # CM logical providers share one governed endpoint and credential.
+        # Hermes must retain distinct catalogs rather than folding all models
+        # into the first/default provider section.
+        os.environ["CLAWMANAGER_HERMES_DESKTOP_WEB_ENABLED"] = "true"
+        catalogs = {"clawmanager-auto": ("ClawManager", ["auto"]),
+                    "clawmanager-icompify": ("icompify", [f"model-{n}" for n in range(10)]),
+                    "clawmanager-second": ("second", ["other-model"])}
+        providers = {slug: {"name": name, "base_url": endpoint,
+                           "key_env": "OPENAI_API_KEY", "enabled": True,
+                           "api_mode": "chat_completions", "discover_models": False,
+                           "extra_headers": {"X-CM-Catalog-Provider": slug},
+                           "default_model": ids[0], "models": {id: {} for id in ids}}
+                     for slug, (name, ids) in catalogs.items()}
+        from hermes_cli import model_switch
+        from hermes_cli.models import CANONICAL_PROVIDERS
+        rows = model_switch.list_authenticated_providers(
+            current_provider="clawmanager-auto", current_base_url=endpoint,
+            current_model="auto", user_providers=providers, custom_providers=[],
+            probe_custom_providers=False, probe_current_custom_provider=False,
+            excluded_providers=[p.slug for p in CANONICAL_PROVIDERS])
+        grouped = {row["slug"]: row for row in rows if row["slug"] in catalogs}
+        assert set(grouped) == set(catalogs), "CM providers collapsed at the shared gateway"
+        for slug, (name, ids) in catalogs.items():
+            assert grouped[slug]["name"].casefold() == name.casefold(), "provider display name lost"
+            assert set(grouped[slug]["models"]) == set(ids), "provider catalog mixed with siblings"
+        print("PASS: actual pinned Hermes inventory preserves ClawManager/auto and separate 10-model provider at one shared gateway")
         print("PASS: actual offline provider resolver uses instance credentials with clean/saved pools; auth state preserved; unmanaged/flag-off behavior retained")
 
 

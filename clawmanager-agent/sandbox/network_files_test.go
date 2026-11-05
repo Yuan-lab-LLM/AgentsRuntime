@@ -11,6 +11,9 @@ func TestNetworkRoutingFilePolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chmod(root, 0755); err != nil {
+		t.Fatal(err)
+	}
 	dir := filepath.Join(root, "0123456789abcdef0123456789abcdef")
 	if err = os.Mkdir(dir, 0755); err != nil {
 		t.Fatal(err)

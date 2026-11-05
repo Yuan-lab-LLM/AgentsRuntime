@@ -109,7 +109,7 @@ func assertPlatformDefaults(t *testing.T, config map[string]any) {
 		}
 	}
 	dreaming := objectAt(t, objectAt(t, objectAt(t, pluginEntries, "memory-core"), "config"), "dreaming")
-	if dreaming["enabled"] != true ||
+	if dreaming["enabled"] != false ||
 		dreaming["frequency"] != "0 3 * * *" ||
 		dreaming["timezone"] != "Asia/Shanghai" {
 		t.Fatalf("plugins.entries.memory-core.config.dreaming = %#v, want managed defaults", dreaming)

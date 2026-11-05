@@ -201,8 +201,13 @@ type ManagedProcess struct {
 	PID             int
 	Stop            func(context.Context) error
 	Done            <-chan error
+	// ConfirmStopped proves the entire owned scope has ended without signaling.
+	ConfirmStopped func(context.Context) error
+	// FenceIdleStop atomically persists graceful policy against asynchronous
+	// process teardown sources such as network failure.
+	FenceIdleStop func(persist func() error) error
 	// GracefulStop never escalates to SIGKILL. Success confirms leader reaping
-	// AND disappearance of its process group, not arbitrary detached children.
+	// and the entire owned scope (sandbox namespace or legacy process group).
 	GracefulStop func(context.Context) error
 }
 

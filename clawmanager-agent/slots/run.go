@@ -65,8 +65,12 @@ func runWorker(ctx context.Context, cfg gateway.Config) error {
 	if err != nil {
 		return err
 	}
-	if err = worker.manager.Initialize(); err != nil {
-		return err
+	// A durable idle fence quarantines a restarted worker. Legacy recovery may
+	// escalate to SIGKILL, so it must not touch this operation's survivors.
+	if !worker.idleStopFenced() {
+		if err = worker.manager.Initialize(); err != nil {
+			return err
+		}
 	}
 	if info, e := os.Lstat(socket); e == nil {
 		if info.Mode()&os.ModeSocket == 0 {

@@ -91,3 +91,25 @@ func TestNetworkSessionUncertainAuxiliaryRetainsResources(t *testing.T) {
 		t.Fatal("uncertain namespace resources/evidence discarded")
 	}
 }
+
+func TestNetworkLifetimeSurvivesGatewayCancellationUntilConfirmedCleanup(t *testing.T) {
+	parent, cancel := context.WithCancel(context.Background())
+	owner := &networkOwner{build: func(ctx context.Context, _ gateway.Config, _ gateway.CreateGatewayRequest, _ int) (*networkSession, error) {
+		return newTestNetworkSession(ctx, func(context.Context) error { return nil }), nil
+	}}
+	cleanup, err := owner.prepare(parent, gateway.Config{}, gateway.CreateGatewayRequest{InstanceID: 1}, 20000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if owner.active.ctx.Err() != nil {
+		t.Fatal("gateway cancellation revoked networking before graceful teardown")
+	}
+	session := owner.active
+	if err = cleanup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if session.ctx.Err() == nil {
+		t.Fatal("confirmed cleanup retained network lifetime")
+	}
+}

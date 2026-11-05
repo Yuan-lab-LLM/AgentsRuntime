@@ -111,8 +111,10 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 		return err
 	}
 
+	idlePolicyStatus := "configured_pending_verification"
 	config := map[string]any{}
 	if data, err := s.ReadFile(configPath); err == nil && len(data) > 0 {
+		idlePolicyStatus = "existing_source_unknown"
 		if err := json.Unmarshal(data, &config); err != nil {
 			return fmt.Errorf("parse openclaw config: %w", err)
 		}
@@ -218,6 +220,14 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 	if err := s.WriteFile(configPath, append(data, '\n'), 0o600); err != nil {
 		return fmt.Errorf("write openclaw config: %w", err)
 	}
+	policyData, policyErr := json.Marshal(idleDefaultsPolicy{Version: idleDefaultsPolicyVersion, Status: idlePolicyStatus})
+	if policyErr != nil {
+		return policyErr
+	}
+	if policyErr = s.WriteFile(filepath.Join(workspacePath, ".clawmanager-idle-defaults-policy.json"), append(policyData, '\n'), 0o600); policyErr != nil {
+		return fmt.Errorf("persist Lite defaults policy status: %w", policyErr)
+	}
+	log.Printf("runtime-agent Lite defaults policy: instance_id=%d generation=%d policy=lite-idle-off-v1 absent_only=true", req.InstanceID, req.Generation)
 	if err := s.Chmod(configPath, 0o600); err != nil {
 		return fmt.Errorf("chmod openclaw config: %w", err)
 	}
@@ -393,9 +403,8 @@ func setDefaultObjectValue(object map[string]any, key string, value any) {
 	object[key] = value
 }
 
-// mergeOpenClawLiteDefaults supplies the instance defaults that Pro receives
-// from /defaults/.openclaw/openclaw.json. Lite workspaces start with an empty
-// config, so these defaults must be added when the instance is created.
+// mergeOpenClawLiteDefaults supplies Lite instance defaults. Background heartbeat,
+// dreaming and autonomous workshop are off by default; Pro templates are separate.
 //
 // Values are only filled when absent so recreating an existing Lite instance
 // does not discard explicit user choices. Environment-managed model, channel,
@@ -405,6 +414,8 @@ func mergeOpenClawLiteDefaults(config map[string]any, openClawVersion string) {
 	setDefaultObjectValue(models, "mode", "merge")
 
 	agentDefaults := ensureObject(ensureObject(config, "agents"), "defaults")
+	setDefaultObjectValue(ensureObject(agentDefaults, "heartbeat"), "every", "0m")
+	setDefaultObjectValue(ensureObject(ensureObject(ensureObject(config, "skills"), "workshop"), "autonomous"), "mode", "off")
 	memorySearch := ensureObject(agentDefaults, "memorySearch")
 	setDefaultObjectValue(memorySearch, "enabled", true)
 	setDefaultObjectValue(memorySearch, "provider", "none")
@@ -464,7 +475,7 @@ func mergeOpenClawLiteDefaults(config map[string]any, openClawVersion string) {
 	}
 	memoryCore := ensureObject(entries, "memory-core")
 	dreaming := ensureObject(ensureObject(memoryCore, "config"), "dreaming")
-	setDefaultObjectValue(dreaming, "enabled", true)
+	setDefaultObjectValue(dreaming, "enabled", false)
 	setDefaultObjectValue(dreaming, "frequency", "0 3 * * *")
 	setDefaultObjectValue(dreaming, "timezone", "Asia/Shanghai")
 

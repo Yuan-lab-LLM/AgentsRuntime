@@ -57,9 +57,10 @@ func (s sandboxStarter) StartGateway(_ context.Context, spec gateway.GatewayStar
 		tracker.Close()
 		return gateway.ManagedProcess{}, err
 	}
+	policy := &sandboxStopPolicy{}
 	stopNetworkFailure := func() bool { return true }
 	if execution != nil {
-		stopNetworkFailure = context.AfterFunc(execution.ctx, func() { _ = cmd.Process.Kill() })
+		stopNetworkFailure = context.AfterFunc(execution.ctx, func() { policy.networkFailure(func() { _ = cmd.Process.Kill() }) })
 	}
 	startupCtx, cancelStartup := context.WithTimeout(context.Background(), 10*time.Second)
 	startErr := tracker.Started(startupCtx)
@@ -78,56 +79,66 @@ func (s sandboxStarter) StartGateway(_ context.Context, spec gateway.GatewayStar
 		}
 		return tracker.Close()
 	}
-	process := gateway.ManagedProcess{PID: cmd.Process.Pid, Done: done, VerifyListeners: func(ctx context.Context) error {
-		block := s.cfg.GatewayPortBlockSize
-		if block < 1 {
-			block = 1
-		}
-		return tracker.VerifyListeners(ctx, spec.Port, block)
-	}, Stop: func(ctx context.Context) error {
-		mu.Lock()
-		defer mu.Unlock()
-		select {
-		case <-waited:
-			return confirmedStop(ctx)
-		default:
-		}
-		timeout := s.cfg.ProcessStopTimeout
-		if timeout <= 0 {
-			timeout = 20 * time.Second
-		}
-		// Signal the pinned primary gateway so its application shutdown hooks
-		// can flush data. Killing the monitor first tears down its namespace.
-		signalCtx, cancelSignal := context.WithTimeout(ctx, 2*time.Second)
-		signalErr := tracker.Terminate(signalCtx)
-		cancelSignal()
-		if signalErr != nil && !errors.Is(signalErr, os.ErrProcessDone) {
-			// Identity/permission failures never cause numeric-PID signaling.
-			// Forced teardown below must still prove the whole namespace died.
+	process := gateway.ManagedProcess{PID: cmd.Process.Pid, Done: done, FenceIdleStop: policy.fenceIdle, GracefulStop: newSandboxGracefulStop(&mu, tracker.Terminate, confirmedStop, waited),
+		ConfirmStopped: func(ctx context.Context) error {
+			mu.Lock()
+			defer mu.Unlock()
+			select {
+			case <-waited:
+				return confirmedStop(ctx)
+			default:
+				return gateway.ErrGatewayStopFailed
+			}
+		}, VerifyListeners: func(ctx context.Context) error {
+			block := s.cfg.GatewayPortBlockSize
+			if block < 1 {
+				block = 1
+			}
+			return tracker.VerifyListeners(ctx, spec.Port, block)
+		}, Stop: func(ctx context.Context) error {
+			mu.Lock()
+			defer mu.Unlock()
+			select {
+			case <-waited:
+				return confirmedStop(ctx)
+			default:
+			}
+			timeout := s.cfg.ProcessStopTimeout
+			if timeout <= 0 {
+				timeout = 20 * time.Second
+			}
+			// Signal the pinned primary gateway so its application shutdown hooks
+			// can flush data. Killing the monitor first tears down its namespace.
+			signalCtx, cancelSignal := context.WithTimeout(ctx, 2*time.Second)
+			signalErr := tracker.Terminate(signalCtx)
+			cancelSignal()
+			if signalErr != nil && !errors.Is(signalErr, os.ErrProcessDone) {
+				// Identity/permission failures never cause numeric-PID signaling.
+				// Forced teardown below must still prove the whole namespace died.
+				if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+					return err
+				}
+			}
+			timer := time.NewTimer(timeout)
+			defer timer.Stop()
+			select {
+			case <-waited:
+				return confirmedStop(ctx)
+			case <-ctx.Done():
+				_ = cmd.Process.Kill()
+				return ctx.Err()
+			case <-timer.C:
+			}
 			if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 				return err
 			}
-		}
-		timer := time.NewTimer(timeout)
-		defer timer.Stop()
-		select {
-		case <-waited:
-			return confirmedStop(ctx)
-		case <-ctx.Done():
-			_ = cmd.Process.Kill()
-			return ctx.Err()
-		case <-timer.C:
-		}
-		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-			return err
-		}
-		select {
-		case <-waited:
-			return confirmedStop(ctx)
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}}
+			select {
+			case <-waited:
+				return confirmedStop(ctx)
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}}
 	return process, startErr
 }
 

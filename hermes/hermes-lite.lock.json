@@ -51,7 +51,7 @@
     "smoke_lite_desktop_rpc.py": "be5198e07de0c06cec029a97545fe44a464f2258db3c26681006c1f114238387",
     "smoke_lite_image.py": "88e3c6dfb0cfbcdcdfababd8ac6f5ac5b32dc79c43314d62330adde1b3029a1f",
     "smoke_lite_non_native.py": "6f13ccc46d07d52cf20252a28e82e0b5341bfd9c450aae72375d59248b0b8cf2",
-    "smoke_lite_provider.py": "ddc80471c029676e32d56139b0426b0c4d471e8b265599a22e28fb9201607a42",
+    "smoke_lite_provider.py": "53a64d7b9d31b5e46692bb43d5b2c1018173e92fbd80ec4e23a1cce7446686fd",
     "smoke_lite_team.py": "a6d2d7c0a9f3789b417a0041761014a207c4a342a85c7383a4840f65b81071c0"
   },
   "acceptance_sha256": {

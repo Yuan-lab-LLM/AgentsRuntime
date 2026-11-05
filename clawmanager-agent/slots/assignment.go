@@ -61,7 +61,7 @@ func (b *book) begin(req gateway.CreateGatewayRequest) error {
 		}
 	}
 	previous, previousDigest := b.Assignment, b.Digest
-	b.Assignment = &Assignment{GatewayID: id, InstanceID: req.InstanceID, UserID: req.UserID, Generation: req.Generation, State: "starting"}
+	b.Assignment = &Assignment{GatewayID: id, InstanceID: req.InstanceID, UserID: req.UserID, Generation: req.Generation, State: "starting", PodUID: req.PodUID}
 	b.Digest = digest
 	if err = b.save(); err != nil {
 		b.Assignment, b.Digest = previous, previousDigest

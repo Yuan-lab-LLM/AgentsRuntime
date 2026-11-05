@@ -73,6 +73,11 @@ func (m *GatewayManager) createIsolatedGateway(req CreateGatewayRequest) (Create
 	replacing := 0
 	for _, record := range m.gateways {
 		if record.state.InstanceID == req.InstanceID {
+			// A completed idle stop retains its identity for idempotent replies,
+			// but no longer owns a writer. Only unresolved ownership blocks restart.
+			if record.idleStop && (record.reserved || !recordFinished(record) || record.process.PID != 0 || record.executionCleanup != nil || record.automationStopFailed || record.state.State != "stopped") {
+				return CreateGatewayResponse{}, ErrGatewayStopConflict
+			}
 			if record.state.Generation > req.Generation {
 				return CreateGatewayResponse{}, ErrStaleGeneration
 			}
@@ -116,6 +121,8 @@ func (m *GatewayManager) createIsolatedGateway(req CreateGatewayRequest) (Create
 	}}
 	for _, old := range previous {
 		if old.cancel != nil {
+			old.deletePending = true
+			old.state.State = "stopping"
 			old.cancel()
 		}
 	}
@@ -145,9 +152,26 @@ func (m *GatewayManager) runIsolatedGateway(ctx context.Context, record *gateway
 		stopFailed := errors.Is(failure, ErrGatewayStopFailed)
 		// Stop must finish before any reservation is released or successor can
 		// write the same workspace. It includes the entire process group.
-		if process.Stop != nil {
+		m.mu.Lock()
+		idleStop := record.idleStop
+		if record.automationStopFailed {
+			stopFailed = true
+			failure = ErrGatewayStopFailed
+		}
+		// Fence a concurrent idle request before selecting a teardown policy.
+		record.state.State = "stopping"
+		m.mu.Unlock()
+		stop := process.Stop
+		if idleStop {
+			stop = process.GracefulStop
+		}
+		if process.PID != 0 && stop == nil {
+			stopFailed = true
+			failure = ErrGatewayStopFailed
+		}
+		if stop != nil {
 			stopCtx, cancel := context.WithTimeout(context.Background(), m.stopTimeout()+5*time.Second)
-			if err := process.Stop(stopCtx); err != nil {
+			if err := stop(stopCtx); err != nil {
 				failure = fmt.Errorf("gateway_stop_failed")
 				stopFailed = true
 			}
@@ -161,8 +185,8 @@ func (m *GatewayManager) runIsolatedGateway(ctx context.Context, record *gateway
 			}
 			cancel()
 		}
+		var releaseGuard func()
 		m.mu.Lock()
-		defer m.mu.Unlock()
 		if record.reserved && !stopFailed {
 			m.ports.Release(record.state.Port)
 			record.reserved = false
@@ -171,6 +195,8 @@ func (m *GatewayManager) runIsolatedGateway(ctx context.Context, record *gateway
 			record.process = ManagedProcess{}
 			record.executionCleanup = nil
 			record.state.PID = 0
+			releaseGuard = record.idleRelease
+			record.idleRelease = nil
 		}
 		record.state.State = "stopped"
 		record.state.ErrorMessage = ""
@@ -183,6 +209,10 @@ func (m *GatewayManager) runIsolatedGateway(ctx context.Context, record *gateway
 		close(record.finished)
 		m.notifyGatewayStateChangedLocked()
 		log.Printf("runtime-agent gateway completed: instance_id=%d generation=%d state=%s error=%s", req.InstanceID, req.Generation, record.state.State, record.state.ErrorMessage)
+		m.mu.Unlock()
+		if releaseGuard != nil {
+			releaseGuard()
+		}
 	}()
 	for _, old := range previous {
 		if old.finished != nil {
@@ -272,10 +302,17 @@ func (m *GatewayManager) runIsolatedGateway(ctx context.Context, record *gateway
 		if failure == nil {
 			failure = m.monitorIsolatedGateway(ctx, record, req, spec, process)
 		}
-		if ctx.Err() != nil || failure == nil || errors.Is(failure, ErrGatewayStopFailed) || !m.automaticGatewayRecoveryEnabled() {
+		m.mu.RLock()
+		idleStop := record.idleStop
+		m.mu.RUnlock()
+		if idleStop || ctx.Err() != nil || failure == nil || errors.Is(failure, ErrGatewayStopFailed) || !m.automaticGatewayRecoveryEnabled() {
 			return
 		}
 		m.mu.Lock()
+		if record.idleStop {
+			m.mu.Unlock()
+			return
+		}
 		if record.readyAt.IsZero() {
 			m.mu.Unlock()
 			return
@@ -291,6 +328,9 @@ func (m *GatewayManager) runIsolatedGateway(ctx context.Context, record *gateway
 			return
 		}
 		delay := m.restartDelays[record.restartAttempts]
+		// Recovery owns forceful cleanup from here; idle proof must fail before
+		// selecting its policy if this attempt has already left running.
+		record.state.State = "stopping"
 		record.restartAttempts++
 		record.state.RestartAttempt = record.restartAttempts
 		m.mu.Unlock()
@@ -461,6 +501,12 @@ func (m *GatewayManager) deleteIsolatedGateway(ctx context.Context, id string) e
 		m.mu.Unlock()
 		return nil
 	}
+	if record.idleStop {
+		m.mu.Unlock()
+		return ErrGatewayStopConflict
+	}
+	record.deletePending = true
+	record.state.State = "stopping"
 	record.cancel()
 	m.mu.Unlock()
 	select {
@@ -472,7 +518,11 @@ func (m *GatewayManager) deleteIsolatedGateway(ctx context.Context, id string) e
 	defer record.stopMu.Unlock()
 	m.mu.RLock()
 	reserved, process, automationStopFailed, cleanup := record.reserved, record.process, record.automationStopFailed, record.executionCleanup
+	idleStop := record.idleStop
 	m.mu.RUnlock()
+	if idleStop {
+		return ErrGatewayStopConflict
+	}
 	if automationStopFailed {
 		return fmt.Errorf("%w: auxiliary command namespace teardown is unconfirmed", ErrGatewayStopFailed)
 	}
@@ -528,6 +578,10 @@ func (m *GatewayManager) Shutdown(ctx context.Context) error {
 	m.mu.Lock()
 	var records []*gatewayRecord
 	for _, record := range m.gateways {
+		if !record.idleStop {
+			record.deletePending = true
+			record.state.State = "stopping"
+		}
 		record.cancel()
 		records = append(records, record)
 	}

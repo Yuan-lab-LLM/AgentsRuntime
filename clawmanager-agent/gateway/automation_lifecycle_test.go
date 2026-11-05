@@ -184,6 +184,7 @@ func TestManagedAutomationVerifiesListenerBeforeSendingCredentials(t *testing.T)
 	spec := GatewayStartSpec{UID: 200007, GID: 200008, Generation: 2, Env: []string{"HOME=/assigned/home", "BUSINESS_AUTH=stale"}}
 	denied := errors.New("wrong listener namespace")
 	process := ManagedProcess{VerifyListeners: func(context.Context) error { verified++; return denied }}
+	m.gateways[spec.GatewayID] = &gatewayRecord{process: process, state: GatewayState{State: "running"}}
 	hook := m.gatewayAutomationsForAttempt(CreateGatewayRequest{}, spec, process)
 	if err := hook(context.Background(), 20000); !errors.Is(err, denied) || commands != 0 {
 		t.Fatalf("credentials sent to unowned listener: %v commands=%d", err, commands)

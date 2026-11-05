@@ -174,6 +174,10 @@ func (w *Worker) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		w.handler.ServeHTTP(out, copyReq)
 		return
 	}
+	if id, operation := idleOperation(r.URL.Path); operation != "" {
+		w.serveIdle(out, r, id, operation)
+		return
+	}
 	stop := strings.HasPrefix(r.URL.Path, "/v1/gateways/") && (r.Method == http.MethodDelete || (r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/stop")))
 	if stop {
 		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/gateways/"), "/stop")
@@ -181,6 +185,10 @@ func (w *Worker) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		defer w.mu.Unlock()
 		if w.book.quarantined || w.book.Assignment == nil || w.book.Assignment.GatewayID != id {
 			http.Error(out, "slot cannot confirm unknown writer stop", 409)
+			return
+		}
+		if w.idleStopFenced() {
+			http.Error(out, "idle stop requires graceful protocol retry", 409)
 			return
 		}
 		if w.book.Assignment.State == "stopped" {
@@ -264,6 +272,9 @@ func (w *Worker) acquire(req gateway.CreateGatewayRequest) (*os.File, error) {
 func (w *Worker) Shutdown(ctx context.Context) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.idleStopFenced() {
+		return gateway.ErrGatewayStopConflict
+	}
 	if w.book.Assignment == nil || w.book.Assignment.State == "stopped" {
 		return w.manager.StopAll(ctx)
 	}
