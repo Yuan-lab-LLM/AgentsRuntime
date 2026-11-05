@@ -175,6 +175,30 @@ func TestRootlessProductionSlotAcceptance(t *testing.T) {
 	if err = process.VerifyListeners(ctx); err != nil {
 		t.Fatal("real listener attribution:", err)
 	}
+
+	if !starter.GatewayPreviewAvailable(spec) {
+		t.Fatal("rootless preview transport unavailable")
+	}
+	preview, err := starter.DialGatewayPreview(ctx, spec, "tcp", "127.0.0.1:3000")
+	if err != nil {
+		t.Fatal("rootless preview dial:", err)
+	}
+	defer preview.Close()
+	_ = preview.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err = io.WriteString(preview, "GET /root%2Fasset?q=a%2Fb HTTP/1.1\r\nHost: localhost:3000\r\nConnection: close\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(preview), nil)
+	if err != nil {
+		t.Fatal("rootless preview response:", err)
+	}
+	var previewResult map[string]string
+	err = json.NewDecoder(io.LimitReader(response.Body, 4096)).Decode(&previewResult)
+	response.Body.Close()
+	preview.Close()
+	if err != nil || response.StatusCode != 200 || previewResult["namespace"] != result.Namespace || previewResult["instance"] != "101" || previewResult["uri"] != "/root%2Fasset?q=a%2Fb" {
+		t.Fatalf("rootless preview scope mismatch: status=%d result=%v err=%v", response.StatusCode, previewResult, err)
+	}
 	for _, port := range []int{28081, 28082} {
 		response, e := client.Get(fmt.Sprintf("http://127.0.0.1:%d/", port))
 		if e != nil {
@@ -195,5 +219,5 @@ func TestRootlessProductionSlotAcceptance(t *testing.T) {
 	if json.NewDecoder(bufio.NewReader(strings.NewReader(string(output)))).Decode(&auxiliary) != nil || auxiliary["namespace"] != result.Namespace {
 		t.Fatalf("auxiliary network mismatch: %s", output)
 	}
-	t.Log("production native preparation, primary, proc/listener attribution, auxiliary, model/services/Redis, transparent TCP and private ingress passed with outer SETUID/SETGID only")
+	t.Log("production native preparation, primary, proc/listener attribution, auxiliary, private preview, model/services/Redis, transparent TCP and private ingress passed with outer SETUID/SETGID only")
 }
