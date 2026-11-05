@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/iamlovingit/clawmanager-agent/gateway"
@@ -26,13 +27,22 @@ import (
 	"github.com/iamlovingit/clawmanager-agent/netguard"
 	"github.com/iamlovingit/clawmanager-agent/netrelay"
 	"github.com/iamlovingit/clawmanager-agent/sandbox"
+	"github.com/iamlovingit/clawmanager-agent/sandboxprofile"
 )
+
+type networkGuard interface {
+	ParentIP() string
+	ChildIP() string
+	Wrap(*exec.Cmd, int, int, []uint32) error
+	Close(context.Context) error
+}
 
 type networkResources struct {
 	cancel                context.CancelFunc
 	credentials           *netbroker.Credentials
 	broker                *netbroker.Broker
-	guard                 *netguard.Handle
+	guard                 networkGuard
+	rootless              *netguard.RootlessHandle
 	servers               []*http.Server
 	listeners             []io.Closer
 	ingress               []*nativeIngress
@@ -45,7 +55,7 @@ type networkResources struct {
 }
 
 func prepareNetworkSession(parent context.Context, cfg gateway.Config, req gateway.CreateGatewayRequest, port int) (session *networkSession, result error) {
-	if runtime.GOOS != "linux" || os.Geteuid() != 0 {
+	if runtime.GOOS != "linux" || (cfg.SandboxProfile == sandboxprofile.NFSRootlessV1 && os.Geteuid() != sandboxprofile.ManagementUID) || (cfg.SandboxProfile != sandboxprofile.NFSRootlessV1 && os.Geteuid() != 0) {
 		return nil, fmt.Errorf("private network requires Linux trusted root")
 	}
 	token, err := validateNetworkAssignment(cfg, req, port)
@@ -64,6 +74,11 @@ func prepareNetworkSession(parent context.Context, cfg gateway.Config, req gatew
 	ctx, cancel := context.WithCancel(parent)
 	resources := &networkResources{cancel: cancel, httpConnections: make(chan struct{}, 256)}
 	session = &networkSession{ctx: ctx, cancel: cancel, release: resources.close}
+	session.fenceIngress = func() {
+		for _, ingress := range resources.ingress {
+			ingress.Fence()
+		}
+	}
 	// Partial ownership is returned even on failure so uncertain cleanup remains
 	// attached to the writer fence rather than discarded by an error path.
 	defer func() {
@@ -82,7 +97,28 @@ func prepareNetworkSession(parent context.Context, cfg gateway.Config, req gatew
 	}
 	setupCtx, setupCancel := context.WithTimeout(ctx, 20*time.Second)
 	defer setupCancel()
-	resources.guard, err = netguard.Prepare(setupCtx, netguard.Config{SlotIndex: cfg.NetworkSlotIndex, SlotCount: cfg.NetworkSlotCount, StateDir: stateDir, PodUID: cfg.PodUID}, netguard.Identity{InstanceID: req.InstanceID, Generation: req.Generation})
+	guardConfig := netguard.Config{SlotIndex: cfg.NetworkSlotIndex, SlotCount: cfg.NetworkSlotCount, StateDir: stateDir, PodUID: cfg.PodUID}
+	guardIdentity := netguard.Identity{InstanceID: req.InstanceID, Generation: req.Generation}
+	if cfg.SandboxProfile == sandboxprofile.NFSRootlessV1 {
+		var executable string
+		executable, err = os.Executable()
+		if err == nil {
+			executable, err = filepath.EvalSymlinks(executable)
+		}
+		var groups []uint32
+		if err == nil {
+			groups, err = rootlessNetworkGroups(req)
+		}
+		if err == nil {
+			resources.rootless, err = netguard.PrepareRootless(setupCtx, guardConfig, guardIdentity, req.UID, req.GID, groups, executable)
+		}
+		if resources.rootless != nil {
+			resources.guard = resources.rootless
+			context.AfterFunc(resources.rootless.Context(), cancel)
+		}
+	} else {
+		resources.guard, err = netguard.Prepare(setupCtx, guardConfig, guardIdentity)
+	}
 	if err != nil {
 		resources.uncertain = errors.Is(err, netguard.ErrCleanupUnconfirmed)
 		return session, fmt.Errorf("private network preparation failed: %w", err)
@@ -104,17 +140,28 @@ func prepareNetworkSession(parent context.Context, cfg gateway.Config, req gatew
 		return session, fmt.Errorf("private managed services unavailable")
 	}
 	parentIP := resources.guard.ParentIP()
-	for _, entry := range []struct {
+	var privateListeners []net.Listener
+	var privateUDP net.PacketConn
+	if resources.rootless != nil {
+		privateListeners, privateUDP = resources.rootless.BrokerListeners()
+	}
+	listen := func(index, port int) (net.Listener, error) {
+		if privateListeners != nil {
+			return privateListeners[index], nil
+		}
+		return net.Listen("tcp", net.JoinHostPort(parentIP, strconv.Itoa(port)))
+	}
+	for index, entry := range []struct {
 		port    int
 		handler http.Handler
 	}{{31280, resources.broker.Egress()}, {31281, resources.broker.Model()}, {31282, services.Services()}} {
-		listener, e := net.Listen("tcp", net.JoinHostPort(parentIP, strconv.Itoa(entry.port)))
+		listener, e := listen(index, entry.port)
 		if e != nil {
 			return session, fmt.Errorf("private broker listener unavailable")
 		}
 		resources.serveHTTP(ctx, listener, entry.handler)
 	}
-	redisListener, err := net.Listen("tcp", net.JoinHostPort(parentIP, "31283"))
+	redisListener, err := listen(3, 31283)
 	if err != nil {
 		return session, fmt.Errorf("private service listener unavailable")
 	}
@@ -126,12 +173,15 @@ func prepareNetworkSession(parent context.Context, cfg gateway.Config, req gatew
 			cancel()
 		}
 	}()
-	udp, err := net.ListenPacket("udp", net.JoinHostPort(parentIP, "53"))
+	udp := privateUDP
+	if udp == nil {
+		udp, err = net.ListenPacket("udp", net.JoinHostPort(parentIP, "53"))
+	}
 	if err != nil {
 		return session, fmt.Errorf("private DNS listener unavailable")
 	}
 	resources.listeners = append(resources.listeners, udp)
-	tcp, err := net.Listen("tcp", net.JoinHostPort(parentIP, "53"))
+	tcp, err := listen(4, 53)
 	if err != nil {
 		return session, fmt.Errorf("private DNS listener unavailable")
 	}
@@ -181,15 +231,25 @@ func prepareNetworkSession(parent context.Context, cfg gateway.Config, req gatew
 	if err != nil {
 		return session, fmt.Errorf("trusted network helper unavailable")
 	}
-	helper, err := resources.guard.HelperCommand(ctx, executable, netrelay.Command)
+	var helper *exec.Cmd
+	if resources.rootless != nil {
+		helper, err = resources.rootless.HelperCommand(ctx, files, executable, netrelay.Command)
+	} else {
+		helper, err = resources.guard.(*netguard.Handle).HelperCommand(ctx, executable, netrelay.Command)
+		if helper != nil {
+			helper.ExtraFiles = files
+		}
+	}
 	if err != nil {
 		return session, err
 	}
 	resources.helper = helper
+	if resources.rootless != nil {
+		helper.Cancel = func() error { return sandbox.SignalProcess(helper.Process, 65534, syscall.SIGKILL) }
+	}
 	data, _ := json.Marshal(netrelay.Config{Broker: net.JoinHostPort(parentIP, "31280"), IngressPorts: ports})
 	helper.Stdin = bytes.NewReader(data)
 	helper.Stderr = io.Discard
-	helper.ExtraFiles = files
 	output, err := helper.StdoutPipe()
 	if err != nil {
 		return session, fmt.Errorf("network helper readiness unavailable")
@@ -287,8 +347,8 @@ func trustedRootPublicDirectory(path string) error {
 	}
 	for current := path; ; current = filepath.Dir(current) {
 		info, e := os.Lstat(current)
-		if e != nil || !info.IsDir() || info.Mode().Perm()&0022 != 0 || !rootOwned(info) {
-			return fmt.Errorf("public routing ancestor must be controlled by root")
+		if e != nil || !info.IsDir() || info.Mode().Perm()&0022 != 0 || (!rootOwned(info) && !(os.Geteuid() == sandboxprofile.ManagementUID && trustedOwner(info))) {
+			return fmt.Errorf("public routing ancestor must be controlled by trusted management")
 		}
 		if current == path && info.Mode().Perm() != 0755 {
 			return fmt.Errorf("public routing root requires 0755")

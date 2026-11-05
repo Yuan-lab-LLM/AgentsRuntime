@@ -13,6 +13,7 @@ import (
 
 	"github.com/iamlovingit/clawmanager-agent/gateway"
 	"github.com/iamlovingit/clawmanager-agent/llmconfig"
+	"github.com/iamlovingit/clawmanager-agent/sandboxprofile"
 )
 
 func RuntimeAgentModeEnabled() bool {
@@ -73,6 +74,7 @@ func LoadConfigFromEnv(profile gateway.RuntimeProfile) (Config, error) {
 	}
 
 	cfg := Config{
+		SandboxProfile:        strings.TrimSpace(os.Getenv("RUNTIME_SANDBOX_PROFILE")),
 		RuntimeType:           runtimeType,
 		OpenClawVersion:       strings.TrimSpace(os.Getenv("CLAWMANAGER_OPENCLAW_VERSION")),
 		UpgradeID:             strings.TrimSpace(os.Getenv("CLAWMANAGER_RUNTIME_UPGRADE_ID")),
@@ -134,6 +136,22 @@ func LoadConfigFromEnv(profile gateway.RuntimeProfile) (Config, error) {
 		endpoint, err := url.Parse(cfg.NetworkEgressProxyURL)
 		if err != nil || (endpoint.Scheme != "http" && endpoint.Scheme != "https") || endpoint.Hostname() == "" || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" || (endpoint.Path != "" && endpoint.Path != "/") {
 			return Config{}, errors.New("invalid authenticated egress proxy endpoint")
+		}
+	}
+
+	if !sandboxprofile.Valid(cfg.SandboxProfile) {
+		return Config{}, errors.New("unknown RUNTIME_SANDBOX_PROFILE")
+	}
+	if cfg.SandboxProfile == sandboxprofile.NFSRootlessV1 {
+		if len(cfg.ControlToken) < 32 || strings.TrimSpace(cfg.PodUID) == "" {
+			return Config{}, errors.New("NFS rootless sandbox requires a strong control token and pinned POD_UID")
+		}
+		role := os.Getenv("RUNTIME_AGENT_ROLE")
+		if role != "slot" && role != "pool" {
+			return Config{}, errors.New("NFS rootless sandbox requires a container slot pool")
+		}
+		if role == "slot" && cfg.NetworkSecurityProfile != "isolated-network-v1" {
+			return Config{}, errors.New("NFS rootless sandbox requires isolated networking")
 		}
 	}
 

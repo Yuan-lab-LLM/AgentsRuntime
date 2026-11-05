@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/iamlovingit/clawmanager-agent/workspaceio"
 	"io"
 	"io/fs"
 	"os"
@@ -492,6 +493,13 @@ func (m *upgradeService) copyRegularFileStable(source, target string, mode os.Fi
 }
 
 func (m *upgradeService) chownTree(root string, uid, gid int) error {
+	if m.cfg.SandboxProfile == "nfs-rootless-v1" {
+		if err := workspaceio.ValidateInstanceCaller(uid, gid); err != nil {
+			return err
+		}
+		_, err := m.io.Lstat(root)
+		return err
+	}
 	return m.io.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -1579,6 +1587,15 @@ func (m *upgradeService) restoreOpenClawStateCapsule(workspace string, req Works
 	if json.Unmarshal(raw, &capsule) != nil || capsule.InstanceID != req.InstanceID || capsule.SchemaVersion < 1 || capsule.SchemaVersion > 3 {
 		return false, errors.New("invalid OpenClaw state rollback capsule")
 	}
+	// Workspace and capsule are distinct scoped mounts on NFS. Quarantine
+	// within the workspace so every destructive move remains atomic.
+	failedRoot := dir
+	if m.scopedNative {
+		if err := validateUpgradeID("rollout_id", req.RolloutID); err != nil {
+			return false, err
+		}
+		failedRoot = filepath.Join(workspace, ".clawmanager-rollback", "rollout-"+req.RolloutID)
+	}
 	openClawDir := filepath.Join(workspace, "home", ".openclaw")
 	if capsule.SchemaVersion >= 2 {
 		entries, readErr := m.io.ReadDir(openClawDir)
@@ -1588,13 +1605,13 @@ func (m *upgradeService) restoreOpenClawStateCapsule(workspace string, req Works
 		for _, entry := range entries {
 			name := entry.Name()
 			if entry.IsDir() && !upgradeStateCapsuleExcludedRootForVersion(name, capsule.SchemaVersion) && !capsule.ControlDirs[name] {
-				if err := m.quarantineUpgradeTarget(filepath.Join(openClawDir, name), filepath.Join(dir, "control-failed-target", name)); err != nil {
+				if err := m.quarantineUpgradeTarget(filepath.Join(openClawDir, name), filepath.Join(failedRoot, "control-failed-target", name)); err != nil {
 					return false, err
 				}
 			}
 			if !entry.IsDir() && name != "openclaw.json" && !upgradeStateCapsuleExcludedRootForVersion(name, capsule.SchemaVersion) {
 				if _, existed := capsule.ControlFiles[name]; !existed {
-					if err := m.quarantineUpgradeTarget(filepath.Join(openClawDir, name), filepath.Join(dir, "control-failed-target-files", name)); err != nil {
+					if err := m.quarantineUpgradeTarget(filepath.Join(openClawDir, name), filepath.Join(failedRoot, "control-failed-target-files", name)); err != nil {
 						return false, err
 					}
 				}
@@ -1616,7 +1633,7 @@ func (m *upgradeService) restoreOpenClawStateCapsule(workspace string, req Works
 			return false, errors.New("invalid OpenClaw state rollback path")
 		}
 		target := filepath.Join(openClawDir, rel)
-		failed := filepath.Join(dir, "control-failed-target", rel)
+		failed := filepath.Join(failedRoot, "control-failed-target", rel)
 		if _, err := m.io.Stat(failed); errors.Is(err, os.ErrNotExist) {
 			if _, currentErr := m.io.Stat(target); currentErr == nil {
 				if err := m.io.MkdirAll(filepath.Dir(failed), 0o700); err != nil {
@@ -1631,7 +1648,7 @@ func (m *upgradeService) restoreOpenClawStateCapsule(workspace string, req Works
 		}
 		original := filepath.Join(dir, "control-original", rel)
 		if _, err := m.io.Stat(target); errors.Is(err, os.ErrNotExist) {
-			if err := m.io.Rename(original, target); err != nil {
+			if err := m.restoreUpgradeDirectory(original, target); err != nil {
 				return false, fmt.Errorf("restore original OpenClaw %s: %w", name, err)
 			}
 		} else if err != nil {
@@ -1653,7 +1670,7 @@ func (m *upgradeService) restoreOpenClawStateCapsule(workspace string, req Works
 		}
 		meta := capsule.ControlFiles[slash]
 		target := filepath.Join(openClawDir, rel)
-		failed := filepath.Join(dir, "control-failed-target-files", rel)
+		failed := filepath.Join(failedRoot, "control-failed-target-files", rel)
 		if err := m.quarantineUpgradeTarget(target, failed); err != nil {
 			return false, err
 		}
@@ -1678,7 +1695,7 @@ func (m *upgradeService) restoreOpenClawStateCapsule(workspace string, req Works
 		}
 	}
 	workspaceDir := filepath.Join(workspace, "home", ".openclaw", "workspace")
-	failedWorkspace := filepath.Join(dir, "workspace-failed-target")
+	failedWorkspace := filepath.Join(failedRoot, "workspace-failed-target")
 	workspaceFiles := []string{"HEARTBEAT.md", "TOOLS.md"}
 	// Schema v1 capsules predate the workspace-state inputs.  Treating an
 	// absent v1 manifest entry as "did not exist" would incorrectly quarantine

@@ -34,6 +34,10 @@ func decodeIdleRequest(body []byte, id, podUID string) (gateway.IdleStopRequest,
 }
 
 func (w *Worker) serveIdle(out http.ResponseWriter, r *http.Request, id, operation string) {
+	if w.cfg.SandboxProfile == "nfs-rootless-v1" && operation == "idle-stop" {
+		http.Error(out, "graceful idle stop requires the container intent protocol", 409)
+		return
+	}
 	if r.Method != http.MethodPost {
 		out.WriteHeader(http.StatusMethodNotAllowed)
 		return

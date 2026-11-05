@@ -43,6 +43,9 @@ func (p *nativeIngress) shutdown() {
 	}
 	p.transport.CloseIdleConnections()
 }
+
+// Fence refuses new requests while accepted work retains its shutdown grace.
+func (p *nativeIngress) Fence()       { p.mu.Lock(); p.closing = true; p.mu.Unlock() }
 func (p *nativeIngress) Close() error { p.cancel(); p.shutdown(); p.workers.Wait(); return nil }
 func rejectNativeIngress(w http.ResponseWriter, r *http.Request, status int) {
 	w.Header().Set("Connection", "close")

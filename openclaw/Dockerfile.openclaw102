@@ -49,7 +49,8 @@ RUN mkdir -p /usr/local/lib/node_modules/openclaw/dist/extensions/redis-team/nod
     && ln -s /usr/local/lib/node_modules/openclaw /usr/local/lib/node_modules/openclaw/dist/extensions/redis-team/node_modules/openclaw
 COPY openclaw/patches/ /usr/local/share/openclaw/patches/
 COPY --chown=abc:abc plugins/openclaw-redis-team/ /defaults/.openclaw/extensions/redis-team/
-RUN node /usr/local/share/openclaw/patches/patch_managed_proxy_policy.mjs --patch --install-marker \
+RUN chmod -R a+rX /defaults/.openclaw/extensions/redis-team \
+    && node /usr/local/share/openclaw/patches/patch_managed_proxy_policy.mjs --patch --install-marker \
     && node /usr/local/share/openclaw/patches/patch_managed_proxy_policy.mjs --verify \
     && node /usr/local/share/openclaw/patches/patch_memory_core_startup_migration.mjs --patch \
     && node /usr/local/share/openclaw/patches/patch_memory_core_startup_migration.mjs --verify \

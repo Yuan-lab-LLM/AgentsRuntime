@@ -380,7 +380,7 @@ func (m *GatewayManager) gatewayCommandExecutor(spec GatewayStartSpec, process M
 		if business {
 			m.mu.Lock()
 			record := m.gateways[spec.GatewayID]
-			if record == nil || record.process.PID != process.PID || record.idleStop || record.idleChecking {
+			if record == nil || record.process.PID != process.PID || record.deletePending || record.idleStop || record.idleChecking {
 				m.mu.Unlock()
 				return nil, ErrGatewayIdleBusy
 			}

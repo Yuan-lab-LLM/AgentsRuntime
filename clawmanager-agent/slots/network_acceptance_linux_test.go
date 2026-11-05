@@ -18,11 +18,13 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/iamlovingit/clawmanager-agent/gateway"
 	"github.com/iamlovingit/clawmanager-agent/netbroker"
+	"github.com/iamlovingit/clawmanager-agent/netguard"
 	"github.com/iamlovingit/clawmanager-agent/netrelay"
 	"github.com/iamlovingit/clawmanager-agent/runtime/generic"
 )
@@ -35,8 +37,21 @@ const slotProbeOffline = "--cm-slot-network-offline"
 // Only the explicitly env-gated Linux acceptance test launches these modes.
 // They let the real worker execute this static test binary inside its sandbox.
 func TestMain(m *testing.M) {
+	if handled, err := gateway.RunNativeStorageHelper(slotNetworkProbeProfile{generic.NewProfile("opencode")}, os.Args[1:], os.Stdin, os.Stdout); handled {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		return
+	}
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
+		case netguard.RootlessCommand:
+			if _, err := netguard.RunRootlessCommand(context.Background(), os.Args[1:], os.Stdin, os.Stdout); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(2)
+			}
+			return
 		case slotProbeOffline:
 			serveOfflineMaintenanceProbe()
 			return
@@ -112,6 +127,23 @@ func serveSlotNetworkProbe() error {
 			if strings.Contains(value, slotProbeControl) || strings.Contains(value, "v1.probe-") {
 				result.Checks["no_management_env"] = false
 			}
+		}
+		if manager, err := strconv.Atoi(os.Getenv("CM_PROBE_MANAGER_PID")); err == nil && manager > 0 {
+			_, envErr := os.ReadFile(fmt.Sprintf("/proc/%d/environ", manager))
+			_, fdErr := os.ReadDir(fmt.Sprintf("/proc/%d/fd", manager))
+			root, rootErr := os.Open(fmt.Sprintf("/proc/%d/root", manager))
+			if root != nil {
+				root.Close()
+			}
+			namespace, nsErr := os.Open(fmt.Sprintf("/proc/%d/ns/net", manager))
+			if namespace != nil {
+				namespace.Close()
+			}
+			result.Checks["management_proc_denied"] = os.IsPermission(envErr) && os.IsPermission(fdErr) && os.IsPermission(rootErr) && os.IsPermission(nsErr) && syscall.Kill(manager, 0) == syscall.EPERM
+			dnsCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+			addresses, dnsErr := net.DefaultResolver.LookupHost(dnsCtx, "kubernetes.default.svc.cluster.local")
+			cancel()
+			result.Checks["dns_broker"] = dnsErr == nil && len(addresses) > 0
 		}
 		_, err = os.ReadFile("/tmp/cm-slot-A-sentinel")
 		result.Checks["fresh_tmp"] = os.IsNotExist(err)

@@ -25,6 +25,9 @@ var (
 )
 
 type Config struct {
+	// WorkspaceHealthCheck performs fixed private-file validation under the active instance identity.
+	WorkspaceHealthCheck   func(context.Context, GatewayStartSpec) error
+	SandboxProfile         string
 	NetworkSecurityProfile string
 	NetworkSlotIndex       int
 	NetworkSlotCount       int
@@ -194,9 +197,14 @@ type GatewayStartSpec struct {
 	Generation    int
 	Command       []string
 	Env           []string
+	// Stdin carries bounded native-operation payloads without exposing them in argv.
+	Stdin []byte
 }
 
 type ManagedProcess struct {
+	// PrepareReset joins only the primary application shutdown. It never proves
+	// detached descendants ended and cannot authorize writer release.
+	PrepareReset    func(context.Context, bool) error
 	VerifyListeners func(context.Context) error
 	PID             int
 	Stop            func(context.Context) error

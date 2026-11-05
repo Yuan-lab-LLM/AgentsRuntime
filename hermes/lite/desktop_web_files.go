@@ -72,6 +72,11 @@ func openDesktopWebHome(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 			return nil, fmt.Errorf("workspace_unavailable: Hermes workspace directory changed during preparation")
 		}
 		root = next
+		// The NFS grant root belongs to management and existing private children
+		// retain their owner/mode. Only newly created children need initialization.
+		if cfg.SandboxProfile == "nfs-rootless-v1" && mkdirErr != nil {
+			continue
+		}
 		dir, err := root.Open(".")
 		if err == nil {
 			if index >= 2 {

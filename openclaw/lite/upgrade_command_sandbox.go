@@ -51,6 +51,15 @@ func (b *limitedUpgradeOutput) Write(p []byte) (int, error) {
 }
 
 func (m *upgradeService) runUpgradeCommand(ctx context.Context, original *exec.Cmd, req WorkspaceUpgradeRequest) error {
+	if m.scopedNative {
+		configureScopedUpgradeProcess(original)
+		original.WaitDelay = 2 * time.Second
+		err := original.Run()
+		if ctx.Err() != nil || errors.Is(err, exec.ErrWaitDelay) {
+			m.scopedUncertain = true
+		}
+		return err
+	}
 	readOnly, _ := ctx.Value(readOnlyUpgradeCommandKey{}).(bool)
 	if m.cfg.NetworkSecurityProfile != "" {
 		maintenanceCtx, finish, err := m.protectedMaintenanceContext(ctx, req, readOnly)

@@ -172,7 +172,9 @@ func (m *GatewayManager) runIsolatedGateway(ctx context.Context, record *gateway
 		if stop != nil {
 			stopCtx, cancel := context.WithTimeout(context.Background(), m.stopTimeout()+5*time.Second)
 			if err := stop(stopCtx); err != nil {
-				failure = fmt.Errorf("gateway_stop_failed")
+				if process.PrepareReset == nil || failure == nil {
+					failure = fmt.Errorf("gateway_stop_failed")
+				}
 				stopFailed = true
 			}
 			cancel()
@@ -180,7 +182,9 @@ func (m *GatewayManager) runIsolatedGateway(ctx context.Context, record *gateway
 		if !stopFailed && cleanupExecution != nil {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), m.stopTimeout()+5*time.Second)
 			if err := cleanupExecution(cleanupCtx); err != nil {
-				failure = ErrGatewayStopFailed
+				if m.cfg.SandboxProfile != "nfs-rootless-v1" || failure == nil {
+					failure = ErrGatewayStopFailed
+				}
 				stopFailed = true
 			}
 			cancel()
@@ -254,6 +258,9 @@ func (m *GatewayManager) runIsolatedGateway(ctx context.Context, record *gateway
 		record.executionCleanup = cleanupExecution
 		m.mu.Unlock()
 		if failure != nil {
+			if m.cfg.SandboxProfile == "nfs-rootless-v1" {
+				log.Printf("runtime-agent execution preparation failed: %v", failure)
+			}
 			return
 		}
 	} else if m.cfg.NetworkSecurityProfile != "" {
@@ -261,31 +268,45 @@ func (m *GatewayManager) runIsolatedGateway(ctx context.Context, record *gateway
 		return
 	}
 	workspace := record.state.WorkspacePath
-	if m.cfg.NetworkSecurityProfile != "" {
-		migrator, ok := m.profile().(ManagedCredentialMigrator)
+	if m.cfg.SandboxProfile == "nfs-rootless-v1" {
+		preparer, ok := m.starter.(interface {
+			PrepareNativeStorage(context.Context, CreateGatewayRequest, int) error
+		})
 		if !ok {
-			failure = fmt.Errorf("managed credential migration unavailable")
+			failure = fmt.Errorf("credential-scoped native storage unavailable")
 			return
 		}
-		if failure = migrator.MigrateManagedCredentials(ctx, m.cfg, req, workspace); failure != nil {
+		if failure = preparer.PrepareNativeStorage(ctx, req, record.state.Port); failure != nil {
+			return
+		}
+	} else {
+		if m.cfg.NetworkSecurityProfile != "" {
+			migrator, ok := m.profile().(ManagedCredentialMigrator)
+			if !ok {
+				failure = fmt.Errorf("managed credential migration unavailable")
+				return
+			}
+			if failure = migrator.MigrateManagedCredentials(ctx, m.cfg, req, workspace); failure != nil {
+				return
+			}
+			if ctx.Err() != nil {
+				return
+			}
+		}
+		if failure = m.profile().PrepareWorkspace(m.cfg, req, workspace); failure != nil {
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		if failure = m.profile().WriteGatewayConfig(m.cfg, req, workspace, record.state.Port); failure != nil {
 			return
 		}
 		if ctx.Err() != nil {
 			return
 		}
 	}
-	if failure = m.profile().PrepareWorkspace(m.cfg, req, workspace); failure != nil {
-		return
-	}
-	if ctx.Err() != nil {
-		return
-	}
-	if failure = m.profile().WriteGatewayConfig(m.cfg, req, workspace, record.state.Port); failure != nil {
-		return
-	}
-	if ctx.Err() != nil {
-		return
-	}
+
 	spec := GatewayStartSpec{GatewayID: record.state.GatewayID, RuntimeType: m.cfg.RuntimeType,
 		InstanceID: req.InstanceID, UserID: req.UserID, WorkspacePath: workspace, Port: record.state.Port,
 		UID: req.UID, GID: req.GID, Generation: req.Generation, CPUCores: req.CPUCores, MemoryMB: req.MemoryMB, DiskQuotaMB: req.DiskQuotaMB,

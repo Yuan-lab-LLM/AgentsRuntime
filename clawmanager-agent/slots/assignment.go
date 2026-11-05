@@ -13,10 +13,14 @@ import (
 )
 
 type book struct {
-	Assignment  *Assignment `json:"assignment,omitempty"`
-	Digest      string      `json:"digest,omitempty"`
-	path        string
-	quarantined bool
+	StopIntent       *containerStopIntent       `json:"stop_intent,omitempty"`
+	TerminationProof *containerTerminationProof `json:"termination_proof,omitempty"`
+	StopFinalized    bool                       `json:"stop_finalized,omitempty"`
+	Maintenance      *nativeMaintenanceBook     `json:"maintenance,omitempty"`
+	Assignment       *Assignment                `json:"assignment,omitempty"`
+	Digest           string                     `json:"digest,omitempty"`
+	path             string
+	quarantined      bool
 }
 
 func openBook(dir string) (*book, error) {
@@ -34,11 +38,11 @@ func openBook(dir string) (*book, error) {
 	if err = json.Unmarshal(data, b); err != nil {
 		return nil, fmt.Errorf("invalid slot assignment: %w", err)
 	}
-	b.quarantined = b.Assignment != nil && b.Assignment.State != "stopped"
+	b.quarantined = b.Assignment != nil && (b.Assignment.State != "stopped" || b.TerminationProof != nil && !b.StopFinalized)
 	return b, nil
 }
 
-func (b *book) begin(req gateway.CreateGatewayRequest) error {
+func (b *book) begin(req gateway.CreateGatewayRequest, epoch ...string) error {
 	if b.quarantined {
 		return errors.New("slot writer state requires reconciliation")
 	}
@@ -61,10 +65,22 @@ func (b *book) begin(req gateway.CreateGatewayRequest) error {
 		}
 	}
 	previous, previousDigest := b.Assignment, b.Digest
+	previousIntent, previousProof := b.StopIntent, b.TerminationProof
+	previousFinalized := b.StopFinalized
+	previousMaintenance := b.Maintenance
 	b.Assignment = &Assignment{GatewayID: id, InstanceID: req.InstanceID, UserID: req.UserID, Generation: req.Generation, State: "starting", PodUID: req.PodUID}
+	if len(epoch) != 0 {
+		b.Assignment.WorkerEpoch = epoch[0]
+	}
+	b.StopIntent, b.TerminationProof = nil, nil
+	b.StopFinalized = false
+	b.Maintenance = nil
 	b.Digest = digest
 	if err = b.save(); err != nil {
 		b.Assignment, b.Digest = previous, previousDigest
+		b.StopIntent, b.TerminationProof = previousIntent, previousProof
+		b.StopFinalized = previousFinalized
+		b.Maintenance = previousMaintenance
 		return err
 	}
 	return nil

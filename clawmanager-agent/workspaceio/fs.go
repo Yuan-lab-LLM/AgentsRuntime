@@ -15,6 +15,8 @@ import (
 type FS struct {
 	Root *os.Root
 	Base string
+	// PreserveOwnership disables recursive repair inside an instance credential helper.
+	PreserveOwnership bool
 }
 
 func Open(base string) (*FS, error) {
@@ -201,6 +203,15 @@ func (s *FS) Chmod(name string, mode os.FileMode) error {
 	return file.Chmod(mode)
 }
 func (s *FS) Chown(name string, uid, gid int) error {
+	if s.PreserveOwnership {
+		if _, err := s.Rel(name); err != nil {
+			return err
+		}
+		if _, err := s.Lstat(name); err != nil {
+			return err
+		}
+		return ValidateInstanceCaller(uid, gid)
+	}
 	if runtime.GOOS == "windows" || uid <= 0 || gid <= 0 {
 		return nil
 	}
@@ -245,6 +256,15 @@ func (s *FS) WriteFileAtomic(name string, data []byte, mode os.FileMode) error {
 	return s.Root.Rename(temp, rel)
 }
 func (s *FS) ChownTree(name string, uid, gid int) error {
+	if s.PreserveOwnership {
+		if _, err := s.Rel(name); err != nil {
+			return err
+		}
+		if _, err := s.Lstat(name); err != nil {
+			return err
+		}
+		return ValidateInstanceCaller(uid, gid)
+	}
 	rel, err := s.Rel(name)
 	if err != nil {
 		return err
@@ -283,7 +303,7 @@ func (s *FS) Child(name string, mode os.FileMode) (*FS, error) {
 		root.Close()
 		return nil, fmt.Errorf("workspace directory changed during open")
 	}
-	return &FS{Root: root, Base: filepath.Join(s.Base, name)}, nil
+	return &FS{Root: root, Base: filepath.Join(s.Base, name), PreserveOwnership: s.PreserveOwnership}, nil
 }
 func OpenOrCreateAt(base, target string, mode os.FileMode) (*FS, error) {
 	current, err := Open(base)
@@ -317,6 +337,13 @@ func (s *FS) Chgrp(name string, gid int) error {
 		return err
 	}
 	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if groupMatches(info, gid) {
+		return nil
+	}
 	return file.Chown(-1, gid)
 }
 

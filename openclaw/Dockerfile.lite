@@ -107,7 +107,7 @@ RUN sed -i 's/\r$//' /usr/local/bin/install-openclaw-plugin /usr/local/bin/openc
   && rm -rf /tmp/openclaw-redis-team /tmp/openclaw-plugin-pack \
   && chown -R root:root /defaults/.openclaw \
   && chmod 0755 /defaults /defaults/.openclaw \
-  && chmod -R a+rX /defaults/.openclaw/npm \
+  && chmod -R a+rX /defaults/.openclaw/npm /defaults/.openclaw/extensions \
   && mkdir -p /defaults/.openclaw/npm/node_modules \
   && ln -s /usr/local/lib/node_modules/openclaw /defaults/.openclaw/npm/node_modules/openclaw \
   && for plugin_package in \

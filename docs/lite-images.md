@@ -113,14 +113,15 @@ security policy, including any approved namespace capabilities:
 
 The gate runs as the assigned nonroot UID/GID, and a separate root supervisor
 mode checks cross-UID stop and listener ownership. Final slim images do not need
-Go: cross-compile the test binary first and provide it read-only alongside the
-script. For example, build the amd64 gate artifact on the development machine:
+Go: build the test binary on the Linux test/build node first and provide it
+read-only alongside the script. Do not build images or test binaries on the
+resource-constrained local Mac. For example, on the Linux amd64 test node:
 
 ```sh
-mkdir -p /private/tmp/cm-lite-acceptance
+mkdir -p /srv/cm-lite-acceptance
 cd clawmanager-agent
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test -c -o /private/tmp/cm-lite-acceptance/sandbox.test ./sandbox
-cp sandbox/acceptance-linux.sh /private/tmp/cm-lite-acceptance/
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test -c -o /srv/cm-lite-acceptance/sandbox.test ./sandbox
+cp sandbox/acceptance-linux.sh /srv/cm-lite-acceptance/
 ```
 
 Inside the actual Linux image/security context, with these files mounted at
@@ -149,3 +150,40 @@ upgrade acceptance. Those remain separate deployment release gates. Record
 both architectures' image sizes and per-runtime idle/load CPU, memory, startup
 and migration timings after the functional/security gates pass; a slim base
 alone is not evidence of lower operating memory.
+
+## NFS rootless multi-slot profile
+
+`RUNTIME_SANDBOX_PROFILE=nfs-rootless-v1` is an explicit paired CM/Runtime
+deployment. It requires container slots, network isolation and ordinary Pods
+without Pod user namespaces, so the NFS mount is never idmapped. Each slot
+reuses its own masked container PID boundary; physical container termination,
+matched to the exact persisted intent and old ContainerID, proves complete
+process teardown before reuse. The legacy profile and its Linux gates remain
+unchanged.
+
+The trusted launcher immediately switches from its fixed two-capability root
+bootstrap to UID/GID10001. It retains only SETUID/SETGID; business and relay
+processes have no effective capabilities. Rootless networking requires the
+image's bubblewrap, iproute2 and nftables. OpenClaw, Hermes and OpenCode overlays
+install the network tools when an older native base lacks them. Public immutable
+OpenClaw plugin defaults must remain readable to scoped instance helpers; this
+is image payload permission, never recursive NFS ownership repair.
+
+Native preparation, private file operations and offline upgrades use fixed
+typed helpers with exact workspace/Team/operation grants and a small
+configuration whitelist. Control/report/model credentials stay in the trusted
+parent. Hermes private workspace health runs through the active instance's
+scoped command path; HTTP authentication and WebSocket health remain checked by
+the parent. Offline OpenClaw maintenance binds workspace and capsule separately;
+directory restores stage inside the workspace mount before atomic installation,
+retaining the capsule for safe retries across mount boundaries.
+
+The NFS export retains root_squash. Provision management roots for10001 and
+stable instance UID/GID200000+instanceID; authorize Team supplemental groups
+according to the actual server NSS/ACL policy. Do not grant a business process
+the full PVC, management UID/GID, outer namespace descriptors or direct storage
+network access. CM's deployment guide in
+`ClawManager/deployments/k8s/lite-slots/nfs-rootless.md` describes admission,
+storage setup, migration and failure fencing. Validate both architectures and
+actual target nodes separately; the2026-11-05 Linux54 NFS lab is single-node
+amd64 and does not establish cross-node or production-NFS fault acceptance.

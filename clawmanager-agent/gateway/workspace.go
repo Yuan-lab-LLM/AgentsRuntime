@@ -91,3 +91,29 @@ func pathWithin(root, child string) bool {
 }
 
 func PathWithin(root, child string) bool { return pathWithin(root, child) }
+
+// PrepareWorkspaceForConfig preserves the management-owned NFS grant. Native
+// hooks run as the assigned instance inside a filesystem with synthetic parents.
+func PrepareWorkspaceForConfig(cfg Config, req CreateGatewayRequest) (string, error) {
+	if cfg.SandboxProfile != "nfs-rootless-v1" {
+		return PrepareWorkspace(cfg.WorkspaceRoot, cfg.RuntimeType, req)
+	}
+	if err := workspaceio.ValidateInstanceCaller(req.UID, req.GID); err != nil {
+		return "", err
+	}
+	workspace, err := ValidateWorkspacePath(cfg.WorkspaceRoot, cfg.RuntimeType, req)
+	if err != nil {
+		return "", err
+	}
+	instance, err := workspaceio.Open(workspace)
+	if err != nil {
+		return "", err
+	}
+	defer instance.Close()
+	home, err := instance.Child("home", 0750)
+	if err != nil {
+		return "", err
+	}
+	defer home.Close()
+	return workspace, nil
+}

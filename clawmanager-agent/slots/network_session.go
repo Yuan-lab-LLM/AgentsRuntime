@@ -26,6 +26,7 @@ type networkSession struct {
 	hosts, resolver            string
 	wrap                       func(*exec.Cmd, int, int, []uint32) error
 	release                    func(context.Context) error
+	fenceIngress               func()
 	mu                         sync.Mutex
 	closing, closed, uncertain bool
 	aux                        sync.WaitGroup

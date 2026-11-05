@@ -13,6 +13,7 @@ import (
 	runtimeagent "github.com/iamlovingit/clawmanager-agent/agent"
 	"github.com/iamlovingit/clawmanager-agent/gateway"
 	"github.com/iamlovingit/clawmanager-agent/internal/instanceagent"
+	"github.com/iamlovingit/clawmanager-agent/netguard"
 	"github.com/iamlovingit/clawmanager-agent/netrelay"
 	"github.com/iamlovingit/clawmanager-agent/slots"
 )
@@ -28,6 +29,24 @@ const (
 )
 
 func Run(profile gateway.RuntimeProfile) {
+	if len(os.Args) > 1 && os.Args[1] == netguard.RootlessCommand {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		if _, err := netguard.RunRootlessCommand(ctx, os.Args[1:], os.Stdin, os.Stdout); err != nil {
+			// This fixed helper receives network/UID metadata only. Its bounded
+			// parent-side stderr capture can retain the concrete setup failure.
+			log.Printf("managed_network_guard_failed: %v", err)
+			os.Exit(2)
+		}
+		return
+	}
+	if handled, err := gateway.RunNativeStorageHelper(profile, os.Args[1:], os.Stdin, os.Stdout); handled {
+		if err != nil {
+			_, _ = os.Stderr.WriteString("managed_native_storage_failed\n")
+			os.Exit(2)
+		}
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == netrelay.Command {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()

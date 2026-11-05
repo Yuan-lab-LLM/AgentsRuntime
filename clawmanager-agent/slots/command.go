@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/iamlovingit/clawmanager-agent/gateway"
@@ -51,13 +52,26 @@ func (s sandboxStarter) RunGatewayCommand(ctx context.Context, spec gateway.Gate
 		return nil, err
 	}
 	cmd := exec.Command(argv[0], argv[1:]...)
+	if spec.Stdin != nil {
+		cmd.Stdin = bytes.NewReader(spec.Stdin)
+	}
+	if s.cfg.SandboxProfile == "nfs-rootless-v1" {
+		cmd.WaitDelay = s.cfg.ProcessStopTimeout
+		if cmd.WaitDelay <= 0 {
+			cmd.WaitDelay = 20 * time.Second
+		}
+	}
 	cmd.Env = []string{"PATH=/usr/local/bin:/usr/bin:/bin", "LANG=C.UTF-8"}
 	var output boundedCommandOutput
 	cmd.Stdout, cmd.Stderr = output.Stdout(), output.Stderr()
 	if err = configureSandboxProcess(cmd, spec.UID, spec.GID, groups); err != nil {
 		return nil, err
 	}
-	tracker, err := sandbox.Track(cmd)
+	track := sandbox.Track
+	if s.cfg.SandboxProfile == "nfs-rootless-v1" {
+		track = sandbox.TrackContainer
+	}
+	tracker, err := track(cmd)
 	if err != nil {
 		return nil, err
 	}
@@ -74,6 +88,12 @@ func (s sandboxStarter) RunGatewayCommand(ctx context.Context, spec gateway.Gate
 	}
 	if err = cmd.Start(); err != nil {
 		return nil, err
+	}
+	kill := func() error {
+		if s.cfg.SandboxProfile == "nfs-rootless-v1" {
+			return sandbox.SignalProcess(cmd.Process, uint32(spec.UID), syscall.SIGKILL)
+		}
+		return cmd.Process.Kill()
 	}
 	startedCtx, cancelStarted := context.WithTimeout(ctx, 10*time.Second)
 	commandErr := tracker.Started(startedCtx)
@@ -98,13 +118,13 @@ func (s sandboxStarter) RunGatewayCommand(ctx context.Context, spec gateway.Gate
 		signalErr := tracker.Terminate(signalCtx)
 		cancelSignal()
 		if signalErr != nil && !errors.Is(signalErr, os.ErrProcessDone) {
-			_ = cmd.Process.Kill()
+			_ = kill()
 		}
 		timer := time.NewTimer(grace)
 		select {
 		case <-waited:
 		case <-timer.C:
-			_ = cmd.Process.Kill()
+			_ = kill()
 			// Wait joins inherited output copies as well as the outer process. The
 			// lifecycle fence remains held even if a stuck writer delays this join.
 			<-waited
@@ -112,7 +132,10 @@ func (s sandboxStarter) RunGatewayCommand(ctx context.Context, spec gateway.Gate
 		timer.Stop()
 	}
 	stopCtx, cancelStop := context.WithTimeout(context.Background(), grace+5*time.Second)
-	stopErr := tracker.WaitStopped(stopCtx)
+	var stopErr error
+	if s.cfg.SandboxProfile != "nfs-rootless-v1" {
+		stopErr = tracker.WaitStopped(stopCtx)
+	}
 	cancelStop()
 	if stopErr != nil {
 		return output.Result(errors.Join(commandErr, fmt.Errorf("%w: auxiliary command namespace teardown is unconfirmed: %v", gateway.ErrGatewayStopFailed, stopErr)))

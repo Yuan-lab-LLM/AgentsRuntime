@@ -139,3 +139,43 @@ func TestListenerInspectionUsesPinnedBusinessNetwork(t *testing.T) {
 		t.Fatal("accepted replaced network namespace")
 	}
 }
+
+func TestContainerListenerPinsFinalUserNamespaceAfterPrimaryAppears(t *testing.T) {
+	tracker, initial, final := listenerFixture(t)
+	defer tracker.Close()
+	tracker.containerLifecycle = true
+	for _, pid := range []string{"123", "456", "789"} {
+		path := filepath.Join(tracker.procRoot, pid, "ns", "user")
+		if err := os.Symlink(initial, path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tablePath := filepath.Join(tracker.procRoot, "123", "net", "tcp")
+	table, err := os.ReadFile(tablePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tablePath, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := tracker.VerifyListeners(context.Background(), 20000, 1); err == nil {
+		t.Fatal("primary socket was not present during early startup")
+	}
+	// Bubblewrap can complete its final user namespace after info-fd/block-fd
+	// rendezvous. Business code cannot run until this setup has completed.
+	for _, pid := range []string{"123", "456"} {
+		path := filepath.Join(tracker.procRoot, pid, "ns", "user")
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(final, path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(tablePath, table, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := tracker.VerifyListeners(context.Background(), 20000, 1); err != nil {
+		t.Fatalf("legitimate final business namespace rejected after early probe: %v", err)
+	}
+}

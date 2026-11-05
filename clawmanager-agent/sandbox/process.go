@@ -28,6 +28,8 @@ type ProcessIdentity struct {
 // Waiting for the outer bubblewrap monitor alone does not prove child teardown.
 // Started and Close must not run concurrently. WaitStopped is safe after Started.
 type Tracker struct {
+	containerLifecycle           bool
+	businessUID                  uint32
 	cmd                          *exec.Cmd
 	infoR, infoW, blockR, blockW *os.File
 	filter                       *os.File
@@ -52,7 +54,22 @@ func Track(cmd *exec.Cmd) (*Tracker, error) {
 	return newTracker(cmd)
 }
 
+// ErrContainerResetRequired prevents primary-process exit from being treated
+// as proof that detached descendants in the shared slot PID namespace ended.
+var ErrContainerResetRequired = errors.New("slot container termination proof is required")
+
+func TrackContainer(cmd *exec.Cmd) (*Tracker, error) {
+	if runtime.GOOS != "linux" {
+		return nil, fmt.Errorf("sandbox process tracking requires Linux")
+	}
+	return newTrackerMode(cmd, true)
+}
+
 func newTracker(cmd *exec.Cmd) (*Tracker, error) {
+	return newTrackerMode(cmd, false)
+}
+
+func newTrackerMode(cmd *exec.Cmd, containerLifecycle bool) (*Tracker, error) {
 	if cmd == nil || len(cmd.Args) < 2 || cmd.Process != nil || len(cmd.ExtraFiles) != 0 {
 		return nil, fmt.Errorf("sandbox tracking requires an unstarted command without inherited FDs")
 	}
@@ -68,7 +85,10 @@ func newTracker(cmd *exec.Cmd) (*Tracker, error) {
 			return nil, fmt.Errorf("sandbox command has incompatible lifecycle options")
 		}
 	}
-	if !pidNamespace {
+	if containerLifecycle && pidNamespace {
+		return nil, fmt.Errorf("container tracking must reuse the slot PID namespace")
+	}
+	if !containerLifecycle && !pidNamespace {
 		return nil, fmt.Errorf("sandbox tracking requires a private PID namespace")
 	}
 	filter, err := seccompFilter()
@@ -87,7 +107,10 @@ func newTracker(cmd *exec.Cmd) (*Tracker, error) {
 		_ = infoW.Close()
 		return nil, fmt.Errorf("create sandbox startup pipe: %w", err)
 	}
-	tracker := &Tracker{cmd: cmd, infoR: infoR, infoW: infoW, blockR: blockR, blockW: blockW, filter: filter, procRoot: "/proc"}
+	tracker := &Tracker{containerLifecycle: containerLifecycle, cmd: cmd, infoR: infoR, infoW: infoW, blockR: blockR, blockW: blockW, filter: filter, procRoot: "/proc"}
+	if containerLifecycle {
+		tracker.businessUID = processLaunchUID(cmd)
+	}
 	cmd.ExtraFiles = []*os.File{infoW, blockR, filter}
 	cmd.Args = append([]string{cmd.Args[0], "--info-fd", "3", "--block-fd", "4", "--seccomp", "5"}, cmd.Args[1:]...)
 	return tracker, nil
@@ -160,13 +183,32 @@ func (t *Tracker) capture(pid, parentPID int) error {
 		return fmt.Errorf("read sandbox init namespace: %w", err)
 	}
 	isInit := false
+	uidCaptured := !t.containerLifecycle
 	for _, line := range strings.Split(string(status), "\n") {
+		if t.containerLifecycle && strings.HasPrefix(line, "Uid:") {
+			fields := strings.Fields(line)
+			if len(fields) != 5 {
+				return fmt.Errorf("invalid sandbox outer identity")
+			}
+			uid, err := strconv.ParseUint(fields[1], 10, 32)
+			if err != nil || uid == 0 || uid == 1<<32-1 || fields[1] != fields[2] || fields[1] != fields[3] || fields[1] != fields[4] {
+				return fmt.Errorf("sandbox outer identity is not a fixed business UID")
+			}
+			if t.businessUID != 0 && t.businessUID != uint32(uid) {
+				return fmt.Errorf("sandbox outer business UID changed during startup")
+			}
+			t.businessUID = uint32(uid)
+			uidCaptured = true
+		}
 		if strings.HasPrefix(line, "NSpid:") {
 			fields := strings.Fields(line)
 			isInit = len(fields) >= 3 && fields[len(fields)-1] == "1"
 		}
 	}
-	if !isInit {
+	if !uidCaptured {
+		return fmt.Errorf("sandbox outer business UID was not captured")
+	}
+	if !isInit && !t.containerLifecycle {
 		return fmt.Errorf("sandbox child is not a private PID namespace init")
 	}
 	t.identity, t.captured = identity, true
@@ -178,6 +220,9 @@ func (t *Tracker) capture(pid, parentPID int) error {
 // a zombie. PID reuse is checked using the recorded start time, never kill(0).
 // Errors and timeouts are uncertain teardown and must prevent slot reuse.
 func (t *Tracker) WaitStopped(ctx context.Context) error {
+	if t.containerLifecycle {
+		return ErrContainerResetRequired
+	}
 	if !t.captured {
 		return fmt.Errorf("sandbox namespace identity was not captured")
 	}
@@ -276,7 +321,11 @@ func (t *Tracker) Terminate(ctx context.Context) error {
 			err = ctx.Err()
 		}
 		if err == nil {
-			err = process.Signal(syscall.SIGTERM)
+			if t.containerLifecycle {
+				err = SignalProcess(process, t.businessUID, syscall.SIGTERM)
+			} else {
+				err = process.Signal(syscall.SIGTERM)
+			}
 		}
 		_ = process.Release()
 		return err
@@ -311,6 +360,9 @@ func (t *Tracker) primaryGateway() (ProcessIdentity, error) {
 	}
 	if !alive {
 		return ProcessIdentity{}, os.ErrProcessDone
+	}
+	if t.containerLifecycle {
+		return t.identity, nil
 	}
 	children, err := os.ReadFile(filepath.Join(t.procRoot, strconv.Itoa(t.identity.PID), "task", strconv.Itoa(t.identity.PID), "children"))
 	if err != nil {
@@ -369,7 +421,15 @@ func (t *Tracker) Close() error {
 		t.networkFile = nil
 	}
 	if !t.released && t.cmd != nil && t.cmd.Process != nil {
-		_ = t.cmd.Process.Kill()
+		var err error
+		if t.containerLifecycle {
+			err = SignalProcess(t.cmd.Process, t.businessUID, syscall.SIGKILL)
+		} else {
+			err = t.cmd.Process.Kill()
+		}
+		if err != nil && !errors.Is(err, os.ErrProcessDone) {
+			return fmt.Errorf("failed startup process remains fenced: %w", err)
+		}
 	}
 	for _, file := range []*os.File{t.infoR, t.infoW, t.blockR, t.blockW, t.filter} {
 		if file != nil {
