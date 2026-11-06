@@ -123,6 +123,10 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", 401)
 		return
 	}
+	if r.URL.Path == "/v1/source-writer/stopped-proof" {
+		p.serveSourceStoppedWriterProof(w, r)
+		return
+	}
 	if r.URL.Path == "/v1/workbench/preview" {
 		p.serveWorkbenchPreview(w, r)
 		return
