@@ -128,7 +128,9 @@ func (s sandboxStarter) RunGatewayCommand(ctx context.Context, spec gateway.Gate
 		}
 		return cmd.Process.Kill()
 	}
-	startedCtx, cancelStarted := context.WithTimeout(ctx, 10*time.Second)
+	// Once spawned, capture the namespace even if the request disconnects.
+	// Losing this identity makes joined cancellation look like unknown teardown.
+	startedCtx, cancelStarted := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	commandErr := tracker.Started(startedCtx)
 	cancelStarted()
 	if commandErr == nil && spec.Terminal != nil {
