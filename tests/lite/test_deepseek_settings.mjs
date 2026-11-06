@@ -13,10 +13,11 @@ const dependencies = {
   '@deepseek-ai/cordis': { Service },
   '@deepseek-ai/dsh-client-store': { createSnapshotStore(initial) {
     let value = initial;
-    return { getSnapshot: () => value, set: next => { value = next; }, subscribe: () => () => {} };
+    return { getSnapshot: () => value, set: next => { value = next; }, update: change => { value = structuredClone(value); change(value); }, subscribe: () => () => {} };
   } },
 };
 vm.runInNewContext(source, {
+  structuredClone,
   window: { __ModuleLoader__: { load: entry => { plugin = entry.factory(name => {
     assert.ok(dependencies[name], `unexpected dependency ${name}`);
     return dependencies[name];
@@ -44,4 +45,21 @@ plugin.apply(denied);
 await denied.settingsScope.describe().ensure();
 assert.equal(denied.settingsScope.describe().getSnapshot().error, 'unauthorized');
 assert.equal(denied.settingsScope.describe().getSnapshot().view, undefined);
-console.log('PASS: remote and loopback settings read host; RPC denial retained; host ownership unchanged');
+let writes = 0;
+const writeDenied = {
+  remote: { $host: { isLoopback: false }, $on: () => () => {}, settings: {
+    describe: async () => ({ ok: true, value: view }),
+    mutate: async () => { writes++; return { ok: false, error: { message: 'read-only provider' } }; },
+  } },
+  on: () => () => {}, effect: callback => callback(),
+};
+plugin.apply(writeDenied);
+await writeDenied.settingsScope.describe().ensure();
+const scope = writeDenied.settingsScope.bind({ namespace: 'llm-pi-ai', decode: value => value });
+await scope.set('providers', { injected: {} });
+assert.equal(writes, 1, 'settings writes must go through the host RPC');
+assert.equal(writeDenied.settingsScope.describe().getSnapshot().view, view, 'denied write must not change the mirror');
+assert.equal(scope.getSnapshot().writable, false, 'provider write policy must remain authoritative');
+assert.equal(scope.getSnapshot().value.providers.auto.models[0].id, 'auto');
+assert.equal(writeDenied.remote.$host.isLoopback, false);
+console.log('PASS: host settings mirror, denied reads/writes, provider policy, and unchanged host ownership');

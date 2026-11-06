@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Enable host settings reads only in the authenticated managed Lite image.
+"""Enable the host settings mirror in the authenticated managed Lite image.
 
 The browser URL names ClawManager rather than localhost. Keep DSH's generic
 host-ownership decision intact; only its settings mirror uses the existing
-instance-authenticated, secret-redacted host RPC instead of process memory.
+instance-authenticated host RPC instead of process memory. Reads stay secret-
+redacted; writes retain the host provider policy and revision checks.
 """
 import hashlib
 from pathlib import Path

@@ -65,7 +65,7 @@ COPY deepseek-harness/scripts/patch-persistent-tmp.py /usr/local/share/deepseek-
 RUN python3 /usr/local/share/deepseek-harness/patch-persistent-tmp.py \
     /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-sandbox-local/lib/index.js
 
-# Remote managed browsers use the instance-authenticated settings RPC. Preserve
+# Remote managed browsers use the instance-authenticated settings mirror. Preserve
 # the native connection's loopback/host-ownership checks for other capabilities.
 COPY deepseek-harness/scripts/patch-managed-settings.py tests/lite/test_deepseek_settings.mjs /usr/local/share/deepseek-harness/
 RUN python3 /usr/local/share/deepseek-harness/patch-managed-settings.py \
