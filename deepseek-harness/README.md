@@ -25,6 +25,10 @@ registry SHA512 integrity before installation. DSH starts with Node's explicit
 applies one SHA-pinned sandbox-local patch: workspace-write commands bind the
 outer instance-private `/tmp` instead of creating another temporary filesystem.
 The read-only profile and Landlock grants retain their existing constraints.
+The Lite image also SHA-pins its settings client patch: managed remote browsers
+read the instance-authenticated, secret-redacted host settings RPC. Generic
+loopback detection and host ownership remain unchanged. The image build runs
+`tests/lite/test_deepseek_settings.mjs` against the installed client bundle.
 
 On the cluster build node, verify a built image with
 `python3 tests/lite/test_deepseek_startup.py <image>`. It starts a fresh non-root
