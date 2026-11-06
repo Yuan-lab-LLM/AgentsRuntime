@@ -104,7 +104,12 @@ func (s *Service) readRegistry(ctx context.Context) (*registry, error) {
 		}
 		seen[rel] = true
 		if _, err = s.repository(ctx, p.Path); err != nil {
-			return nil, err
+			// Removed or renamed projects remain registered, but must not block
+			// other projects. Execute and register still validate their target.
+			var typed *Error
+			if !errors.As(err, &typed) || typed.Code != "not_repository" {
+				return nil, err
+			}
 		}
 		if p.Remote != "" {
 			if p.Remote != publicRemote(p.Remote) {

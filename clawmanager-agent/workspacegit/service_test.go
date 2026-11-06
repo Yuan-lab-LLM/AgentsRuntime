@@ -121,6 +121,89 @@ func TestRegistryCloneImportPersistence(t *testing.T) {
 	}
 }
 
+func TestUnavailableProjectDoesNotBlockOtherProjects(t *testing.T) {
+	for _, change := range []string{"deleted", "renamed"} {
+		t.Run(change, func(t *testing.T) {
+			root := t.TempDir()
+			missing := repoTest(t, root, "missing")
+			healthy := repoTest(t, root, "healthy")
+			repoTest(t, root, "new")
+			s, err := New(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			executeTest(t, s, Request{Operation: "import", Path: "missing"})
+			executeTest(t, s, Request{Operation: "import", Path: "healthy"})
+			if change == "deleted" {
+				err = os.RemoveAll(missing)
+			} else {
+				err = os.Rename(missing, filepath.Join(root, "renamed"))
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Run("projects", func(t *testing.T) {
+				projects := executeTest(t, s, Request{Operation: "projects"}).Projects
+				if len(projects) != 2 || projects[0].Path != "healthy" || projects[1].Path != "missing" {
+					t.Fatalf("registered projects: %+v", projects)
+				}
+			})
+			t.Run("healthy status", func(t *testing.T) {
+				res := executeTest(t, s, Request{Operation: "status", Path: "healthy"})
+				if res.Status == nil || res.Status.Branch != "main" || len(res.Status.Changes) != 0 {
+					t.Fatalf("healthy status: %+v", res.Status)
+				}
+			})
+			t.Run("import", func(t *testing.T) {
+				executeTest(t, s, Request{Operation: "import", Path: "new"})
+			})
+			t.Run("clone", func(t *testing.T) {
+				executeTest(t, s, Request{Operation: "clone", Path: "copy", URL: healthy})
+			})
+			t.Run("missing status", func(t *testing.T) {
+				errorTest(t, s, Request{Operation: "status", Path: "missing"}, "not_repository")
+			})
+		})
+	}
+}
+
+func TestUnavailableProjectDoesNotBypassRegistrySafety(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	repo := repoTest(t, root, "unsafe-metadata")
+	if err := os.RemoveAll(filepath.Join(repo, ".git")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(repo, ".git")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "escape")); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name    string
+		project Project
+		code    string
+	}{
+		{"credentials", Project{Path: "missing", Name: "Missing", Remote: "https://user:secret@example.test/repo.git"}, "invalid_registry"},
+		{"remote helper", Project{Path: "missing", Name: "Missing", Remote: "ext::sh -c evil"}, "invalid_registry"},
+		{"project symlink", Project{Path: "escape", Name: "Escape"}, "invalid_path"},
+		{"metadata symlink", Project{Path: "unsafe-metadata", Name: "Unsafe"}, "invalid_path"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := &registry{Version: 1, Projects: []Project{{Path: "gone", Name: "Gone"}, tc.project}}
+			if err := s.saveRegistry(reg); err != nil {
+				t.Fatal(err)
+			}
+			errorTest(t, s, Request{Operation: "projects"}, tc.code)
+		})
+	}
+}
+
 func TestChangesDiffUnstageAndRename(t *testing.T) {
 	root := t.TempDir()
 	repo := repoTest(t, root, "repo")
