@@ -85,6 +85,38 @@ func TestListenersMustBelongToCapturedNamespaceAcrossAssignedBlock(t *testing.T)
 	}
 }
 
+func TestListenersAllowUnreadableDescendantOnlyWithCompleteAttribution(t *testing.T) {
+	for _, hiddenListener := range []bool{false, true} {
+		t.Run(strconv.FormatBool(hiddenListener), func(t *testing.T) {
+			tracker, _, _ := listenerFixture(t)
+			defer tracker.Close()
+			// PID123 shares the primary namespace, but owns no listener. An
+			// invalid descriptor directory models an inspection error even as root.
+			path := filepath.Join(tracker.procRoot, "123", "fd")
+			if err := os.RemoveAll(path); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if hiddenListener {
+				// Hide the only positive evidence for the primary socket. An
+				// unreadable process must never authorize this unattributed inode.
+				if err := os.Remove(filepath.Join(tracker.procRoot, "456", "fd", "3")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := tracker.VerifyListeners(context.Background(), 20000, 1)
+			if hiddenListener && err == nil {
+				t.Fatal("accepted unattributed listening inode")
+			}
+			if !hiddenListener && err != nil {
+				t.Fatalf("fully attributed listeners rejected for unrelated descriptor failure: %v", err)
+			}
+		})
+	}
+}
+
 func TestListenersRejectMissingPrimaryOrChangedInitIdentity(t *testing.T) {
 	tracker, _, _ := listenerFixture(t)
 	defer tracker.Close()
