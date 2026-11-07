@@ -214,6 +214,8 @@ type GatewayTerminalIO struct {
 }
 
 type ManagedProcess struct {
+	// StartTerminal is bound to this exact admitted execution, never a client PID.
+	StartTerminal        func(context.Context, workbench.TerminalOptions) (workbench.Terminal, error)
 	WorkbenchProcesses   func(context.Context) ([]workbench.Process, error)
 	WorkbenchStopProcess func(context.Context, string) (workbench.Process, error)
 	// PrepareReset joins only the primary application shutdown. It never proves

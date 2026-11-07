@@ -44,3 +44,24 @@ func TestWorkbenchProcessesRequirePinnedNamespaceUIDAndStart(t *testing.T) {
 		t.Fatal("foreign namespace allowed")
 	}
 }
+
+func TestWorkbenchCleanupRejectsUnknownPositivelyOwnedTask(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "scope")
+	os.WriteFile(path, []byte("mnt"), 0600)
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	info, _ := file.Stat()
+	dir := filepath.Join(root, "123")
+	os.MkdirAll(filepath.Join(dir, "ns"), 0700)
+	os.Symlink(path, filepath.Join(dir, "ns/mnt"))
+	os.WriteFile(filepath.Join(dir, "status"), []byte("Uid:\t200002\t200002\t200002\t200002\n"), 0600)
+	os.WriteFile(filepath.Join(dir, "stat"), []byte("unreadable identity"), 0600)
+	tracker := &Tracker{procRoot: root, namespaceFile: file, namespaceInfo: info, auxiliaryMountScope: true, containerLifecycle: true, businessUID: 200002}
+	if err := tracker.StopWorkbenchScope(context.Background(), 200002); err == nil {
+		t.Fatal("unknown task in owned mount scope was reported stopped")
+	}
+}

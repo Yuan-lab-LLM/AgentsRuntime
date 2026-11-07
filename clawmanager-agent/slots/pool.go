@@ -34,6 +34,8 @@ type Assignment struct {
 }
 
 type Snapshot struct {
+	PodUID                 string                     `json:"pod_uid,omitempty"`
+	IdleConfirmed          bool                       `json:"idle_confirmed"`
 	MaintenanceOperationID string                     `json:"maintenance_operation_id,omitempty"`
 	WorkerEpoch            string                     `json:"worker_epoch,omitempty"`
 	Digest                 string                     `json:"digest,omitempty"`

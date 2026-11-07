@@ -170,6 +170,9 @@ func (m *GatewayManager) workbenchWithAdmission(ctx context.Context, req workben
 		return response.Result, nil
 	default:
 		launch := func(lifetime context.Context, options workbench.TerminalOptions) (workbench.Terminal, error) {
+			if process.StartTerminal != nil {
+				return process.StartTerminal(lifetime, options)
+			}
 			runner, ok := m.starter.(workbenchTerminalStarter)
 			if !ok {
 				return workbench.Terminal{}, workbench.Failure("unsupported_runtime", "Terminal execution is unavailable.")

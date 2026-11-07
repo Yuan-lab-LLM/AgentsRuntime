@@ -41,6 +41,7 @@ const slotProbeOffline = "--cm-slot-network-offline"
 func TestMain(m *testing.M) {
 	if handled, err := workbench.RunTerminalHelper(os.Args[1:], os.Stdin, os.Stdout); handled {
 		if err != nil {
+			fmt.Fprintln(os.Stderr, "terminal helper:", err)
 			os.Exit(2)
 		}
 		return
@@ -412,6 +413,7 @@ func protectedSlotLinuxAcceptance(t *testing.T, checkExpiry bool) {
 			time.Sleep(10 * time.Millisecond)
 		}
 
+		assertProtectedTerminalSharesGateway(t, worker, id, result.Namespace)
 		// Pin the old namespace until both assignments have been compared. Inode
 		// numbers may otherwise be reused immediately after complete teardown.
 		running, _ := worker.manager.GatewayState(fmt.Sprintf("gw-%d-1", id))

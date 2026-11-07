@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"github.com/iamlovingit/clawmanager-agent/gateway"
+	"github.com/iamlovingit/clawmanager-agent/sandbox"
 	"github.com/iamlovingit/clawmanager-agent/workbench"
 	"os"
 	"path/filepath"
@@ -14,6 +15,10 @@ import (
 )
 
 func (s sandboxStarter) StartGatewayTerminal(ctx context.Context, spec gateway.GatewayStartSpec, options workbench.TerminalOptions) (workbench.Terminal, error) {
+	return s.startGatewayTerminal(ctx, spec, options, nil)
+}
+
+func (s sandboxStarter) startGatewayTerminal(ctx context.Context, spec gateway.GatewayStartSpec, options workbench.TerminalOptions, primary *sandbox.Tracker) (workbench.Terminal, error) {
 	if filepath.IsAbs(options.Cwd) || strings.ContainsRune(options.Cwd, 0) || strings.Contains(options.Cwd, "\\") {
 		return workbench.Terminal{}, workbench.Invalid()
 	}
@@ -40,13 +45,17 @@ func (s sandboxStarter) StartGatewayTerminal(ctx context.Context, spec gateway.G
 		return workbench.Terminal{}, err
 	}
 	readyToken := hex.EncodeToString(token[:])
-	spec.Command = []string{binary, workbench.TerminalCommand, readyToken}
+	command := workbench.TerminalCommand
+	if primary != nil {
+		command = workbench.SharedTerminalCommand
+	}
+	spec.Command = []string{binary, command, readyToken}
 	spec.Env = append(append([]string{}, spec.Env...), "TERM=xterm-256color")
 	started := make(chan error, 1)
 	done := make(chan error, 1)
 	spec.Terminal = &gateway.GatewayTerminalIO{Master: master, ReadyToken: readyToken, Slave: slave, Started: func(err error) { started <- err }}
 	go func() {
-		_, err := s.RunGatewayCommand(ctx, spec)
+		_, err := s.runGatewayCommand(ctx, spec, primary)
 		slave.Close()
 		if errors.Is(err, gateway.ErrGatewayStopFailed) {
 			err = errors.Join(gateway.ErrGatewayStopFailed, workbench.Failure("stop_unconfirmed", "Terminal writer teardown is unconfirmed."))

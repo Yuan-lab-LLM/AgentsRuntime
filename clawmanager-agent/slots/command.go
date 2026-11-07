@@ -22,6 +22,10 @@ import (
 // stopped-workspace lease: the primary gateway is still running. Its caller must
 // join this command before releasing that lease or acknowledging gateway stop.
 func (s sandboxStarter) RunGatewayCommand(ctx context.Context, spec gateway.GatewayStartSpec) (result []byte, resultErr error) {
+	return s.runGatewayCommand(ctx, spec, nil)
+}
+
+func (s sandboxStarter) runGatewayCommand(ctx context.Context, spec gateway.GatewayStartSpec, primary *sandbox.Tracker) (result []byte, resultErr error) {
 	notified := false
 	if spec.Terminal != nil {
 		defer func() {
@@ -98,12 +102,17 @@ func (s sandboxStarter) RunGatewayCommand(ctx context.Context, spec gateway.Gate
 	if s.cfg.SandboxProfile == "nfs-rootless-v1" {
 		track = sandbox.TrackContainer
 	}
-	tracker, err := track(cmd)
+	var tracker *sandbox.Tracker
+	if primary != nil {
+		tracker, err = primary.JoinTerminal(cmd, commandSpec, groups)
+	} else {
+		tracker, err = track(cmd)
+	}
 	if err != nil {
 		return nil, err
 	}
 	defer tracker.Close()
-	if execution != nil {
+	if execution != nil && primary == nil {
 		if err = execution.wrap(cmd, spec.UID, spec.GID, groups); err != nil {
 			return nil, err
 		}
@@ -112,7 +121,9 @@ func (s sandboxStarter) RunGatewayCommand(ctx context.Context, spec gateway.Gate
 		cmd.Stdin = spec.Terminal.Slave
 		cmd.Stdout = spec.Terminal.Slave
 		cmd.Stderr = spec.Terminal.Slave
-		configureTerminal(cmd)
+		if primary == nil {
+			configureTerminal(cmd)
+		}
 	}
 	// Preparation/identity checks can take time; cancellation must also be checked
 	// immediately before spawn. Any concurrent cancellation after Start is joined.
@@ -186,7 +197,9 @@ func (s sandboxStarter) RunGatewayCommand(ctx context.Context, spec gateway.Gate
 	}
 	stopCtx, cancelStop := context.WithTimeout(context.Background(), grace+5*time.Second)
 	var stopErr error
-	if s.cfg.SandboxProfile != "nfs-rootless-v1" {
+	if primary != nil {
+		stopErr = tracker.StopWorkbenchScope(stopCtx, uint32(spec.UID))
+	} else if s.cfg.SandboxProfile != "nfs-rootless-v1" {
 		stopErr = tracker.WaitStopped(stopCtx)
 	} else if spec.Terminal != nil {
 		stopErr = tracker.StopWorkbenchScope(stopCtx, uint32(spec.UID))

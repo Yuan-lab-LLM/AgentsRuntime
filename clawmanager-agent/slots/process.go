@@ -16,6 +16,7 @@ import (
 
 	"github.com/iamlovingit/clawmanager-agent/gateway"
 	"github.com/iamlovingit/clawmanager-agent/sandbox"
+	"github.com/iamlovingit/clawmanager-agent/workbench"
 )
 
 type sandboxStarter struct {
@@ -174,6 +175,14 @@ func (s sandboxStarter) StartGateway(_ context.Context, spec gateway.GatewayStar
 		process.ConfirmStopped = func(context.Context) error { return sandbox.ErrContainerResetRequired }
 	}
 	attachWorkbenchProcesses(&process, tracker, spec)
+	process.StartTerminal = func(ctx context.Context, options workbench.TerminalOptions) (workbench.Terminal, error) {
+		if s.cfg.SandboxProfile == "nfs-rootless-v1" {
+			// This profile already shares the slot PID namespace. Retain its
+			// existing rootless network attach and private terminal user scope.
+			return s.startGatewayTerminal(ctx, spec, options, nil)
+		}
+		return s.startGatewayTerminal(ctx, spec, options, tracker)
+	}
 	return process, startErr
 }
 

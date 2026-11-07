@@ -29,6 +29,8 @@ type ProcessIdentity struct {
 // Started and Close must not run concurrently. WaitStopped is safe after Started.
 type Tracker struct {
 	containerLifecycle           bool
+	auxiliaryMountScope          bool
+	joinFiles                    []*os.File
 	businessUID                  uint32
 	cmd                          *exec.Cmd
 	infoR, infoW, blockR, blockW *os.File
@@ -108,9 +110,7 @@ func newTrackerMode(cmd *exec.Cmd, containerLifecycle bool) (*Tracker, error) {
 		return nil, fmt.Errorf("create sandbox startup pipe: %w", err)
 	}
 	tracker := &Tracker{containerLifecycle: containerLifecycle, cmd: cmd, infoR: infoR, infoW: infoW, blockR: blockR, blockW: blockW, filter: filter, procRoot: "/proc"}
-	if containerLifecycle {
-		tracker.businessUID = processLaunchUID(cmd)
-	}
+	tracker.businessUID = processLaunchUID(cmd)
 	cmd.ExtraFiles = []*os.File{infoW, blockR, filter}
 	cmd.Args = append([]string{cmd.Args[0], "--info-fd", "3", "--block-fd", "4", "--seccomp", "5"}, cmd.Args[1:]...)
 	return tracker, nil
@@ -175,8 +175,16 @@ func (t *Tracker) capture(pid, parentPID int) error {
 	if err != nil {
 		return err
 	}
-	if ppid != parentPID || state == "Z" || state == "X" {
-		return fmt.Errorf("sandbox init is not a live child of its monitor")
+	parentMatches := ppid == parentPID
+	if !parentMatches && t.auxiliaryMountScope {
+		// --pidns uses one trusted intermediate fork. The final child stays
+		// blocked on our startup FD; verify that fork's exact monitor ancestry.
+		raw, parentErr := os.ReadFile(filepath.Join(t.procRoot, strconv.Itoa(ppid), "stat"))
+		intermediate, intermediateState, monitor, parseErr := parseProcessIdentity(ppid, raw)
+		parentMatches = parentErr == nil && parseErr == nil && monitor == parentPID && intermediateState != "Z" && intermediateState != "X" && intermediate.StartTime <= identity.StartTime
+	}
+	if !parentMatches || state == "Z" || state == "X" {
+		return fmt.Errorf("sandbox init is not a live child of its monitor (pid=%d ppid=%d monitor=%d state=%s)", pid, ppid, parentPID, state)
 	}
 	status, err := os.ReadFile(filepath.Join(t.procRoot, strconv.Itoa(pid), "status"))
 	if err != nil {
@@ -412,6 +420,10 @@ func (t *Tracker) primaryGateway() (ProcessIdentity, error) {
 func (t *Tracker) Close() error {
 	t.namespaceMu.Lock()
 	defer t.namespaceMu.Unlock()
+	for _, file := range t.joinFiles {
+		_ = file.Close()
+	}
+	t.joinFiles = nil
 	if t.namespaceFile != nil {
 		_ = t.namespaceFile.Close()
 		t.namespaceFile = nil

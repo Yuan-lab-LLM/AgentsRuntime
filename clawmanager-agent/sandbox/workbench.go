@@ -88,7 +88,9 @@ func (t *Tracker) ownsWorkbenchProcess(uid uint32, identity ProcessIdentity) boo
 		return false
 	}
 	namespace := "pid"
-	if t.containerLifecycle {
+	if t.auxiliaryMountScope {
+		namespace = "mnt"
+	} else if t.containerLifecycle {
 		namespace = "user"
 	}
 	dir := filepath.Join(t.procRoot, strconv.Itoa(identity.PID))
@@ -173,7 +175,9 @@ func (t *Tracker) PinWorkbenchNamespace() error {
 		return fmt.Errorf("business helper identity unavailable")
 	}
 	namespace := "pid"
-	if t.containerLifecycle {
+	if t.auxiliaryMountScope {
+		namespace = "mnt"
+	} else if t.containerLifecycle {
 		namespace = "user"
 	}
 	file, err := os.Open(filepath.Join(t.procRoot, strconv.Itoa(t.identity.PID), "ns", namespace))
@@ -199,6 +203,7 @@ func (t *Tracker) StopWorkbenchScope(ctx context.Context, uid uint32) error {
 		return fmt.Errorf("auxiliary namespace was not pinned")
 	}
 	deadline := time.Now().Add(time.Second)
+	emptyObserved := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -233,7 +238,9 @@ func (t *Tracker) StopWorkbenchScope(ctx context.Context, uid uint32) error {
 				continue
 			}
 			namespace := "pid"
-			if t.containerLifecycle {
+			if t.auxiliaryMountScope {
+				namespace = "mnt"
+			} else if t.containerLifecycle {
 				namespace = "user"
 			}
 			ns, nsErr := os.Stat(filepath.Join(t.procRoot, entry.Name(), "ns", namespace))
@@ -246,14 +253,19 @@ func (t *Tracker) StopWorkbenchScope(ctx context.Context, uid uint32) error {
 			if !os.SameFile(t.namespaceInfo, ns) {
 				continue
 			}
+			// Once a task positively belongs to this scope, uncertainty cannot
+			// turn it into an empty scan. Even a PID race requires another pass.
+			count++
 			identity, e := t.readIdentity(pid)
 			if e != nil {
-				continue
+				if namespaceInitDisappeared(e) {
+					continue
+				}
+				return fmt.Errorf("verify owned terminal task: %w", e)
 			}
 			if !t.ownsWorkbenchProcess(uid, identity) {
 				continue
 			}
-			count++
 			process, e := os.FindProcess(pid)
 			if e != nil {
 				return e
@@ -271,9 +283,10 @@ func (t *Tracker) StopWorkbenchScope(ctx context.Context, uid uint32) error {
 				return e
 			}
 		}
-		if count == 0 {
+		if count == 0 && emptyObserved {
 			return nil
 		}
+		emptyObserved = count == 0
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
