@@ -145,6 +145,7 @@ COPY hermes/patches/hermes-agent/apply_lite_model_catalog.py hermes/patches/herm
 COPY hermes/tests/test_lite_model_catalog.py hermes/tests/test_lite_picker_budget.py hermes/tests/test_lite_models_metadata.py /usr/local/share/hermes-lite/tests/
 COPY hermes/scripts/hermes-lite-entrypoint /usr/local/bin/hermes-lite-entrypoint
 RUN python -c 'import json,os; p=json.load(open("/usr/local/share/hermes-lite/source-lock.json")); assert (os.environ["HERMES_VERSION"],os.environ["HERMES_GIT_REF"],os.environ["HERMES_GIT_COMMIT"]) == (p["package_version"],p["tag"],p["commit"]), "release build args must match lock"' \
+    && test -s /opt/hermes-agent/hermes_cli/tui_dist/entry.js \
     && sed -i 's/\r$//' /usr/local/bin/start-hermes-lite-backend /usr/local/bin/start-hermes-lite-runtime /usr/local/bin/hermes-apply-runtime-config /usr/local/bin/hermes-lite-entrypoint \
     && chmod 0755 /usr/local/bin/start-hermes-lite-backend /usr/local/bin/start-hermes-lite-runtime /usr/local/bin/hermes-apply-runtime-config /usr/local/bin/hermes-lite-entrypoint \
     && mkdir -p /workspaces /var/lib/clawmanager-agent /usr/local/share/licenses/hermes-agent /usr/local/share/clawmanager \
