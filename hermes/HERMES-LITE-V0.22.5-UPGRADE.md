@@ -43,3 +43,7 @@ The final runtime image and compatible ClawManager were tested in a dedicated Ku
 Authenticated HTTPS/BFF WebSocket checks covered advertised provider aliases, session creation, real model responses and streaming, reconnect/resume, event replay and persistent conversation context. NFS probe files survived slot container recreation and cross-Pod migration. The paired ClawManager fix waits for kubelet termination evidence before target launch and supports retry of a failed source stop; actual retry and migration passed while neighboring instances remained running.
 
 Final targeted runtime verification included 36 release/supply-chain tests and ten catalogue/metadata/budget tests, in addition to the earlier Go, Python and full-image checks. This is functional test evidence, not signed promotion. Actual browser interaction, cross-node scheduling, Longhorn RWX, Team end-to-end acceptance and migration of old 0.21.0 workspaces are not established by these tests.
+
+### Publish preflight follow-up
+
+The first post-merge publish run stopped before matrix generation: the shared static contract expected the complete `hermes_cli/tui_dist/entry.js` path in the Dockerfile, while the new build copied the containing directory. The final image now explicitly requires this entry file to be nonempty. Both shared Lite contract and entrypoint checks also run on pull requests, without registry credentials or publishing images. A passing preflight does not establish that every architecture build or registry push has completed.
