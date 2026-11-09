@@ -121,7 +121,9 @@ func (s sandboxStarter) runGatewayCommand(ctx context.Context, spec gateway.Gate
 		cmd.Stdin = spec.Terminal.Slave
 		cmd.Stdout = spec.Terminal.Slave
 		cmd.Stderr = spec.Terminal.Slave
-		if primary == nil {
+		// A fresh/private PID namespace needs its session created by the
+		// helper after entry. NFS already uses this outer slot PID view.
+		if primary == nil && s.cfg.SandboxProfile == "nfs-rootless-v1" {
 			configureTerminal(cmd)
 		}
 	}

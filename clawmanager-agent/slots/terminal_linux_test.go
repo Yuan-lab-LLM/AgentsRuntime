@@ -106,7 +106,7 @@ func runLinuxWorkbenchSandboxTerminal(t *testing.T, profile string) {
 	var output strings.Builder
 	readDone := make(chan struct{})
 	go func() { io.Copy(&output, terminal.IO); close(readDone) }()
-	_, err = io.WriteString(terminal.IO, "pwd; id -u; stty size; echo $EXPLICIT_BUSINESS; echo ${RUNTIME_AGENT_CONTROL_TOKEN-unset}; setsid /bin/sh -c 'trap \"\" HUP TERM; while :; do printf x >> \"$HOME/writes\"; sleep 0.03; done' >/dev/null 2>&1 & sleep 0.1; exit\n")
+	_, err = io.WriteString(terminal.IO, "pwd; id -u; stty size; test \"$(ps -p $$ -o sid= | tr -d ' ')\" -gt 0 && echo terminal-session-owned; echo $EXPLICIT_BUSINESS; echo ${RUNTIME_AGENT_CONTROL_TOKEN-unset}; setsid /bin/sh -c 'trap \"\" HUP TERM; while :; do printf x >> \"$HOME/writes\"; sleep 0.03; done' >/dev/null 2>&1 & sleep 0.1; exit\n")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ func runLinuxWorkbenchSandboxTerminal(t *testing.T, profile string) {
 	if waitErr != nil {
 		t.Fatalf("sandbox terminal: %v output=%q", waitErr, output.String())
 	}
-	for _, expected := range []string{workspace + "/project", "200002", "38 104", "visible", "unset"} {
+	for _, expected := range []string{workspace + "/project", "200002", "38 104", "visible", "unset", "\r\nterminal-session-owned\r\n"} {
 		if !strings.Contains(output.String(), expected) {
 			t.Fatalf("missing %s: %q", expected, output.String())
 		}

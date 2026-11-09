@@ -179,9 +179,19 @@ func (t *Tracker) capture(pid, parentPID int) error {
 	if !parentMatches && t.auxiliaryMountScope {
 		// --pidns uses one trusted intermediate fork. The final child stays
 		// blocked on our startup FD; verify that fork's exact monitor ancestry.
+		// The intermediate may already be an unreaped zombie. Its PID cannot
+		// be reused yet; do not accept an unrelated/reparented Pod init.
 		raw, parentErr := os.ReadFile(filepath.Join(t.procRoot, strconv.Itoa(ppid), "stat"))
 		intermediate, intermediateState, monitor, parseErr := parseProcessIdentity(ppid, raw)
-		parentMatches = parentErr == nil && parseErr == nil && monitor == parentPID && intermediateState != "Z" && intermediateState != "X" && intermediate.StartTime <= identity.StartTime
+		parentMatches = parentErr == nil && parseErr == nil && monitor == parentPID && intermediateState != "X" && intermediate.StartTime <= identity.StartTime
+	}
+	if !parentMatches && t.auxiliaryMountScope {
+		// The intermediate can be reaped between the two stat reads. Bwrap
+		// is a subreaper: accept one fresh, unchanged child only if the exact
+		// monitor now owns it. Reparenting to a Pod init grants no authority.
+		raw, readErr := os.ReadFile(filepath.Join(t.procRoot, strconv.Itoa(pid), "stat"))
+		current, currentState, currentParent, parseErr := parseProcessIdentity(pid, raw)
+		parentMatches = readErr == nil && parseErr == nil && current == identity && currentParent == parentPID && currentState != "Z" && currentState != "X"
 	}
 	if !parentMatches || state == "Z" || state == "X" {
 		return fmt.Errorf("sandbox init is not a live child of its monitor (pid=%d ppid=%d monitor=%d state=%s)", pid, ppid, parentPID, state)

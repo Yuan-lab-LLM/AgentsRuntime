@@ -46,7 +46,7 @@ func (s sandboxStarter) startGatewayTerminal(ctx context.Context, spec gateway.G
 	}
 	readyToken := hex.EncodeToString(token[:])
 	command := workbench.TerminalCommand
-	if primary != nil {
+	if primary != nil || s.cfg.SandboxProfile != "nfs-rootless-v1" {
 		command = workbench.SharedTerminalCommand
 	}
 	spec.Command = []string{binary, command, readyToken}
