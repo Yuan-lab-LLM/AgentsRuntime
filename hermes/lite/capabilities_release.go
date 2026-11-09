@@ -83,7 +83,9 @@ func readVerifiedDesktopRelease(root *os.Root) (*desktopRelease, bool) {
 		(release.Accepted && release.Acceptance == nil) || (!release.Accepted && release.Acceptance != nil) {
 		return nil, false
 	}
-	if len(release.Artifacts) == 0 || len(release.Artifacts) > 16384 || !desktopSHA256(release.PayloadSHA256) {
+	// Checked-hash application bytecode is inventory-bound too; retain a bounded
+	// file count while accommodating source plus its build-time caches.
+	if len(release.Artifacts) == 0 || len(release.Artifacts) > 32768 || !desktopSHA256(release.PayloadSHA256) {
 		return nil, false
 	}
 	for _, required := range desktopRequiredArtifacts {
@@ -142,7 +144,7 @@ func desktopArtifactPath(file string) bool {
 	if file == HermesManagedProxyPolicyMarker {
 		return true
 	}
-	for _, prefix := range []string{"/opt/hermes-agent/", "/usr/local/lib/python3.13/", "/usr/local/share/hermes-lite/patches/", "/usr/local/share/hermes-lite/tests/"} {
+	for _, prefix := range []string{"/opt/hermes-agent/", "/usr/local/lib/python3.14/", "/usr/local/share/hermes-lite/patches/", "/usr/local/share/hermes-lite/tests/"} {
 		if strings.HasPrefix(file, prefix) {
 			return true
 		}
@@ -167,17 +169,24 @@ func desktopDigest(value []byte) string {
 // welcome, but a manifest cannot omit the code/launcher that enforces the mode.
 var desktopRequiredArtifacts = []string{
 	"/opt/hermes-agent/plugins/platforms/redis_team/adapter.py", "/opt/hermes-agent/plugins/platforms/redis_team/plugin.yaml",
-	"/usr/local/share/hermes-lite/patches/apply_team_completion_stop.py", "/usr/local/share/hermes-lite/patches/apply_profile_external_skill_dedupe.py",
+	"/usr/local/share/hermes-lite/patches/apply_team_completion_stop.py", "/usr/local/share/hermes-lite/patches/apply_lite_team_completion_stop.py", "/usr/local/share/hermes-lite/patches/apply_lite_skill_dedupe.py", "/usr/local/share/hermes-lite/patches/apply_profile_external_skill_dedupe.py",
 	"/usr/local/bin/start-hermes-lite-runtime", "/usr/local/bin/hermes-apply-runtime-config",
 	"/usr/local/share/clawmanager/hermes/skills/redis-team-protocol/SKILL.md", "/usr/local/share/clawmanager/hermes/skills/redis-team-protocol/skill.json",
-	"/usr/local/bin/start-hermes-lite-backend", "/usr/local/bin/clawmanager-agent", "/usr/local/bin/node", "/usr/local/bin/hermes-lite-entrypoint", "/usr/local/bin/python3.13",
-	"/usr/local/lib/libpython3.13.so.1.0",
+	"/usr/local/bin/start-hermes-lite-backend", "/usr/local/bin/clawmanager-agent", "/usr/local/bin/node", "/usr/local/bin/hermes-lite-entrypoint", "/usr/local/bin/python3.14",
+	"/usr/local/lib/libpython3.14.so.1.0",
 	"/opt/hermes-agent/hermes_cli/web_server.py", "/opt/hermes-agent/hermes_cli/runtime_provider.py", "/opt/hermes-agent/hermes_cli/lite_gateway_boundary.py", "/opt/hermes-agent/hermes_cli/lite_non_native.py", "/opt/hermes-agent/tui_gateway/server.py", "/opt/hermes-agent/tui_gateway/methods_session.py", "/opt/hermes-agent/model_tools.py",
 	"/opt/hermes-agent/hermes_cli/tui_dist/entry.js",
+	"/opt/hermes-agent/hermes_cli/web_server_chat.py", "/opt/hermes-agent/hermes_cli/web_server_lifecycle.py", "/opt/hermes-agent/hermes_cli/runtime_provider_custom.py",
+	"/opt/hermes-agent/tui_gateway/agent_factory.py", "/opt/hermes-agent/tui_gateway/rpc_dispatch.py", "/opt/hermes-agent/tui_gateway/session_registry.py",
+	"/opt/hermes-agent/tui_gateway/session_lifecycle.py", "/opt/hermes-agent/tui_gateway/session_notifications.py", "/opt/hermes-agent/install-stamp.json", "/opt/hermes-agent/pm/lock.json",
+	"/opt/hermes-agent/pm-runtime/pm-runtime.json", "/opt/hermes-agent/hermes_cli/tui_dist/package.json",
+	"/opt/hermes-agent/.install_method",
 	"/opt/hermes-agent/agent/tool_executor.py",
+	"/opt/hermes-agent/agent/secret_scope.py",
 	"/opt/hermes-agent/hermes_cli/env_loader.py", "/opt/hermes-agent/hermes_cli/lite_environment.py",
 	"/opt/hermes-agent/.venv/bin/hermes", "/opt/hermes-agent/pyproject.toml", "/opt/hermes-agent/uv.lock", "/opt/hermes-agent/package-lock.json",
 	"/usr/local/share/hermes-lite/source-lock.json", "/usr/local/share/hermes-lite/verify_lite_release.py", "/usr/local/share/hermes-lite/run_release_check.py",
+	"/usr/local/share/hermes-lite/precompile_lite.py",
 	"/usr/local/share/hermes-lite/patches/apply_lite_gateway_boundary.py", "/usr/local/share/hermes-lite/patches/lite_gateway_boundary.py", "/usr/local/share/hermes-lite/patches/apply_lite_non_native.py", "/usr/local/share/hermes-lite/patches/lite_non_native.py",
 	"/usr/local/share/hermes-lite/patches/apply_lite_tool_executor.py", "/usr/local/share/hermes-lite/tests/check_lite_tool_executor.py",
 	"/usr/local/share/hermes-lite/patches/lite_environment.py",

@@ -19,9 +19,9 @@ import (
 )
 
 const (
-	desktopWebHermesVersion = "0.21.0"
-	desktopWebHermesGitRef  = "v2026.8.31"
-	desktopWebHermesCommit  = "29112bef099274229cadff79cdff7bf7b99c4b77"
+	desktopWebHermesVersion = "0.22.5"
+	desktopWebHermesGitRef  = "v0.22.5"
+	desktopWebHermesCommit  = "bf0203a794a07aac3ff764972ab9087baa4e4f4e"
 	desktopWebMarkerFile    = ".clawmanager-hermes-workspace.json"
 )
 
@@ -135,7 +135,7 @@ func writeDesktopWebConfig(cfg gateway.Config, req gateway.CreateGatewayRequest,
 		return err
 	}
 	defer root.Close()
-	version := desktopWebWorkspaceVersion{1, desktopWebHermesVersion, desktopWebHermesGitRef, desktopWebHermesCommit, "dashboard"}
+	version := desktopWebWorkspaceVersion{1, desktopWebHermesVersion, desktopWebHermesGitRef, desktopWebHermesCommit, "serve"}
 	marker, err := readDesktopWebFile(root, desktopWebMarkerFile)
 	if err != nil {
 		return err

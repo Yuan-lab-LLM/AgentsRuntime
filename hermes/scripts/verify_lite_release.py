@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Fail-closed verification of the reviewed Hermes Lite release, using stdlib only."""
 import argparse
-import ast
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -27,9 +26,9 @@ SUITES = {
 }
 FIXED_FILES = [
     "/usr/local/bin/" + name for name in
-    ("clawmanager-agent", "start-hermes-lite-backend", "start-hermes-lite-runtime", "hermes-apply-runtime-config", "hermes-lite-entrypoint", "node", "python3.13")
-] + ["/usr/local/lib/libpython3.13.so.1.0"] + [SHARE + "/" + name for name in (
-    "source-lock.json", "verify_lite_release.py", "run_release_check.py", "run_campaign.py", "campaign_evidence.py",
+    ("clawmanager-agent", "start-hermes-lite-backend", "start-hermes-lite-runtime", "hermes-apply-runtime-config", "hermes-lite-entrypoint", "node", "python3.14")
+] + ["/usr/local/lib/libpython3.14.so.1.0"] + [SHARE + "/" + name for name in (
+    "source-lock.json", "verify_lite_release.py", "run_release_check.py", "run_campaign.py", "campaign_evidence.py", "precompile_lite.py",
     "campaign_signing.py", "verify_lite_promotion_oci.py", "verify_campaign_signature.mjs", "release-trust.json", "acceptance-protocol.json")]
 FIXED_FILES += [
     "/usr/local/share/clawmanager/hermes-proxy-policy-v1",
@@ -41,15 +40,20 @@ MANDATORY = FIXED_FILES + ["/opt/hermes-agent/" + name for name in (
     "hermes_cli/lite_non_native.py", "hermes_cli/env_loader.py", "hermes_cli/lite_environment.py",
     "tui_gateway/server.py", "tui_gateway/methods_session.py",
     "model_tools.py", "agent/tool_executor.py", "hermes_cli/tui_dist/entry.js",
+    "agent/secret_scope.py",
+    "hermes_cli/web_server_chat.py", "hermes_cli/web_server_lifecycle.py", "hermes_cli/runtime_provider_custom.py",
+    "tui_gateway/agent_factory.py", "tui_gateway/rpc_dispatch.py", "tui_gateway/session_registry.py",
+    "tui_gateway/session_lifecycle.py", "tui_gateway/session_notifications.py", "install-stamp.json", "pm/lock.json",
+    "pm-runtime/pm-runtime.json", "hermes_cli/tui_dist/package.json", ".install_method",
     ".venv/bin/hermes", "pyproject.toml", "uv.lock", "package-lock.json",
     "plugins/platforms/redis_team/adapter.py", "plugins/platforms/redis_team/plugin.yaml",
 )] + [SHARE + "/patches/" + name for name in (
-    "apply_lite_gateway_boundary.py", "lite_gateway_boundary.py", "apply_lite_non_native.py", "lite_non_native.py", "lite_environment.py", "apply_lite_tool_executor.py", "apply_team_completion_stop.py", "apply_profile_external_skill_dedupe.py",
+    "apply_lite_models_metadata.py", "apply_lite_picker_budget.py", "apply_lite_model_catalog.py", "apply_lite_gateway_boundary.py", "lite_gateway_boundary.py", "apply_lite_non_native.py", "lite_non_native.py", "lite_environment.py", "apply_lite_tool_executor.py", "apply_lite_startup.py", "lite_startup_timing.py", "lite_skills_sync.py", "apply_team_completion_stop.py", "apply_lite_team_completion_stop.py", "apply_lite_skill_dedupe.py", "apply_profile_external_skill_dedupe.py",
 )] + [SHARE + "/tests/" + name for name in (*SUITES.values(), "check_lite_tool_executor.py", "cm_bff_browser.mjs", "acceptance_model_stub.py")]
-ARTIFACT_TREES = ("/opt/hermes-agent", "/usr/local/lib/python3.13", SHARE + "/patches", SHARE + "/tests")
+ARTIFACT_TREES = ("/opt/hermes-agent", "/usr/local/lib/python3.14", SHARE + "/patches", SHARE + "/tests")
 HEX256 = re.compile(r"[0-9a-f]{64}")
-PATCH_FILES = {"apply_lite_gateway_boundary.py", "lite_gateway_boundary.py", "apply_lite_non_native.py", "lite_non_native.py", "lite_environment.py", "apply_lite_tool_executor.py", "apply_team_completion_stop.py", "apply_profile_external_skill_dedupe.py"}
-TEST_FILES = set(SUITES.values()) | {"check_lite_tool_executor.py", "cm_bff_browser.mjs", "acceptance_model_stub.py", "smoke_lite_team.py"}
+PATCH_FILES = {"apply_lite_models_metadata.py", "apply_lite_picker_budget.py", "apply_lite_model_catalog.py", "apply_lite_gateway_boundary.py", "lite_gateway_boundary.py", "apply_lite_non_native.py", "lite_non_native.py", "lite_environment.py", "apply_lite_tool_executor.py", "apply_lite_startup.py", "lite_startup_timing.py", "lite_skills_sync.py", "apply_team_completion_stop.py", "apply_lite_team_completion_stop.py", "apply_lite_skill_dedupe.py", "apply_profile_external_skill_dedupe.py"}
+TEST_FILES = set(SUITES.values()) | {"test_lite_models_metadata.py", "test_lite_picker_budget.py", "test_lite_model_catalog.py", "check_lite_tool_executor.py", "cm_bff_browser.mjs", "acceptance_model_stub.py", "smoke_lite_team.py"}
 
 
 def sha256_file(path):
@@ -106,7 +110,7 @@ def collect_artifacts(root="/", ownership=True):
                 path = parent / name
                 if not path.is_symlink():
                     paths.add("/" + path.relative_to(root).as_posix())
-    require(set(MANDATORY) <= paths and len(paths) <= 16384, "incomplete or oversized artifact inventory")
+    require(set(MANDATORY) <= paths and len(paths) <= 32768, "incomplete or oversized artifact inventory")
     return {path: sha256_file(managed_path(root, path, ownership)) for path in sorted(paths)}
 
 
@@ -132,7 +136,7 @@ def verify_release(release, lock, root="/", require_accepted=False, ownership=Tr
             "managed release identity mismatch")
     require(type(release.get("desktop_web_accepted")) is bool, "missing accepted state")
     artifacts = release.get("artifacts", {})
-    require(isinstance(artifacts, dict) and set(MANDATORY) <= artifacts.keys() and len(artifacts) <= 16384,
+    require(isinstance(artifacts, dict) and set(MANDATORY) <= artifacts.keys() and len(artifacts) <= 32768,
             "incomplete or oversized artifact inventory")
     require(all(isinstance(path, str) and artifact_allowed(path) and isinstance(digest, str)
                 and HEX256.fullmatch(digest) for path, digest in artifacts.items()), "invalid artifact entry")
@@ -271,10 +275,13 @@ def require(value, message):
 def load_lock(path):
     lock = load_json(path)
     require(lock.get("schema_version") == 1, "unsupported lock schema")
-    require(re.fullmatch(r"v\d{4}\.\d{1,2}\.\d{1,2}", lock["tag"]), "release tag must be fixed")
+    require(re.fullmatch(r"v(0|[1-9]\d{0,2})\.\d+\.\d+", lock["tag"]), "release tag must be fixed")
     require(re.fullmatch(r"[0-9a-f]{40}", lock["commit"]), "commit must be a full SHA")
     require(re.fullmatch(r"[0-9a-f]{40}", lock["tag_object"]), "tag object must be a full SHA")
     require(re.fullmatch(r"\d+\.\d+\.\d+", lock["package_version"]), "invalid package version")
+    require(lock["tag"] == "v" + lock["package_version"], "release tag/version mismatch")
+    require(lock.get("source_package_version") == "0.0.0" and lock.get("python_version") == "3.14",
+            "unsupported source metadata/runtime")
     require(lock["repository"] == "https://github.com/NousResearch/hermes-agent.git", "unexpected upstream")
     expected = "https://codeload.github.com/NousResearch/hermes-agent/tar.gz/" + lock["commit"]
     require(lock["archive_url"] == expected, "archive URL must name the locked commit")
@@ -310,31 +317,41 @@ def verify_upstream(lock):
 def verify_source(lock, root):
     root = Path(root)
     for relative, digest in lock["source_sha256"].items():
+        require((root / relative).is_file(), "missing locked source: " + relative)
         require(hashlib.sha256((root / relative).read_bytes()).hexdigest() == digest,
                 "source checksum mismatch: " + relative)
     project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
-    require(project["project"]["version"] == lock["package_version"], "Python package version mismatch")
-    constants = {}
-    for node in ast.parse((root / "hermes_cli/__init__.py").read_text(encoding="utf-8")).body:
-        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    constants[target.id] = node.value.value
-    require(constants.get("__version__") == lock["package_version"], "CLI package version mismatch")
-    require("v" + constants.get("__release_date__", "") == lock["tag"], "CLI release tag mismatch")
+    # SemVer releases use a placeholder distribution version. The immutable tag
+    # and a build-time upstream install stamp identify the runnable release.
+    require(project["project"]["version"] == lock["source_package_version"], "Python source package version mismatch")
+    require((root / ".python-version").read_text().strip() == lock["python_version"], "Python runtime mismatch")
     for relative, expected in lock["node_packages"].items():
         actual = json.loads((root / relative).read_text(encoding="utf-8"))["version"]
         require(actual == expected, "Node package version mismatch: " + relative)
 
 
-def download_source(lock, destination):
+def download_source(lock, destination, archive_cache=None, local_archive=None):
     destination = Path(destination)
     require(not destination.exists(), "download destination already exists")
     with tempfile.TemporaryDirectory() as temporary:
-        archive = Path(temporary) / "source.tar.gz"
-        with urllib.request.urlopen(lock["archive_url"], timeout=120) as response, archive.open("wb") as output:
-            shutil.copyfileobj(response, output)
+        archive = Path(local_archive) if local_archive else Path(temporary) / "source.tar.gz"
+        cached = Path(archive_cache) / (lock["archive_sha256"] + ".tar.gz") if archive_cache else None
+        if local_archive:
+            require(archive.is_file(), "local source archive is missing")
+        elif cached and cached.is_file():
+            archive = cached
+        else:
+            with urllib.request.urlopen(lock["archive_url"], timeout=120) as response, archive.open("wb") as output:
+                shutil.copyfileobj(response, output)
         require(hashlib.sha256(archive.read_bytes()).hexdigest() == lock["archive_sha256"], "archive checksum mismatch")
+        if cached and archive != cached:
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            # Cache only verified complete archives; every reuse is hashed again.
+            with tempfile.NamedTemporaryFile(dir=cached.parent, delete=False) as output:
+                staging = Path(output.name)
+                with archive.open("rb") as source:
+                    shutil.copyfileobj(source, output)
+            staging.replace(cached)
         unpacked = Path(temporary) / "unpacked"
         with tarfile.open(archive) as source:
             source.extractall(unpacked, filter="data")
@@ -345,12 +362,38 @@ def download_source(lock, destination):
     (destination / ".hermes_build_sha").write_text(lock["commit"] + "\n", encoding="utf-8")
 
 
+def write_install_stamp(lock, destination):
+    destination = Path(destination)
+    require((destination / "pm-runtime/pm-runtime.json").is_file(), "missing resident PM runtime")
+    subprocess.run([
+        sys.executable, str(destination / "scripts/write_install_stamp.py"),
+        "--output", str(destination / "install-stamp.json"), "--commit", lock["commit"],
+        "--base-version", lock["package_version"], "--distance", "0",
+        "--source", "docker", "--distribution", "docker", "--update-mechanism", "external",
+    ], check=True, timeout=60)
+    path = destination / "install-stamp.json"
+    stamp = load_json(path)
+    stamp["pmRuntime"] = str(destination / "pm-runtime")
+    path.write_text(json.dumps(stamp, indent=2) + "\n", encoding="utf-8")
+    (destination / ".install_method").write_text("docker\n", encoding="utf-8")
+
+
 def verify_runtime(lock, hermes, node):
     output = subprocess.check_output([hermes, "--version"], text=True, timeout=60)
     require(re.search(r"(?<![\d.])v?" + re.escape(lock["package_version"]) + r"(?![\d.])", output),
             "hermes --version mismatch")
     node_version = subprocess.check_output([node, "--version"], text=True, timeout=20).strip()
     require(node_version == "v" + lock["node_version"], "Node runtime version mismatch")
+    verify_install_stamp(lock, Path("/opt/hermes-agent"))
+
+
+def verify_install_stamp(lock, root):
+    stamp = load_json(Path(root) / "install-stamp.json")
+    expected = {"schemaVersion": 2, "commit": lock["commit"], "baseVersion": lock["package_version"],
+                "distance": 0, "source": "docker", "distribution": "docker", "updateMechanism": "external",
+                "pmRuntime": str(Path(root) / "pm-runtime")}
+    require(all(type(stamp.get(key)) is type(value) and stamp[key] == value for key, value in expected.items()),
+            "runtime install stamp mismatch")
 
 
 def main():
@@ -359,6 +402,9 @@ def main():
     parser.add_argument("--upstream", action="store_true")
     parser.add_argument("--source", type=Path)
     parser.add_argument("--download", type=Path)
+    parser.add_argument("--archive-cache", type=Path, help="Cache verified upstream archives by SHA-256")
+    parser.add_argument("--archive", type=Path, help="Use a local archive, with the same mandatory SHA-256/source checks")
+    parser.add_argument("--write-install-stamp", type=Path, help="Stamp the completed packaged runtime")
     parser.add_argument("--runtime", action="store_true")
     parser.add_argument("--patch-root", type=Path)
     parser.add_argument("--test-root", type=Path)
@@ -376,7 +422,9 @@ def main():
     if args.source:
         verify_source(lock, args.source)
     if args.download:
-        download_source(lock, args.download)
+        download_source(lock, args.download, args.archive_cache, args.archive)
+    if args.write_install_stamp:
+        write_install_stamp(lock, args.write_install_stamp)
     if args.runtime:
         verify_runtime(lock, args.hermes, args.node)
     if args.patch_root:

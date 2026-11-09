@@ -6,8 +6,9 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import sys
 import threading
-from types import SimpleNamespace
+from types import SimpleNamespace, ModuleType
 import unittest
 from unittest.mock import patch
 from urllib.parse import urlencode
@@ -51,6 +52,9 @@ class NonNativePolicyTests(unittest.TestCase):
                 result = guarded(name, {"password": "private-do-not-reflect"})
                 self.assertEqual({"error": "unsupported_native_desktop_tool"}, json.loads(result))
                 self.assertNotIn("private", result)
+                alias = guarded("tool_call", {"name": name, "arguments": {"private": "do-not-reflect"}})
+                self.assertEqual({"error": "unsupported_native_desktop_tool"}, json.loads(alias))
+                self.assertNotIn("private", alias)
 
     def test_terminal_and_clarify_keep_real_arguments(self):
         called = []
@@ -273,11 +277,48 @@ class RPCPolicyTests(unittest.TestCase):
 
 
 class HydrationLifecycleTests(unittest.TestCase):
+    def test_actual_rpc_model_catalog_reads_each_env_file_once_per_request(self):
+        root = Path(os.environ.get("HERMES_LITE_TEST_PATCHED_ROOT", "/opt/hermes-agent"))
+        source = root / "tui_gateway/methods_complete.py"
+        if not source.is_file():
+            self.skipTest("requires installed candidate or HERMES_LITE_TEST_PATCHED_ROOT")
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        handler = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                       and any(isinstance(d, ast.Call) and isinstance(d.func, ast.Name)
+                               and d.func.id == "method" and d.args and isinstance(d.args[0], ast.Constant)
+                               and d.args[0].value == "model.options" for d in node.decorator_list))
+        handler.decorator_list = []
+        guard = module("lite_rpc_catalog_test", PATCHES / "lite_environment.py")
+        reads = []
+        @guard.secret_file
+        def read(path):
+            reads.append(path)
+            return {"PLUGIN_KEY": "fixture"}
+        def context(_agent):
+            read("profile.env")
+            return "context"
+        def build(ctx, **_kwargs):
+            self.assertEqual("context", ctx)
+            for _ in range(100):
+                read("profile.env")
+            return {"providers": [{"models": ["fixture"]}]}
+        package, inventory = ModuleType("hermes_cli"), ModuleType("hermes_cli.inventory")
+        package.lite_environment = guard
+        inventory.build_model_options_payload = build
+        ns = {"_model_skew_err": lambda _: None, "_ok": lambda _id, value: value,
+              "_model_picker_context": context, "_session_agent": lambda _: None}
+        exec(compile(ast.Module(body=[handler], type_ignores=[]), str(source), "exec"), ns)
+        with patch.dict(sys.modules, {"hermes_cli": package, "hermes_cli.inventory": inventory}):
+            ns["_"](1, {"explicit_only": True})
+            self.assertEqual(["profile.env"], reads)
+            ns["_"](2, {"explicit_only": True})
+            self.assertEqual(["profile.env", "profile.env"], reads)
+
     def test_actual_hydration_failure_cannot_remove_configured_session(self):
         # Use the actual built/installed handler, not a rewritten lookalike.
         # Host integration runs point this at the exact patched upstream tree.
         source_root = Path(os.environ.get("HERMES_LITE_TEST_PATCHED_ROOT", "/opt/hermes-agent"))
-        source_file = source_root / "tui_gateway/server.py"
+        source_file = source_root / "tui_gateway/session_registry.py"
         if not source_file.is_file():
             self.skipTest("requires installed candidate or HERMES_LITE_TEST_PATCHED_ROOT")
         tree = ast.parse(source_file.read_text(encoding="utf-8"))
@@ -320,6 +361,9 @@ class HydrationLifecycleTests(unittest.TestCase):
                      "current_transport": lambda: None, "_stdio_transport": object(),
                      "_err": lambda rid, code, message: {"error": {"code": code}},
                      "sanitize_replay_history": lambda value: value, "_todo_state_from_history": lambda _: None,
+                     "canonicalize_replay_history": lambda value: value,
+                     "_load_resume_transcript": lambda *_args, **_kwargs: ([], [], []),
+                     "resume_failed_message": lambda _error: "controlled hydration failure",
                      "_start_agent_build": lambda *_: None, "_maybe_schedule_auto_continue": late_failure,
                      "_emit": emit, "entered": entered, "failed": failed, "popped": popped}
         exec(compile(ast.Module(body=[hydration], type_ignores=[]), str(source_file), "exec"), namespace)
@@ -364,6 +408,55 @@ class PatchIntegrityTests(unittest.TestCase):
 
 
 class DeploymentEnvironmentTests(unittest.TestCase):
+    def test_catalog_snapshot_is_request_local_and_preserves_seals(self):
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "managed-fixture"}, clear=True):
+            guard = module("lite_catalog_env_test", PATCHES / "lite_environment.py")
+            reads = []
+            value = {"USER_PLUGIN_KEY": "first", "OPENAI_API_KEY": "forged"}
+            @guard.secret_file
+            def read(path):
+                reads.append(path)
+                return dict(value)
+            @guard.env_read_request
+            def catalog():
+                calls = []
+                def load():
+                    calls.append(True)
+                    return {"actual": len(calls)}
+                self.assertEqual(guard.catalog_value("gateway-config", load), guard.catalog_value("gateway-config", load))
+                self.assertEqual(1, len(calls))
+                first = read("a.env")
+                first["USER_PLUGIN_KEY"] = "caller mutation"
+                value["USER_PLUGIN_KEY"] = "second"
+                self.assertEqual("first", read("a.env")["USER_PLUGIN_KEY"])
+                self.assertEqual("second", read("b.env")["USER_PLUGIN_KEY"])
+                self.assertEqual("managed-fixture", read("a.env")["OPENAI_API_KEY"])
+            catalog()
+            self.assertEqual(["a.env", "b.env"], reads)
+            self.assertEqual("second", read("a.env")["USER_PLUGIN_KEY"])
+            @guard.env_read_request
+            def failed():
+                read("a.env")
+                raise RuntimeError("fixture")
+            with self.assertRaises(RuntimeError):
+                failed()
+            value["USER_PLUGIN_KEY"] = "third"
+            self.assertEqual("third", read("a.env")["USER_PLUGIN_KEY"])
+
+    def test_profile_files_and_scopes_cannot_replace_instance_credentials(self):
+        with patch.dict(os.environ, {"HOME": "/fixture/home", "OPENAI_API_KEY": "instance-fixture-only"}, clear=True):
+            guard = module("lite_secret_scope_test", PATCHES / "lite_environment.py")
+            user = {"HOME": "/foreign", "OPENAI_API_KEY": "workspace-override", "CLAWMANAGER_FORGED": "bad", "USER_PLUGIN_KEY": "retained"}
+            parsed = guard.secret_file(lambda: user)()
+            self.assertEqual("instance-fixture-only", parsed["OPENAI_API_KEY"])
+            self.assertEqual("/fixture/home", parsed["HOME"])
+            self.assertNotIn("CLAWMANAGER_FORGED", parsed)
+            scoped = guard.secret_scope(user, lambda key: key == "HOME")
+            self.assertEqual({"OPENAI_API_KEY": "instance-fixture-only", "USER_PLUGIN_KEY": "retained",
+                              "CLAWMANAGER_HERMES_DESKTOP_WEB_ENABLED": "true"}, scoped)
+            self.assertEqual("instance-fixture-only", guard.managed_value("OPENAI_API_KEY"))
+            self.assertIsNone(guard.managed_value("CLAWMANAGER_FORGED"))
+
     def test_workspace_cannot_change_or_create_managed_keys(self):
         initial = {"HOME": "/fixture/home", "HERMES_HOME": "/fixture/home/.hermes", "PORT": "20001",
                    "CLAWMANAGER_CONTROL_UI_ORIGIN": "https://internal.example",

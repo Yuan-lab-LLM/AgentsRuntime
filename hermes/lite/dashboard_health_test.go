@@ -71,7 +71,7 @@ func (f *dashboardFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if f.healthBody != "" {
 			io.WriteString(w, f.healthBody)
 		} else {
-			io.WriteString(w, `{"ok":true,"version":"0.21.0","auth_required":true}`)
+			io.WriteString(w, `{"ok":true,"version":"0.22.5","auth_required":true}`)
 		}
 	case "/auth/password-login":
 		f.logins++
@@ -336,7 +336,7 @@ func TestDashboardHealthRejectsFalseHTTPReadiness(t *testing.T) {
 		{"login HTML", 200, `<html>Login private-password</html>`, "text/html", "unsupported_hermes_protocol"},
 		{"unauthorized", 401, `private-password`, "application/json", "dashboard_auth_failed"},
 		{"wrong version", 200, `{"ok":true,"version":"0.16.0","auth_required":true}`, "application/json", "unsupported_hermes_protocol"},
-		{"authentication disabled", 200, `{"ok":true,"version":"0.21.0","auth_required":false}`, "application/json", "dashboard_auth_failed"},
+		{"authentication disabled", 200, `{"ok":true,"version":"0.22.5","auth_required":false}`, "application/json", "dashboard_auth_failed"},
 		{"malformed JSON", 200, `private-password`, "application/json", "unsupported_hermes_protocol"},
 		{"oversized response", 200, strings.Repeat("x", dashboardMaxResponseBytes+1), "application/json", "unsupported_hermes_protocol"},
 	}
