@@ -1,0 +1,22 @@
+#!/usr/bin/with-contenv bash
+set -euo pipefail
+
+# A shared Lite Runtime Pod must only run its managed gateway processes.  This
+# service is packaged for the Pro Webtop image and stays dormant if that image
+# is ever used with the Runtime Pod control-plane contract.
+if [[ -n "${RUNTIME_AGENT_CONTROL_TOKEN:-}" || -n "${RUNTIME_AGENT_REPORT_TOKEN:-}" ]]; then
+    echo "Hermes Desktop disabled in shared Runtime Pod mode"
+    exec sleep infinity
+fi
+
+case "${HERMES_AUTOSTART:-true}" in
+    0|false|FALSE|no|NO|off|OFF)
+        exec sleep infinity
+        ;;
+esac
+
+if command -v s6-setuidgid >/dev/null 2>&1 && id abc >/dev/null 2>&1; then
+    exec s6-setuidgid abc /usr/local/bin/start-hermes-desktop
+fi
+
+exec /usr/local/bin/start-hermes-desktop

@@ -104,9 +104,10 @@ func TestSyncBundledRedisTeamPluginUpdatesExistingCopy(t *testing.T) {
 	defaultPlugin := filepath.Join(defaultsDir, "extensions", "redis-team")
 	userPlugin := filepath.Join(extensionsDir, "redis-team")
 	t.Setenv("CLAWMANAGER_TEAM_ENABLED", "true")
+	t.Setenv("CLAWMANAGER_TEAM_SHARED_DIR", filepath.Join(root, "team"))
 
 	writeRedisTeamPluginForTest(t, defaultPlugin, "0.1.1", "new runtime")
-	writeRedisTeamPluginForTest(t, userPlugin, "0.1.0", "old runtime")
+	writeRedisTeamPluginForTest(t, userPlugin, "0.1.1", "old runtime")
 
 	cfg := appconfig.Config{
 		OpenClawDefaultsDir:   defaultsDir,
@@ -144,6 +145,51 @@ func TestSyncBundledRedisTeamPluginDisabledNoop(t *testing.T) {
 	}
 	if _, err := os.Stat(userPlugin); !os.IsNotExist(err) {
 		t.Fatalf("expected redis-team plugin not to be synced for non-team instance, got err=%v", err)
+	}
+}
+
+func TestSyncBundledRedisTeamPluginPreservesUnrecognizedExistingExtension(t *testing.T) {
+	root := t.TempDir()
+	defaultsDir := filepath.Join(root, "defaults")
+	extensionsDir := filepath.Join(root, "extensions")
+	defaultPlugin := filepath.Join(defaultsDir, "extensions", "redis-team")
+	userPlugin := filepath.Join(extensionsDir, "redis-team")
+	t.Setenv("CLAWMANAGER_TEAM_ENABLED", "true")
+	writeRedisTeamPluginForTest(t, defaultPlugin, "0.2.1", "new runtime")
+	writeRedisTeamPluginForTest(t, userPlugin, "1.0.0", "user runtime")
+	if err := os.WriteFile(filepath.Join(userPlugin, "package.json"), []byte(`{"name":"user-owned-plugin","version":"1.0.0"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := syncBundledRedisTeamPlugin(appconfig.Config{OpenClawDefaultsDir: defaultsDir, OpenClawExtensionsDir: extensionsDir})
+	if err == nil {
+		t.Fatal("expected unrecognized extension to be preserved with a degraded sync result")
+	}
+	got, readErr := os.ReadFile(filepath.Join(userPlugin, "dist", "index.js"))
+	if readErr != nil || string(got) != "user runtime" {
+		t.Fatalf("unrecognized extension was changed: content=%q err=%v", got, readErr)
+	}
+}
+
+func TestBootstrapContinuesWhenManagedRedisTeamUpgradeIsDegraded(t *testing.T) {
+	root := t.TempDir()
+	defaultsDir := filepath.Join(root, "defaults")
+	extensionsDir := filepath.Join(root, "extensions")
+	defaultPlugin := filepath.Join(defaultsDir, "extensions", "redis-team")
+	userPlugin := filepath.Join(extensionsDir, "redis-team")
+	t.Setenv("CLAWMANAGER_TEAM_ENABLED", "true")
+	t.Setenv("CLAWMANAGER_TEAM_SHARED_DIR", filepath.Join(root, "team"))
+	writeRedisTeamPluginForTest(t, defaultPlugin, "0.2.1", "new runtime")
+	writeRedisTeamPluginForTest(t, userPlugin, "1.0.0", "user runtime")
+	if err := os.WriteFile(filepath.Join(userPlugin, "package.json"), []byte(`{"name":"user-owned-plugin","version":"1.0.0"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := appconfig.Config{
+		OpenClawDefaultsDir:   defaultsDir,
+		OpenClawExtensionsDir: extensionsDir,
+		OpenClawConfigPath:    filepath.Join(root, "state", "openclaw.json"),
+	}
+	if err := Run(cfg); err != nil {
+		t.Fatalf("a degraded Team plugin upgrade must not make the instance unavailable: %v", err)
 	}
 }
 
@@ -360,10 +406,10 @@ func writeRedisTeamPluginForTest(t *testing.T, root, version, runtime string) {
 	if err := os.MkdirAll(filepath.Join(root, "dist"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "package.json"), []byte(`{"version":"`+version+`"}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "package.json"), []byte(`{"name":"@clawmanager/openclaw-redis-team","version":"`+version+`"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "openclaw.plugin.json"), []byte(`{"id":"redis-team"}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "openclaw.plugin.json"), []byte(`{"id":"redis-team","channels":["redis-team"]}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "dist", "index.js"), []byte(runtime), 0o644); err != nil {

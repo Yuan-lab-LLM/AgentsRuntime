@@ -1,0 +1,58 @@
+# Diagnostic core replacement only; inherits the base image's channel packages.
+# Release builds must use Dockerfile.openclaw, which pins and verifies all channels.
+ARG BASE_IMAGE=10.130.14.23:5000/agentsruntime/openclaw-lite:team-completion-recovery-20261012-v1
+FROM --platform=$BUILDPLATFORM golang:1.26.1-alpine AS agent-builder
+ARG TARGETOS=linux
+ARG TARGETARCH
+ARG AGENT_VERSION=team-openclaw-10.2
+WORKDIR /src/legacy-agent
+COPY clawmanager-agent /src/clawmanager-agent
+COPY legacy-agent /src/legacy-agent
+COPY openclaw/go.mod openclaw/go.sum /src/openclaw/
+COPY openclaw/lite /src/openclaw/lite
+COPY hermes/go.mod hermes/go.sum /src/hermes/
+COPY hermes/lite /src/hermes/lite
+COPY opencode/go.mod /src/opencode/
+COPY opencode/lite /src/opencode/lite
+COPY deepseek-harness/go.mod /src/deepseek-harness/
+COPY deepseek-harness/lite /src/deepseek-harness/lite
+COPY deepseek-harness/dshproxy /src/deepseek-harness/dshproxy
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH:-amd64} go build -trimpath -ldflags="-s -w -X main.version=${AGENT_VERSION}" -o /out/clawmanager-agent ./cmd
+WORKDIR /src/openclaw
+COPY openclaw/go.mod openclaw/go.sum ./
+RUN go mod download
+COPY openclaw/cmd ./cmd
+COPY openclaw/internal ./internal
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH:-amd64} go build -trimpath -o /out/openclaw-agent ./cmd/openclaw-agent
+FROM node:24.21.0-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20 AS node-runtime
+RUN test "$(node --version)" = "v24.21.0"
+COPY openclaw/openclaw102.lock.json /pinned/openclaw102.lock.json
+COPY openclaw/scripts/install-pinned-openclaw.mjs /pinned/scripts/install-pinned-openclaw.mjs
+RUN node /pinned/scripts/install-pinned-openclaw.mjs
+
+FROM ${BASE_IMAGE} AS upstream
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/openclaw
+COPY --from=node-runtime /usr/local /usr/local
+RUN test "$(node -p 'require("/usr/local/lib/node_modules/openclaw/package.json").version')" = "2026.10.2"
+ENV CLAWMANAGER_OPENCLAW_VERSION=2026.10.2
+LABEL io.clawmanager.runtime.type="openclaw" \
+      io.clawmanager.openclaw.version="2026.10.2" \
+      io.clawmanager.upgrade.strategy="openclaw-sqlite-v1" \
+      io.clawmanager.upgrade.protocol="openclaw-upgrade-v3"
+
+# The upstream target is used for isolated contract comparison before overlays.
+FROM upstream AS runtime
+COPY --from=agent-builder /out/clawmanager-agent /out/openclaw-agent /usr/local/bin/
+ENV CLAWMANAGER_REDIS_TEAM_PLUGIN_VERSION=0.3.1
+COPY plugins/openclaw-redis-team/ /usr/local/lib/node_modules/openclaw/dist/extensions/redis-team/
+RUN mkdir -p /usr/local/lib/node_modules/openclaw/dist/extensions/redis-team/node_modules \
+    && ln -s /usr/local/lib/node_modules/openclaw /usr/local/lib/node_modules/openclaw/dist/extensions/redis-team/node_modules/openclaw
+COPY openclaw/patches/ /usr/local/share/openclaw/patches/
+COPY --chown=abc:abc plugins/openclaw-redis-team/ /defaults/.openclaw/extensions/redis-team/
+RUN chmod -R a+rX /defaults/.openclaw/extensions/redis-team \
+    && node /usr/local/share/openclaw/patches/patch_managed_proxy_policy.mjs --patch --install-marker \
+    && node /usr/local/share/openclaw/patches/patch_managed_proxy_policy.mjs --verify \
+    && node /usr/local/share/openclaw/patches/patch_memory_core_startup_migration.mjs --patch \
+    && node /usr/local/share/openclaw/patches/patch_memory_core_startup_migration.mjs --verify \
+    && node /usr/local/share/openclaw/patches/patch_browser_proxy_navigation.mjs --patch \
+    && node /usr/local/share/openclaw/patches/patch_browser_proxy_navigation.mjs --verify

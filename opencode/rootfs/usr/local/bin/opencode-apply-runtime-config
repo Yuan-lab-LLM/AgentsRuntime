@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Write a locked OpenCode provider config for Pro/desktop boots.
+# Lite CreateGateway uses clawmanager-agent WriteGatewayConfig instead.
+
+opencode_home="${OPENCODE_CONFIG_DIR:-${HOME:-/config}/.opencode}"
+mkdir -p "${opencode_home}"
+config_path="${OPENCODE_CONFIG:-${opencode_home}/opencode.json}"
+
+api_key="${CLAWMANAGER_LLM_API_KEY:-${OPENAI_API_KEY:-${CLAWMANAGER_INSTANCE_TOKEN:-}}}"
+export OPENCODE_SERVER_USERNAME="${OPENCODE_SERVER_USERNAME:-opencode}"
+if [ -z "${OPENCODE_SERVER_PASSWORD:-}" ]; then
+  export OPENCODE_SERVER_PASSWORD="${CLAWMANAGER_INSTANCE_TOKEN:-${CLAWMANAGER_LLM_API_KEY:-${api_key}}}"
+fi
+
+config_tmp="$(mktemp "${config_path}.XXXXXX")"
+trap 'rm -f "${config_tmp}"' EXIT
+
+if [ -n "${OPENCODE_CONFIG_CONTENT:-}" ]; then
+  printf '%s\n' "${OPENCODE_CONFIG_CONTENT}" >"${config_tmp}"
+elif ! /usr/local/bin/clawmanager-agent llm-config --format opencode >"${config_tmp}"; then
+  echo "opencode-apply-runtime-config: LLM configuration not ready; skipping"
+  exit 0
+fi
+
+mv -f "${config_tmp}" "${config_path}"
+trap - EXIT
+
+chmod 640 "${config_path}" || true
+export OPENCODE_CONFIG="${config_path}"
+export OPENCODE_CONFIG_DIR="${opencode_home}"
+echo "opencode-apply-runtime-config: wrote ${config_path}"

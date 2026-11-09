@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -42,6 +43,8 @@ func (c *apiClient) register(ctx context.Context) (registerResponse, error) {
 			"metrics.report",
 			"skills.inventory",
 			"skills.upload",
+			"skills.install",
+			"skills.remove",
 			"commands.poll",
 		},
 		"host_info": map[string]any{
@@ -134,6 +137,38 @@ func (c *apiClient) uploadSkill(ctx context.Context, token string, skill SkillIn
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	return c.do(req, nil)
+}
+
+func (c *apiClient) downloadSkill(ctx context.Context, token, skillVersion string) ([]byte, error) {
+	if skillVersion == "" || strings.ContainsAny(skillVersion, "/\\?#") {
+		return nil, errors.New("invalid skill version")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.cfg.AgentAPIURL("skills/versions/"+skillVersion+"/download"), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, ErrUnauthorized
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("GET %s failed: status=%d body=%s", req.URL.Path, resp.StatusCode, body)
+	}
+	const maxSkillArchiveBytes = 256 << 20
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxSkillArchiveBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxSkillArchiveBytes {
+		return nil, errors.New("skill archive exceeds 256 MiB limit")
+	}
+	return body, nil
 }
 
 func (c *apiClient) postJSON(ctx context.Context, path, token string, body any, out any) error {

@@ -78,18 +78,19 @@ cat >/config/.config/autostart/hermes-runtime.desktop <<'DESKTOP'
 Type=Application
 Name=Hermes Runtime
 Comment=Open Hermes automatically
-Exec=/usr/local/bin/start-hermes-terminal
+Exec=/usr/local/bin/start-hermes-desktop
 Terminal=false
 X-KDE-Autostart-enabled=true
 DESKTOP
 chmod 755 /config/.config/autostart/hermes-runtime.desktop
 
 touch /config/.config/openbox/autostart
-if ! grep -q 'start-hermes-terminal' /config/.config/openbox/autostart 2>/dev/null; then
+sed -i '\|start-hermes-terminal|d; \|start-hermes-desktop|d' /config/.config/openbox/autostart
+if ! grep -q 'start-hermes-desktop' /config/.config/openbox/autostart 2>/dev/null; then
     {
         echo ''
         echo '# Hermes Runtime autostart'
-        echo '(/usr/local/bin/start-hermes-terminal) &'
+        echo '(/usr/local/bin/start-hermes-desktop) &'
     } >> /config/.config/openbox/autostart
 fi
 chmod 755 /config/.config/openbox/autostart

@@ -1,0 +1,12 @@
+{
+  "version": "2026.10.2",
+  "integrity": "sha512-FuLLF+WI12ypwQ0r+pcKDcmB+kXus5N4QClaKEnaAn6GN4I1AitkOhwv0GFl2rVKpvuUBDQWIfglHNy6Trv/EQ==",
+  "sourceCommit": "b8952d477f0c932d8ddc6da5c89cab5a169b6ff1",
+  "nodeVersion": "v24.21.0",
+  "nodeImage": "node:24.21.0-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20",
+  "channelPlugins": {
+    "@openclaw/feishu": "2026.10.2",
+    "@wecom/wecom-openclaw-plugin": "2026.9.15",
+    "@dingtalk-real-ai/dingtalk-connector": "0.8.26"
+  }
+}

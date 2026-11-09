@@ -2,13 +2,110 @@ import { createHash, createHmac, randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs/promises";
 import net from "node:net";
+import http from "node:http";
 import path from "node:path";
 import tls from "node:tls";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
-import { dispatchInboundDirectDmWithRuntime } from "openclaw/plugin-sdk/direct-dm";
 
 const PLUGIN_ID = "redis-team";
 const CHANNEL_ID = "redis-team";
+
+// OpenClaw 8.1 Group Channel adapter. Team traffic enters the generic inbound
+// turn kernel with a real group route and never passes through the Direct-DM
+// compatibility helper.
+async function dispatchInboundRedisTeamGroupWithRuntime(params) {
+  const runtime = params.runtime?.channel;
+  if (!runtime?.routing?.resolveAgentRoute || !runtime?.inbound?.buildContext || !runtime?.inbound?.run) {
+    throw new Error("OpenClaw 8.1 Group Channel runtime is unavailable");
+  }
+  const groupId = trim(params.peer?.id);
+  if (!groupId) throw new Error("Redis Team Group id is required");
+  const route = runtime.routing.resolveAgentRoute({
+    cfg: params.cfg,
+    channel: params.channel,
+    accountId: params.accountId,
+    peer: { kind: "group", id: groupId },
+    teamId: groupId,
+    groupScope: "channel",
+  });
+  const ctxPayload = await runtime.inbound.buildContext({
+    channel: params.channel,
+    accountId: route.accountId || params.accountId,
+    provider: params.provider || params.channel,
+    surface: params.surface || params.channel,
+    messageId: params.messageId,
+    messageIdFull: params.messageId,
+    timestamp: params.timestamp,
+    from: params.senderAddress,
+    sender: { id: params.senderId, name: params.conversationLabel },
+    conversation: {
+      kind: "group",
+      id: groupId,
+      routePeer: { kind: "group", id: groupId },
+      label: params.conversationLabel,
+    },
+    route: {
+      agentId: route.agentId,
+      accountId: route.accountId,
+      routeSessionKey: route.sessionKey,
+      dispatchSessionKey: route.sessionKey,
+    },
+    reply: {
+      to: params.recipientAddress,
+      originatingTo: params.originatingTo || params.senderAddress,
+    },
+    message: {
+      body: params.rawBody,
+      bodyForAgent: params.bodyForAgent || params.rawBody,
+      rawBody: params.rawBody,
+      commandBody: params.commandBody || params.rawBody,
+    },
+    access: { commands: { authorized: false } },
+    channelIngress: "unsupported",
+    extra: {
+      // Callers may add task-scoped facts, but they must never be able to
+      // replace the host-authenticated Team identity used by the 8.1 tool
+      // factory. Keep the authoritative channel fields last.
+      ...params.extraContext,
+      NativeChannelId: groupId,
+      OriginatingChannel: params.originatingChannel || params.channel,
+    },
+  });
+  const plan = {
+    cfg: params.cfg,
+    channel: params.channel,
+    accountId: route.accountId || params.accountId,
+    route: { agentId: route.agentId, sessionKey: route.sessionKey },
+    ctxPayload,
+    record: { onRecordError: params.onRecordError },
+    dispatchReplyFromConfig: runtime.reply?.dispatchReplyFromConfig,
+    delivery: {
+      deliverWithProviderMessageSending: async (payload) => {
+        await params.deliver(payload);
+        return { visibleReplySent: true, delivered: true };
+      },
+      onError: (err, info) => params.onDispatchError?.(err, info || { kind: "final" }),
+    },
+    replyPipeline: {},
+  };
+  const result = await runtime.inbound.run({
+    channel: params.channel,
+    accountId: route.accountId || params.accountId,
+    raw: ctxPayload,
+    adapter: {
+      ingest: () => ({
+        id: params.messageId,
+        timestamp: params.timestamp,
+        rawText: params.rawBody,
+        textForAgent: params.bodyForAgent || params.rawBody,
+        textForCommands: params.commandBody || params.rawBody,
+        raw: ctxPayload,
+      }),
+      resolveTurn: () => plan,
+    },
+  });
+  return { route, ctxPayload, result };
+}
 const DEFAULT_SHARED_DIR = "/team";
 const DEFAULT_GROUP = "team-members";
 const DEFAULT_EMBEDDED_TIMEOUT_SECONDS = 1800;
@@ -21,12 +118,16 @@ const RUNTIME_CAPABILITIES = Object.freeze([
   "completion_ack_v1",
   "explicit_completion_receipt_v1",
   "turn_end_monitor_v1",
+  "turn_outcome_v1",
+  "immediate_recheck_v1",
   "assignment_heartbeat_v1",
   "durable_turn_facts_v1",
   "team_artifact_preview_v1",
   "team_artifact_preview_v2",
   "review_contract_v1",
   "validation_contract_v2",
+  "group_hooks_v1",
+  "maintenance_drain_v1",
 ]);
 const COMPLETION_SOURCE = "team_complete_task";
 const TEAM_SHARED_DIR_MODE = 0o2775;
@@ -277,16 +378,37 @@ async function resolveRedisTeamTarget(cfg, value) {
   const target = normalizeRedisTeamTarget(value, cfg);
   if (target.control) return Object.assign(target, { route: "control" });
   if (target.completion) return Object.assign(target, { route: "completion" });
+  const roster = await readTeamRoster(cfg);
+  if (roster.members.length) {
+    const resolution = resolveRosterIdentity(roster, target.originalTo);
+    if (resolution.member) {
+      return Object.assign(target, {
+        to: resolution.member.memberId,
+        route: "member",
+        normalized: resolution.member.memberId !== target.originalTo,
+        targetResolution: resolution.kind,
+        matchedAliases: resolution.matchedAliases,
+      });
+    }
+    const candidateIds = resolution.candidates.map((member) => member.memberId);
+    const suggestionIds = resolution.suggestions.map((member) => member.memberId);
+    return Object.assign(target, {
+      route: "unknown",
+      clarificationRequired: true,
+      targetCandidates: candidateIds,
+      targetSuggestions: suggestionIds,
+      error: candidateIds.length
+        ? "ambiguous Redis Team target; confirm one of: " + candidateIds.join(", ")
+        : suggestionIds.length
+          ? "unknown Redis Team target; did you mean: " + suggestionIds.join(", ")
+          : "unknown Redis Team target: " + target.originalTo,
+    });
+  }
   if (!isSafeMemberTarget(target.to)) {
-    return Object.assign(target, { route: "unknown", error: "unknown Redis Team target: " + target.originalTo });
+    return Object.assign(target, { route: "unknown", clarificationRequired: true, error: "unknown Redis Team target: " + target.originalTo });
   }
   if (target.to === cfg.memberId || safeName(target.to) === safeName(cfg.memberId)) {
     return Object.assign(target, { route: "member" });
-  }
-  const roster = await readTeamRoster(cfg);
-  if (roster.members.length) {
-    if (isKnownRosterTarget(roster, target.to)) return Object.assign(target, { route: "member" });
-    return Object.assign(target, { route: "unknown", error: "unknown Redis Team target: " + target.originalTo });
   }
   const statuses = await readRawStatuses(cfg);
   if (!statuses.length) return Object.assign(target, { route: "member" });
@@ -523,6 +645,14 @@ function privateActiveAssignmentPath(cfg) {
   return path.join(runtimeStateDir(cfg), "active-assignment.json");
 }
 
+function assignmentAttemptAlias(envelope) {
+  const rootTaskId = preferredRootTaskId(envelope?.rootTaskId, envelope?.taskId);
+  const assignmentId = trim(envelope?.assignmentId || envelope?.workId);
+  const revision = Math.max(1, intFrom(envelope?.revision ?? envelope?.metadata?.revision, 1));
+  if (!rootTaskId || !assignmentId) return "";
+  return `attempt-${safeName(rootTaskId)}-${safeName(assignmentId)}-r${revision}`;
+}
+
 async function mkdirBestEffort(dir, mode, label) {
   let existed = false;
   try {
@@ -566,10 +696,8 @@ async function ensureDirs(cfg) {
 async function writeJson(file, value, fileMode = 0o664, dirMode = TEAM_SHARED_DIR_MODE) {
   await mkdirBestEffort(path.dirname(file), dirMode, "JSON parent");
   const tmp = file + "." + process.pid + "." + Date.now() + "." + randomUUID() + ".tmp";
-  await fs.writeFile(tmp, JSON.stringify(value, null, 2) + "\n", "utf8");
-  await fs.chmod(tmp, fileMode);
+  await fs.writeFile(tmp, JSON.stringify(value, null, 2) + "\n", { encoding: "utf8", mode: fileMode });
   await fs.rename(tmp, file);
-  await fs.chmod(file, fileMode);
 }
 function analyzeResponseLocale(locale, text) {
   const normalizedLocale = trim(locale).toLowerCase();
@@ -607,10 +735,8 @@ async function writeJsonBestEffort(file, value, label, fileMode = 0o664, dirMode
 async function writeText(file, value) {
   await mkdirBestEffort(path.dirname(file), TEAM_SHARED_DIR_MODE, "shared text parent");
   const tmp = file + "." + process.pid + "." + Date.now() + "." + randomUUID() + ".tmp";
-  await fs.writeFile(tmp, value, "utf8");
-  await fs.chmod(tmp, 0o664);
+  await fs.writeFile(tmp, value, { encoding: "utf8", mode: 0o664 });
   await fs.rename(tmp, file);
-  await fs.chmod(file, 0o664);
 }
 
 function normalizedArtifactRelativePath(value) {
@@ -1054,14 +1180,50 @@ function managedTeamPreviewOrigin() {
   return proxy;
 }
 
-function previewUrlForTeamArtifact(cfg, file) {
-  const token = trim(process.env.CLAWMANAGER_TEAM_TOKEN);
-  const teamId = trim(cfg?.teamId || process.env.CLAWMANAGER_TEAM_ID);
-  if (!token || !teamId) {
-    throw new Error("Team artifact Browser preview is unavailable in this Runtime");
-  }
-  const origin = managedTeamPreviewOrigin();
+function managedPreviewRuntime() {
+  return process.env.CLAWMANAGER_NETWORK_ISOLATED === "1" ||
+    trim(process.env.CLAWMANAGER_MANAGED_SERVICES_URL).replace(/\/$/, "") === "http://clawmanager-local-services.invalid:31282";
+}
 
+function requestManagedPreview(relative, mode) {
+  const body = JSON.stringify({ path: relative, mode });
+  if (Buffer.byteLength(body) > 4096) return Promise.reject(new Error("Managed Team preview request is too large"));
+  return new Promise((resolve, reject) => {
+    const fail = () => reject(new Error("Managed Team preview is unavailable"));
+    // Native HTTP does not use environment proxies or follow redirects. No
+    // caller origin or credential can select or authenticate this fixed entry.
+    const request = http.request(new URL("http://clawmanager-local-services.invalid:31282/team/preview-sign"), {
+      method: "POST", headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
+    }, response => {
+      let size = 0;
+      const chunks = [];
+      response.on("data", chunk => {
+        size += chunk.length;
+        if (size > 8192) { response.destroy(); request.destroy(); fail(); return; }
+        chunks.push(chunk);
+      });
+      response.on("error", fail);
+      response.on("end", () => {
+        if (response.statusCode !== 200) { fail(); return; }
+        try {
+          const grant = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          const target = new URL(grant.url);
+          const expires = Date.parse(grant.expiresAt);
+          if (target.protocol !== "http:" || !isManagedClusterServiceHost(target.hostname, EGRESS_PROXY_SERVICE_NAME) ||
+              target.username || target.password || target.search || target.hash || !target.pathname.startsWith(`/v3/${mode}/`) ||
+              grant.mode !== mode || !Number.isFinite(expires) || expires <= Date.now() || expires > Date.now() + 300000) { fail(); return; }
+          resolve({ url: target.toString(), mode: grant.mode, expiresAt: grant.expiresAt });
+        } catch { fail(); }
+      });
+    });
+    const timer = setTimeout(() => { request.destroy(); fail(); }, 5000);
+    request.on("error", fail);
+    request.on("close", () => clearTimeout(timer));
+    request.end(body);
+  });
+}
+
+async function previewUrlForTeamArtifact(cfg, file) {
   const root = path.resolve(cfg.sharedDir);
   const relative = path.relative(root, path.resolve(file));
   if (!relative || relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) {
@@ -1069,6 +1231,13 @@ function previewUrlForTeamArtifact(cfg, file) {
   }
   const relativeParts = relative.split(path.sep).filter(Boolean);
   if (!relativeParts.length) throw new Error("Team artifact preview requires a file");
+  if (managedPreviewRuntime()) {
+    return requestManagedPreview(relativeParts.join("/"), path.extname(file).toLowerCase() === ".html" ? "interactive" : "static");
+  }
+  const token = trim(process.env.CLAWMANAGER_TEAM_TOKEN);
+  const teamId = trim(cfg?.teamId || process.env.CLAWMANAGER_TEAM_ID);
+  if (!token || !teamId) throw new Error("Team artifact Browser preview is unavailable in this Runtime");
+  const origin = managedTeamPreviewOrigin();
 
   const signedPrefix = relativeParts.slice(0, -1).join("/");
   const encodedPrefix = signedPrefix
@@ -1135,9 +1304,9 @@ async function canonicalizeReviewerCompletionReport(cfg, envelope, rootTaskId, a
 	return mirrored;
 }
 
-function optionalPreviewFields(cfg, file) {
+async function optionalPreviewFields(cfg, file) {
   try {
-    const preview = previewUrlForTeamArtifact(cfg, file);
+    const preview = await previewUrlForTeamArtifact(cfg, file);
     return {
       previewUrl: preview.url,
     };
@@ -1586,16 +1755,128 @@ async function appendLeaderTeamContext(text, cfg, envelope) {
 }
 
 function isKnownRosterTarget(roster, target) {
-  const raw = trim(target);
-  const safe = safeName(raw);
-  return roster.members.some((member) => member.aliases.includes(raw) || member.aliases.includes(safe));
+  return !!resolveRosterIdentity(roster, target).member;
 }
 
 function rosterMemberForTarget(roster, target) {
-  const raw = trim(target);
-  const safe = safeName(raw);
-  if (!raw) return null;
-  return roster.members.find((member) => member.aliases.includes(raw) || member.aliases.includes(safe)) || null;
+  return resolveRosterIdentity(roster, target).member;
+}
+
+function comparableRosterIdentity(value) {
+  return trim(value).normalize("NFKC").toLowerCase();
+}
+
+function rosterIdentityFragments(value) {
+  const comparable = comparableRosterIdentity(value);
+  if (!comparable) return [];
+  const fragments = new Set([comparable]);
+  for (const part of comparable.split(/[^\p{L}\p{N}]+/u)) {
+    if (part) fragments.add(part);
+  }
+  return [...fragments];
+}
+
+function rosterAliasForms(member) {
+  const forms = new Set();
+  for (const alias of member?.aliases || []) {
+    const comparable = comparableRosterIdentity(alias);
+    if (!comparable) continue;
+    forms.add(comparable);
+    const safe = comparableRosterIdentity(safeName(alias));
+    if (safe) forms.add(safe);
+  }
+  return forms;
+}
+
+function boundedRosterAliasMatch(input, alias) {
+  if (!input || !alias || input === alias) return input === alias;
+  let from = 0;
+  while (from <= input.length - alias.length) {
+    const index = input.indexOf(alias, from);
+    if (index < 0) return false;
+    const before = index > 0 ? input[index - 1] : "";
+    const afterIndex = index + alias.length;
+    const after = afterIndex < input.length ? input[afterIndex] : "";
+    const beforeBoundary = !before || !/[\p{L}\p{N}]/u.test(before);
+    const afterBoundary = !after || !/[\p{L}\p{N}]/u.test(after);
+    if (beforeBoundary && afterBoundary) return true;
+    from = index + 1;
+  }
+  return false;
+}
+
+function rosterEditDistance(left, right) {
+  const a = comparableRosterIdentity(left);
+  const b = comparableRosterIdentity(right);
+  if (!a) return b.length;
+  if (!b) return a.length;
+  const previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= a.length; i += 1) {
+    const current = [i];
+    for (let j = 1; j <= b.length; j += 1) {
+      current[j] = Math.min(
+        current[j - 1] + 1,
+        previous[j] + 1,
+        previous[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+    }
+    for (let j = 0; j < current.length; j += 1) previous[j] = current[j];
+  }
+  return previous[b.length];
+}
+
+// Resolve identity from all information present in the supplied value instead
+// of recognizing a fixed list of wrappers. Auto-routing is allowed only when
+// the current authoritative roster yields one exact/bounded member candidate.
+// Typos are suggestions for the same Worker to confirm, never silent routes.
+function resolveRosterIdentity(roster, value) {
+  const input = comparableRosterIdentity(value);
+  if (!input || !Array.isArray(roster?.members)) {
+    return { member: null, kind: "missing", matchedAliases: [], candidates: [], suggestions: [] };
+  }
+  const fragments = rosterIdentityFragments(input);
+  const matches = [];
+  for (const member of roster.members) {
+    const aliases = rosterAliasForms(member);
+    const matchedAliases = [...aliases].filter((alias) =>
+      fragments.includes(alias) || boundedRosterAliasMatch(input, alias));
+    if (matchedAliases.length) matches.push({ member, matchedAliases });
+  }
+  if (matches.length === 1) {
+    const exact = matches[0].matchedAliases.some((alias) => alias === input);
+    return {
+      member: matches[0].member,
+      kind: exact ? "exact_roster_alias" : "unique_roster_information",
+      matchedAliases: matches[0].matchedAliases,
+      candidates: [matches[0].member],
+      suggestions: [],
+    };
+  }
+  if (matches.length > 1) {
+    return {
+      member: null,
+      kind: "ambiguous_roster_information",
+      matchedAliases: [...new Set(matches.flatMap((match) => match.matchedAliases))],
+      candidates: matches.map((match) => match.member),
+      suggestions: [],
+    };
+  }
+  const suggestionScores = [];
+  for (const member of roster.members) {
+    let best = Number.POSITIVE_INFINITY;
+    for (const alias of rosterAliasForms(member)) {
+      for (const fragment of fragments) {
+        if (fragment.length < 3 || alias.length < 3) continue;
+        best = Math.min(best, rosterEditDistance(fragment, alias));
+      }
+    }
+    if (Number.isFinite(best) && best <= 2) suggestionScores.push({ member, score: best });
+  }
+  const bestScore = Math.min(...suggestionScores.map((entry) => entry.score));
+  const suggestions = Number.isFinite(bestScore)
+    ? suggestionScores.filter((entry) => entry.score === bestScore).map((entry) => entry.member)
+    : [];
+  return { member: null, kind: suggestions.length ? "suggestion_only" : "unresolved", matchedAliases: [], candidates: [], suggestions };
 }
 
 function currentRosterMember(cfg, roster) {
@@ -1777,6 +2058,8 @@ async function writeTaskEnvelope(cfg, envelope) {
     for (const alias of taskIdAliases(value)) aliases.add(alias);
     if (trim(value)) aliases.add(trim(value));
   }
+  const attemptAlias = assignmentAttemptAlias(envelope);
+  if (attemptAlias) aliases.add(attemptAlias);
   for (const alias of aliases) {
     await writeJsonBestEffort(privateTaskEnvelopePath(cfg, alias), envelope, "runtime private task envelope", 0o600, RUNTIME_PRIVATE_DIR_MODE);
     await writeJsonBestEffort(path.join(cfg.sharedDir, "tasks", safeName(alias) + ".json"), envelope, "legacy shared task envelope");
@@ -1826,8 +2109,27 @@ async function mergeTaskEnvelopeArtifactContext(cfg, envelope, refs = []) {
 function isContextOnlyEnvelope(envelope) {
   if (!envelope) return false;
   if (envelope.requiresCompletion === false) return true;
+  const deliveryKind = trim(
+    envelope.businessDeliveryKind ||
+      envelope.business_delivery_kind ||
+      envelope.deliveryKind ||
+      envelope.delivery_kind,
+  ).toLowerCase();
+  if (["context", "peer_request", "notification", "monitor", "ambiguous"].includes(deliveryKind)) return true;
   const intent = trim(envelope.intent || envelope.metadata?.intent || envelope.type).toLowerCase();
-  return intent === "member_result_confirmed" || intent === "context" || intent === "notification";
+  return [
+    "member_result_confirmed",
+    "context",
+    "context_update",
+    "notification",
+    "peer_request",
+    "question",
+    "reminder",
+    "follow_up",
+    "assignment_status_check",
+    "assignment_recovery_request",
+    "leader_synthesis_reminder",
+  ].includes(intent);
 }
 
 function normalizeMonitorPolicy(raw) {
@@ -2182,7 +2484,7 @@ function isManagedInteractivePreviewUrl(value) {
     const host = parsed.hostname.toLowerCase();
     const managedHost = isManagedClusterServiceHost(host, EGRESS_PROXY_SERVICE_NAME);
     const isolatedHost = host.endsWith("." + LEGACY_TEAM_PREVIEW_HOST);
-    return (managedHost || isolatedHost) && parsed.pathname.startsWith("/v2/interactive/");
+    return (managedHost || isolatedHost) && (parsed.pathname.startsWith("/v2/interactive/") || parsed.pathname.startsWith("/v3/interactive/"));
   } catch {
     return false;
   }
@@ -2381,7 +2683,7 @@ function appendRedisTeamCompletionGuidance(text, envelope) {
   const guidance = [
     body,
     "",
-	"Redis Team delivery rule: when the assigned work is ready, call team_complete_task once with status, summary, resultMarkdown, and artifact refs. Use team_send for a real assignment, handoff, question, blocker, or intermediate milestone, not as a substitute for the completion receipt. If the call is missed, end the current turn normally; ClawManager Monitor will send a separate reminder without treating prose as completion.",
+	"Redis Team delivery rule: before ending a completed assignment, call team_complete_task once with status, summary, the full answer in resultMarkdown, and any actual artifact refs. A text-only answer needs no file. Use team_send for a real assignment, handoff, question, blocker, or intermediate milestone, not as a substitute for the completion receipt. Reuse work already done when correcting a missed receipt; do not repeat research or create unnecessary files. If work is unfinished or waiting, report its actual state with Team tools instead of claiming success. Ordinary prose alone is not a completion receipt.",
     "Progress visibility rule: when you create an execution plan or reach a meaningful milestone, call team_update_progress with status=\"running\", a concise summary, and eventKind set to leader_plan, worker_plan, worker_progress, or leader_synthesis as appropriate. Use assignment_check_result only when replying to a ClawManager Monitor envelope carrying a monitor checkId. Do not expose hidden reasoning or tool logs; only publish user-visible plans, phase summaries, blockers, verification notes, and recovery status.",
     `Output language rule: use ${locale} for every user-visible plan, assignment, progress summary, resultMarkdown, and final synthesis. Preserve source code, API names, file names, and necessary technical terms in their original form.`,
     "Shared artifact rule: prefer team_artifact_write/read/list/mkdir. These tools enforce current-Team isolation and cooperative permissions. The /team prefix is only the canonical link returned to ClawManager in pooled Lite runtimes. To inspect a Team HTML or other Team file in Browser, call team_artifact_preview and navigate to its returned signed HTTP URL; never use file:// or start a temporary file server.",
@@ -2414,6 +2716,93 @@ function appendRedisTeamCompletionGuidance(text, envelope) {
   return guidance.join("\n");
 }
 
+function contextTurnOutcomePolicy(envelope) {
+  const configured = envelope?.turnOutcomePolicy || envelope?.turn_outcome_policy || envelope?.metadata?.turnOutcomePolicy;
+  if (configured && typeof configured === "object") {
+    return {
+      actionExpected: boolFrom(configured.actionExpected ?? configured.action_expected, false),
+      immediateRecoveryAllowed: boolFrom(configured.immediateRecoveryAllowed ?? configured.immediate_recovery_allowed, false),
+      reason: trim(configured.reason) || "control_plane_policy",
+    };
+  }
+  const intent = trim(envelope?.intent || envelope?.metadata?.intent || envelope?.metadata?.monitorType).toLowerCase();
+  if (["member_result_confirmed", "leader_synthesis_reminder", "leader_workflow_decision", "leader_decision_reminder"].includes(intent)) {
+    return { actionExpected: true, immediateRecoveryAllowed: true, reason: "legacy_workflow_notification" };
+  }
+  if (["root_coordination_recovery", "root_assignment_recovery", "assignment_recovery_reminder", "target_resolution_review"].includes(intent)) {
+    return { actionExpected: true, immediateRecoveryAllowed: false, reason: "recovery_turn" };
+  }
+  return { actionExpected: false, immediateRecoveryAllowed: false, reason: "ordinary_context" };
+}
+
+function observeTeamTurnOutcome({
+  envelope,
+  activeResult = {},
+  durableFacts = {},
+  toolEvidence = {},
+  terminalAfterDispatch = false,
+  dispatchFailed = false,
+  incompleteTurnDetected = false,
+  contextOnly = false,
+  memberRouting = {},
+} = {}) {
+  const policy = contextOnly
+    ? contextTurnOutcomePolicy(envelope)
+    : { actionExpected: true, immediateRecoveryAllowed: true, reason: "formal_assignment" };
+  const localCompletion = activeResult?.completed === true || activeResult?.completionPending === true;
+  const durableCompletion = durableFacts?.completionProposed === true;
+  const completionObserved = terminalAfterDispatch === true || localCompletion || durableCompletion;
+  const outbound = activeResult?.outbound || null;
+  const hadOutbound = !!outbound;
+  const outboundMessage = outbound?.message || {};
+  // Team messages are transport facts, not automatically downstream work.
+  // Prefer the Runtime's ledger-derived business mutation bit. The routing
+  // fallback keeps old ClawManager/Runtime pairs working without treating a
+  // Worker returning evidence to its Leader as a new assignment.
+  const downstreamAssignmentStarted =
+    outboundMessage.businessMutation === true ||
+    trim(outboundMessage.businessDeliveryKind).toLowerCase() === "assignment" ||
+    (outboundMessage.businessMutation === undefined && memberRouting?.leaderCoordination === true);
+  const retryableGap = toolEvidence?.retryableTeamToolGap || null;
+  const conflicts = [];
+  if (retryableGap && completionObserved) conflicts.push("completion_and_retryable_tool_gap");
+  if (durableFacts?.available === false && activeResult?.completed !== true && activeResult?.completionPending !== true) {
+    conflicts.push("durable_turn_facts_unavailable");
+  }
+  if (dispatchFailed || incompleteTurnDetected) conflicts.push("dispatch_did_not_finish_cleanly");
+
+  let outcome = "ordinary_open_turn";
+  if (conflicts.length) outcome = "runtime_observation_unknown";
+  else if (terminalAfterDispatch || activeResult?.completed === true) outcome = "completed";
+  else if (localCompletion || durableCompletion) outcome = "completed";
+  else if (downstreamAssignmentStarted) outcome = "legitimate_wait";
+  else if (retryableGap) outcome = "retryable_tool_gap";
+  else if (policy.actionExpected) outcome = "completion_receipt_gap";
+
+  return {
+    outcome,
+    contextOnly: !!contextOnly,
+    actionExpected: policy.actionExpected,
+    immediateRecoveryEligible:
+      policy.immediateRecoveryAllowed &&
+      ["retryable_tool_gap", "completion_receipt_gap"].includes(outcome),
+    policyReason: policy.reason,
+    evidenceConflict: conflicts.length > 0,
+    evidenceConflicts: conflicts,
+    evidenceSources: {
+      dispatch: true,
+      sessionToolResult: toolEvidence?.source === "dispatch_session",
+      durableTurnFacts: durableFacts?.available !== false,
+      terminalReceipt: terminalAfterDispatch === true,
+    },
+    hadOutboundAssignment: hadOutbound,
+    downstreamAssignmentStarted,
+    outboundDeliveryKind: trim(outboundMessage.businessDeliveryKind) || undefined,
+    outboundTarget: trim(outboundMessage.to || outbound?.target?.to || outbound?.target?.originalTo) || undefined,
+    retryableToolGap: retryableGap,
+  };
+}
+
 function turnFinishedWithoutCompletionEvent(envelope, {
   deliveredViaCallback = false,
   assistantNarratives = [],
@@ -2422,19 +2811,29 @@ function turnFinishedWithoutCompletionEvent(envelope, {
   artifactRefs = [],
   browserVerification = {},
   lastToolOutcome = null,
+  observation = null,
 } = {}) {
-  const summary = "Agent \u56de\u5408\u5df2\u7ed3\u675f\uff0c\u6b63\u5728\u7b49\u5f85\u663e\u5f0f\u5b8c\u6210\u56de\u6267\u3002";
+  const observationOutcome = trim(observation?.outcome);
+  const completionRequired = !observation || ["retryable_tool_gap", "completion_receipt_gap"].includes(observationOutcome);
+  const summary = observationOutcome === "legitimate_wait"
+    ? "Agent turn finished after a valid Team handoff; the workflow is waiting for downstream results."
+    : observationOutcome === "ordinary_open_turn"
+      ? "Non-terminal Team context turn finished."
+      : observationOutcome === "runtime_observation_unknown"
+        ? "Team turn finished with conflicting or unavailable observation evidence; no workflow action was taken."
+        : "Agent \u56de\u5408\u5df2\u7ed3\u675f\uff0c\u6b63\u5728\u7b49\u5f85\u663e\u5f0f\u5b8c\u6210\u56de\u6267\u3002";
   const resultMarkdown = usableFallbackAssistantText(fallbackText);
   const contentHash = resultMarkdown
     ? createHash("sha256").update(resultMarkdown).digest("hex")
     : "";
-  const lastToolFailed = lastToolOutcome?.failed === true;
+  const retryableGap = observation?.retryableToolGap || null;
+  const lastToolFailed = retryableGap?.failed === true || lastToolOutcome?.failed === true;
   return {
     status: "running",
     availability: "busy",
-    runtimeStatus: "awaiting_completion_receipt",
+    runtimeStatus: completionRequired ? "awaiting_completion_receipt" : "running",
     summary,
-    completionRequired: true,
+    completionRequired,
     eventKind: "turn_finished_without_completion",
     activeTurnFinished: true,
     nonAuthoritative: true,
@@ -2444,7 +2843,10 @@ function turnFinishedWithoutCompletionEvent(envelope, {
     visible_to_chat: false,
     chatPolicy: "hidden",
     hadAssistantNarrative: deliveredViaCallback || assistantNarratives.length > 0 || !!trim(fallbackText),
-    hadOutboundAssignment: !!hadOutboundAssignment,
+    hadOutboundAssignment: observation ? !!observation.hadOutboundAssignment : !!hadOutboundAssignment,
+    downstreamAssignmentStarted: observation ? !!observation.downstreamAssignmentStarted : undefined,
+    outboundDeliveryKind: trim(observation?.outboundDeliveryKind) || undefined,
+    outboundTarget: trim(observation?.outboundTarget) || undefined,
     resultMarkdown: resultMarkdown || undefined,
     resultSummary: resultMarkdown
       ? resultMarkdown.replace(/\s+/g, " ").trim().slice(0, 500)
@@ -2454,10 +2856,25 @@ function turnFinishedWithoutCompletionEvent(envelope, {
     verificationMode: browserVerification?.verificationMode,
     browserVerification: browserVerification?.browserVerification,
     lastToolFailed: lastToolFailed || undefined,
-    lastToolName: trim(lastToolOutcome?.toolName) || undefined,
-    lastToolCallId: trim(lastToolOutcome?.toolCallId) || undefined,
-    completionContinuationRequired: lastToolFailed || undefined,
-    retryable: lastToolFailed || undefined,
+    lastToolName: trim(retryableGap?.toolName || lastToolOutcome?.toolName) || undefined,
+    lastToolCallId: trim(retryableGap?.toolCallId || lastToolOutcome?.toolCallId) || undefined,
+    lastToolError: trim(retryableGap?.error || lastToolOutcome?.error) || undefined,
+    lastToolCode: trim(retryableGap?.code || lastToolOutcome?.code) || undefined,
+    targetCandidates: Array.isArray(retryableGap?.candidates) && retryableGap.candidates.length
+      ? retryableGap.candidates
+      : undefined,
+    completionContinuationRequired: (lastToolFailed || observation?.outcome === "completion_receipt_gap") || undefined,
+    retryable: (retryableGap?.retryable === true || observation?.outcome === "completion_receipt_gap") || undefined,
+    turnObservationOutcome: observationOutcome || undefined,
+    contextOnlyTurn: observation?.contextOnly || undefined,
+    observationActionExpected: observation?.actionExpected || undefined,
+    immediateRecoveryEligible: observation?.immediateRecoveryEligible || false,
+    observationConflict: observation?.evidenceConflict || undefined,
+    observationConflicts: Array.isArray(observation?.evidenceConflicts) && observation.evidenceConflicts.length
+      ? observation.evidenceConflicts
+      : undefined,
+    observationSources: observation?.evidenceSources || undefined,
+    observationPolicyReason: trim(observation?.policyReason) || undefined,
     completionRecoveryAttempt: Math.max(
       0,
       intFrom(
@@ -2613,6 +3030,22 @@ function usableFallbackAssistantText(text) {
   return normalizeAssistantSessionText(text);
 }
 
+// Capturing a user-facing delivery and projecting it into chat are independent.
+// Keep only this dispatch's answer; never promote it to a completion proposal.
+function createTurnAnswerCapture() {
+  let text = "";
+  let closed = false;
+  return {
+    capture(payload) {
+      if (closed || payload?.isReasoning || payload?.isError || isIncompleteTurnDelivery(payload)) return;
+      const answer = usableFallbackAssistantText(payload?.text || "");
+      if (answer) text = answer;
+    },
+    close() { closed = true; },
+    get text() { return text; },
+  };
+}
+
 function summarizeCompletionText(text, fallback = "Redis Team task completed") {
   const firstLine = String(text || "")
     .split(/\r?\n/)
@@ -2621,166 +3054,13 @@ function summarizeCompletionText(text, fallback = "Redis Team task completed") {
   return (firstLine || fallback).slice(0, 160);
 }
 
-async function readTextTail(file, maxBytes = 512 * 1024) {
-  try {
-    const stat = await fs.stat(file);
-    if (!stat.isFile()) return "";
-    if (stat.size <= maxBytes) return await fs.readFile(file, "utf8");
-    const handle = await fs.open(file, "r");
-    try {
-      const buffer = Buffer.alloc(maxBytes);
-      await handle.read(buffer, 0, maxBytes, stat.size - maxBytes);
-      return buffer.toString("utf8");
-    } finally {
-      await handle.close();
-    }
-  } catch {
-    return "";
-  }
-}
-
-function resolveSessionFile(baseDir, raw) {
-  const value = trim(raw);
-  if (!value) return "";
-  return path.isAbsolute(value) ? value : path.resolve(baseDir, value);
-}
-
-function sessionRecordFromIndex(index, sessionKey) {
-  if (!index || typeof index !== "object") return null;
-  if (sessionKey && index[sessionKey] && typeof index[sessionKey] === "object") return index[sessionKey];
-  const sessions = Array.isArray(index.sessions)
-    ? index.sessions
-    : index.sessions && typeof index.sessions === "object"
-      ? Object.values(index.sessions)
-      : [];
-  if (sessionKey) {
-    const found = sessions.find((item) => {
-      if (!item || typeof item !== "object") return false;
-      return [item.key, item.sessionKey, item.id, item.conversationId].some((value) => trim(value) === sessionKey);
-    });
-    if (found) return found;
-  }
-  return sessions.length ? sessions[sessions.length - 1] : null;
-}
-
-async function recentJsonlFiles(dir) {
-  let entries = [];
-  try {
-    entries = await fs.readdir(dir, { withFileTypes: true });
-  } catch {
-    return [];
-  }
-  const files = [];
-  for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
-    const file = path.join(dir, entry.name);
-    try {
-      const stat = await fs.stat(file);
-      files.push({ file, mtimeMs: stat.mtimeMs });
-    } catch {}
-  }
-  files.sort((a, b) => b.mtimeMs - a.mtimeMs);
-  return files.map((item) => item.file);
-}
-
-function runtimeSessionDirectories() {
-  const home = trim(process.env.HOME);
-  const roots = [
-    home ? path.join(home, ".openclaw", "agents", "main", "sessions") : "",
-    home ? path.join(home, ".openclaw", "sessions") : "",
-    path.join(process.cwd(), ".openclaw", "agents", "main", "sessions"),
-  ];
-  return [...new Set(roots.filter(Boolean))];
+async function readAttemptEnvelope(cfg, envelope) {
+  const alias = assignmentAttemptAlias(envelope);
+  return alias ? readTaskEnvelope(cfg, alias) : null;
 }
 
 function normalizedSessionContentType(value) {
   return trim(value).toLowerCase().replace(/[-_]/g, "");
-}
-
-function sessionActivityKind(record) {
-  if (!record || typeof record !== "object") return { kind: "session_event", toolName: "" };
-  const message = record.message && typeof record.message === "object" ? record.message : record;
-  const role = trim(message.role || record.role || record.data?.role).toLowerCase();
-  const content = Array.isArray(message.content)
-    ? message.content
-    : Array.isArray(record.content)
-      ? record.content
-      : [];
-  const contentTypes = content.map((entry) => normalizedSessionContentType(entry?.type || entry?.kind));
-  const toolEntry = content.find((entry) =>
-    ["tooluse", "toolcall", "functioncall"].includes(normalizedSessionContentType(entry?.type || entry?.kind)),
-  );
-  const toolName = trim(
-    toolEntry?.name ||
-      toolEntry?.toolName ||
-      record.toolName ||
-      record.tool_name ||
-      record.data?.toolName,
-  );
-  if (["tool", "toolresult", "tool_result"].includes(role) || contentTypes.some((type) => ["toolresult", "functionresult"].includes(type))) {
-    return { kind: "tool_result", toolName };
-  }
-  if (contentTypes.some((type) => ["tooluse", "toolcall", "functioncall"].includes(type))) {
-    return { kind: "tool_call", toolName };
-  }
-  if (role === "assistant") return { kind: "assistant_message", toolName: "" };
-  if (role === "user") return { kind: "user_message", toolName: "" };
-  return { kind: trim(record.type || record.event || "session_event").toLowerCase(), toolName };
-}
-
-async function latestRuntimeSessionActivity(sinceMs = 0) {
-  let latest = null;
-  for (const dir of runtimeSessionDirectories()) {
-    for (const file of (await recentJsonlFiles(dir)).slice(0, 5)) {
-      try {
-        const stat = await fs.stat(file);
-        if (!stat.isFile() || stat.mtimeMs + 1000 < sinceMs) continue;
-        if (latest && latest.mtimeMs >= stat.mtimeMs) continue;
-        const tail = await readTextTail(file, 96 * 1024);
-        let lastRecord = null;
-        let lastAssistantText = "";
-        let lastAssistantAt = "";
-        let lastToolOutcome = null;
-        let lastToolAt = "";
-        const toolCalls = new Map();
-        for (const line of tail.split(/\r?\n/)) {
-          if (!line.trim()) continue;
-          try {
-            const record = JSON.parse(line);
-            const recordMs = sessionRecordTimestampMs(record);
-            if (sinceMs > 0 && recordMs > 0 && recordMs + 1000 < sinceMs) continue;
-            lastRecord = record;
-            const assistantText = normalizeAssistantSessionText(assistantTextFromRecord(record));
-            if (assistantText) {
-              lastAssistantText = assistantText.slice(0, 4000);
-              lastAssistantAt = recordMs > 0 ? new Date(recordMs).toISOString() : "";
-            }
-            const toolOutcome = sessionToolOutcome(record, toolCalls);
-            if (toolOutcome) {
-              lastToolOutcome = toolOutcome;
-              lastToolAt = recordMs > 0 ? new Date(recordMs).toISOString() : "";
-            }
-          } catch {}
-        }
-        if (!lastRecord) continue;
-        const classification = sessionActivityKind(lastRecord);
-        const recordMs = sessionRecordTimestampMs(lastRecord);
-        latest = {
-          mtimeMs: stat.mtimeMs,
-          lastSessionEventAt: new Date(Math.max(recordMs, stat.mtimeMs)).toISOString(),
-          sessionCursor: [path.basename(file), stat.size, Math.trunc(stat.mtimeMs)].join(":"),
-          lastActivityKind: classification.kind,
-          pendingToolName: classification.kind === "tool_call" ? classification.toolName : "",
-          lastAssistantText,
-          lastAssistantAt,
-          lastToolName: trim(lastToolOutcome?.toolName),
-          lastToolFailed: lastToolOutcome?.failed === true,
-          lastToolAt,
-        };
-      } catch {}
-    }
-  }
-  return latest;
 }
 
 async function startAssignmentActivityObserver({ cfg, envelope, startedAt, log }) {
@@ -2811,15 +3091,21 @@ async function startAssignmentActivityObserver({ cfg, envelope, startedAt, log }
     if (inFlight) return;
     inFlight = true;
     try {
-      const observed = await latestRuntimeSessionActivity(startedAt);
-      if (observed && (!lastSession || observed.mtimeMs >= lastSession.mtimeMs)) {
-        lastSession = observed;
-      }
+	  // OpenClaw 8.1 stores active sessions in SQLite. Activity evidence is
+	  // supplied by the official message/tool hooks; this heartbeat never reads
+	  // transcript files or private database tables.
+	  const observed = null;
       const sessionAgeMs = lastSession ? Math.max(0, Date.now() - lastSession.mtimeMs) : Date.now() - startedAt;
+      const quietForSeconds = Math.floor(sessionAgeMs / 1000);
+      const stallCandidate = sessionAgeMs >= policy.softTimeoutSec * 3 * 1000;
       let turnState = requestedState;
       if (!turnState) {
         if (lastSession?.lastActivityKind === "tool_call") turnState = "waiting_tool";
-        else if (sessionAgeMs >= policy.softTimeoutSec * 1000) turnState = "suspected_stalled";
+        // withActiveEnvelope has not returned, so a quiet session is still a
+        // live model/tool turn. Mark it for an independent Leader review only
+        // after a much longer unchanged interval; never label it failed or
+        // enqueue another assignment merely because hook evidence is quiet.
+        else if (sessionAgeMs >= policy.softTimeoutSec * 1000) turnState = "quiet_healthy";
         else turnState = lastSession ? "running" : "starting";
       }
       const terminal = ["completed", "failed", "cancelled", "lost"].includes(turnState);
@@ -2832,6 +3118,10 @@ async function startAssignmentActivityObserver({ cfg, envelope, startedAt, log }
         assignmentId,
         turnId,
         turnState,
+        executionAlive: !terminal,
+        quietForSeconds,
+        stallCandidate: !terminal && stallCandidate,
+        activityClassification: !terminal && stallCandidate ? "needs_supervisor_review" : "observed",
         startedAt: new Date(startedAt).toISOString(),
         observedAt: nowIso(),
         lastSessionEventAt: lastSession?.lastSessionEventAt || "",
@@ -2873,92 +3163,11 @@ async function startAssignmentActivityObserver({ cfg, envelope, startedAt, log }
   };
 }
 
-async function sessionFilesFromDispatchResult(dispatchResult) {
-  const storePath = trim(dispatchResult?.storePath);
-  const route = dispatchResult?.route || {};
-  const sessionKey = trim(route.sessionKey || route.sessionId || dispatchResult?.sessionKey);
-  const candidates = [];
-  if (storePath) {
-    candidates.push(storePath);
-    candidates.push(path.dirname(storePath));
-    candidates.push(path.join(storePath, "sessions"));
-  }
-  const files = [];
-  const dirs = [];
-  for (const candidate of [...new Set(candidates.filter(Boolean))]) {
-    try {
-      const stat = await fs.stat(candidate);
-      if (stat.isFile() && candidate.endsWith(".jsonl")) files.push(candidate);
-      if (stat.isDirectory()) dirs.push(candidate);
-    } catch {}
-  }
-  for (const dir of dirs) {
-    const index = await readJson(path.join(dir, "sessions.json"));
-    const record = sessionRecordFromIndex(index, sessionKey);
-		let foundExactSessionFile = false;
-    if (record) {
-      for (const key of ["sessionFile", "file", "path", "jsonlPath"]) {
-        const file = resolveSessionFile(dir, record[key]);
-				if (file) {
-					files.push(file);
-					foundExactSessionFile = true;
-				}
-      }
-    }
-		// A routed session identity is authoritative. Scan recent files only as an
-		// old-OpenClaw compatibility fallback when no exact session file is known.
-		if (!sessionKey || !foundExactSessionFile) {
-			files.push(...(await recentJsonlFiles(dir)).slice(0, 5));
-		}
-  }
-  return [...new Set(files)];
-}
-
-async function readLatestAssistantTextFromDispatch(dispatchResult) {
-  const texts = await readAssistantTextsFromDispatch(dispatchResult);
-  return texts.length ? texts[texts.length - 1] : "";
-}
-
 function sessionRecordTimestampMs(record) {
   const value = record?.timestamp || record?.createdAt || record?.created_at || record?.data?.timestamp;
   if (typeof value === "number" && Number.isFinite(value)) return value;
   const parsed = Date.parse(String(value || ""));
   return Number.isFinite(parsed) ? parsed : 0;
-}
-
-async function readAssistantNarrativesFromDispatch(dispatchResult, sinceMs = 0) {
-  const collected = [];
-  const seen = new Set();
-  for (const file of await sessionFilesFromDispatchResult(dispatchResult)) {
-    const text = await readTextTail(file);
-    if (!text) continue;
-    for (const line of text.split(/\r?\n/)) {
-      const raw = line.trim();
-      if (!raw) continue;
-      try {
-        const record = JSON.parse(raw);
-        if (sinceMs > 0) {
-          const recordMs = sessionRecordTimestampMs(record);
-          if (recordMs > 0 && recordMs + 1000 < sinceMs) continue;
-        }
-        const candidate = normalizeAssistantSessionText(assistantTextFromRecord(record));
-        if (!candidate) continue;
-        const hash = createHash("sha256").update(candidate).digest("hex");
-        if (seen.has(hash)) continue;
-        seen.add(hash);
-        const sourceTimestampMs = sessionRecordTimestampMs(record);
-        collected.push({
-          text: candidate,
-          contentHash: hash,
-          sourceOccurredAt: sourceTimestampMs > 0 ? new Date(sourceTimestampMs).toISOString() : undefined,
-          sourceSequence: collected.length + 1,
-          sourceRecordId: trim(record?.id || record?.messageId || record?.message_id || record?.data?.id) || undefined,
-        });
-      } catch {}
-    }
-    if (collected.length) return collected.slice(-12);
-  }
-  return [];
 }
 
 function sessionToolOutcome(record, toolCalls = new Map()) {
@@ -2990,7 +3199,28 @@ function sessionToolOutcome(record, toolCalls = new Map()) {
 		message.name || message.toolName || record.toolName || record.tool_name ||
 		toolCalls.get(toolCallId),
 	);
-	const failed = [
+	const resultText = (() => {
+		const values = [resultEntry?.content, message.content, record.content, resultEntry?.text, message.text, record.text];
+		for (const value of values) {
+			if (typeof value === "string" && value.trim()) return value.trim();
+			if (!Array.isArray(value)) continue;
+			const joined = value
+				.map((entry) => typeof entry === "string" ? entry : trim(entry?.text || entry?.content))
+				.filter(Boolean)
+				.join("\n")
+				.trim();
+			if (joined) return joined;
+		}
+		return "";
+	})();
+	let structuredResult = null;
+	if (resultText && /^[\[{]/.test(resultText)) {
+		try {
+			const parsed = JSON.parse(resultText);
+			if (parsed && typeof parsed === "object") structuredResult = parsed;
+		} catch {}
+	}
+	const transportFailed = [
 		resultEntry?.isError,
 		resultEntry?.is_error,
 		message.isError,
@@ -2999,40 +3229,117 @@ function sessionToolOutcome(record, toolCalls = new Map()) {
 		record.is_error,
 		record.error != null,
 	].some((value) => value === true);
+	const structuredFailed = structuredResult?.ok === false || structuredResult?.success === false;
+	const failed = transportFailed || structuredFailed;
+	// Team control-tool argument/transport failures are recoverable by default:
+	// the same Agent can correct the call in its current attempt. An explicit
+	// retryable=false remains authoritative. Other tools (Browser, shell, files)
+	// are not promoted into workflow reminders here.
+	const retryable = structuredResult?.retryable === true || (
+		failed &&
+		!!teamToolFamily(toolName) &&
+		structuredResult?.retryable !== false
+	);
+	const succeeded = !failed && (
+		structuredResult?.ok === true ||
+		structuredResult?.success === true ||
+		!!resultText ||
+		!!resultEntry
+	);
 	return {
 		failed,
+		retryable,
+		succeeded,
 		toolName,
 		toolCallId,
+		...(trim(structuredResult?.error || structuredResult?.message)
+			? { error: trim(structuredResult?.error || structuredResult?.message) }
+			: {}),
+		...(trim(structuredResult?.code) ? { code: trim(structuredResult?.code) } : {}),
+		...(Array.isArray(structuredResult?.candidates)
+			? { candidates: structuredResult.candidates.map(trim).filter(Boolean) }
+			: {}),
+		...(structuredResult ? { result: structuredResult } : {}),
 		sourceRecordId: trim(record.id || record.messageId || record.message_id || message.id) || undefined,
 	};
 }
 
-async function readLastToolOutcomeFromDispatch(dispatchResult, sinceMs = 0) {
-	for (const file of await sessionFilesFromDispatchResult(dispatchResult)) {
-		const text = await readTextTail(file);
-		if (!text) continue;
-		const toolCalls = new Map();
-		let latest = null;
-		for (const line of text.split(/\r?\n/)) {
-			const raw = line.trim();
-			if (!raw) continue;
-			try {
-				const record = JSON.parse(raw);
-				if (sinceMs > 0) {
-					const recordMs = sessionRecordTimestampMs(record);
-					if (recordMs > 0 && recordMs + 1000 < sinceMs) continue;
-				}
-				const outcome = sessionToolOutcome(record, toolCalls);
-				if (outcome) latest = outcome;
-			} catch {}
-		}
-		if (latest) return latest;
-	}
-	return null;
+function teamToolFamily(toolName) {
+	const normalized = trim(toolName).toLowerCase();
+	if (["team_send", "team_complete_task", "team_update_progress"].includes(normalized)) return normalized;
+	return "";
 }
 
-async function readAssistantTextsFromDispatch(dispatchResult, sinceMs = 0) {
-  return (await readAssistantNarrativesFromDispatch(dispatchResult, sinceMs)).map((entry) => entry.text);
+function redisTeamHookEvidenceFromDispatch(dispatchResult) {
+	return dispatchResult?.redisTeamHookEvidence || dispatchResult?.result?.redisTeamHookEvidence || {};
+}
+
+function maintenanceKey(cfg) {
+  return keyPrefix(cfg) + ":maintenance";
+}
+
+async function teamMaintenanceState(redis, cfg) {
+  const raw = await redis.command("GET", maintenanceKey(cfg));
+  if (!raw) return { enabled: false };
+  try {
+    const parsed = JSON.parse(String(raw));
+    return {
+      enabled: parsed?.enabled === true,
+      rolloutId: trim(parsed?.rolloutId),
+      reason: trim(parsed?.reason),
+    };
+  } catch {
+    return { enabled: ["1", "true", "on"].includes(trim(raw).toLowerCase()) };
+  }
+}
+
+async function readHookAssistantNarrativesFromDispatch(dispatchResult, sinceMs = 0) {
+	const evidence = redisTeamHookEvidenceFromDispatch(dispatchResult);
+	return (Array.isArray(evidence.assistantNarratives) ? evidence.assistantNarratives : [])
+		.filter((entry) => !sinceMs || Number(entry.occurredAtMs || 0) >= sinceMs)
+		.map((entry) => ({ ...entry, text: normalizeAssistantSessionText(entry.text) }))
+		.filter((entry) => entry.text);
+}
+
+async function readHookToolEvidenceFromDispatch(dispatchResult, sinceMs = 0) {
+	const evidence = redisTeamHookEvidenceFromDispatch(dispatchResult);
+	const events = (Array.isArray(evidence.toolEvents) ? evidence.toolEvents : [])
+		.filter((entry) => !sinceMs || Number(entry.occurredAtMs || 0) >= sinceMs);
+	const last = events.length ? events[events.length - 1] : null;
+	const latestByTeamFamily = new Map();
+	for (const entry of events) {
+		const family = teamToolFamily(entry.toolName);
+		if (family && entry.phase === "after") latestByTeamFamily.set(family, entry);
+	}
+	const retryableTeamToolGap = [...latestByTeamFamily.values()]
+		.reverse()
+		.find((entry) => entry.ok === false && entry.retryable === true) || null;
+	return {
+		lastToolOutcome: last ? {
+			toolName: trim(last.toolName),
+			failed: last.phase === "after" && last.ok === false,
+			retryable: last.retryable === true,
+			callId: trim(last.toolCallId),
+			toolCallId: trim(last.toolCallId),
+			code: trim(last.errorCode),
+			candidates: Array.isArray(last.candidates) ? last.candidates : [],
+		} : null,
+		retryableTeamToolGap: retryableTeamToolGap ? {
+			toolName: trim(retryableTeamToolGap.toolName),
+			failed: true,
+			retryable: true,
+			toolCallId: trim(retryableTeamToolGap.toolCallId),
+			code: trim(retryableTeamToolGap.errorCode),
+			candidates: Array.isArray(retryableTeamToolGap.candidates) ? retryableTeamToolGap.candidates : [],
+		} : null,
+		teamToolCalls: events.filter((entry) => teamToolFamily(entry.toolName)).map((entry) => ({
+			toolName: trim(entry.toolName),
+			toolFamily: teamToolFamily(entry.toolName),
+			callId: trim(entry.toolCallId),
+			phase: entry.phase,
+			failed: entry.phase === "after" && entry.ok === false,
+		})),
+	};
 }
 
 function lateNarrativeProjectionMeta(terminal) {
@@ -3166,7 +3473,7 @@ async function readTurnFacts(cfg, envelope) {
   const factsKey = turnFactsKey(cfg, envelope);
   const artifactsKey = turnArtifactFactsKey(cfg, envelope);
   if (!cfg?.redisUrl || !factsKey || !artifactsKey) {
-    return { outbound: null, completionProposed: false, artifactRefs: [], browserVerification: null };
+    return { outbound: null, completionProposed: false, artifactRefs: [], browserVerification: null, available: false };
   }
   const redis = new RedisClient(cfg.redisUrl);
   try {
@@ -3200,10 +3507,11 @@ async function readTurnFacts(cfg, envelope) {
       completionProposed: String(facts.completionProposed || "") === "1",
       artifactRefs: Array.isArray(rawArtifacts) ? rawArtifacts.map(String).map(trim).filter(Boolean) : [],
 			browserVerification,
+      available: true,
     };
   } catch (err) {
     warnOnce("turn-facts-read", "redis-team: durable turn facts are unavailable; using in-process facts: " + (err?.message || err));
-    return { outbound: null, completionProposed: false, artifactRefs: [], browserVerification: null };
+    return { outbound: null, completionProposed: false, artifactRefs: [], browserVerification: null, available: false };
   } finally {
     redis.close();
   }
@@ -3515,6 +3823,106 @@ function workflowAssignment(state, assignmentId) {
   return direct && typeof direct === "object" ? direct : null;
 }
 
+function normalizedTeamSendIntent(value) {
+  return trim(value).toLowerCase().replace(/[\s-]+/g, "_");
+}
+
+function teamSendIntentIsContext(intent) {
+  return [
+    "context",
+    "context_update",
+    "peer_request",
+    "question",
+    "reminder",
+    "follow_up",
+    "status_check",
+    "assignment_status_check",
+    "notification",
+    "ack",
+  ].includes(normalizedTeamSendIntent(intent));
+}
+
+function terminalWorkflowAttempt(state) {
+  return ["succeeded", "failed", "blocked", "stale", "cancelled"].includes(trim(state?.status).toLowerCase());
+}
+
+function decideBusinessDelivery({ roster, message, sourceEnvelope, workflowState, targetStatus, explicitWorkId, recentTargetDispatch }) {
+  const intent = normalizedTeamSendIntent(message.intent);
+  const senderIsLeader = isRosterLeaderTarget(roster, message.from);
+  const targetIsLeader = isRosterLeaderTarget(roster, message.to);
+  const assignments = workflowState?.assignments && typeof workflowState.assignments === "object"
+    ? Object.values(workflowState.assignments).filter((entry) => entry && typeof entry === "object")
+    : [];
+  const targetAssignments = assignments
+    .filter((entry) => trim(entry.ownerMemberKey) === trim(message.to))
+    .sort((left, right) => {
+      const revisionDelta = intFrom(right.revision, 1) - intFrom(left.revision, 1);
+      if (revisionDelta) return revisionDelta;
+      return Date.parse(right.updatedAt || "") - Date.parse(left.updatedAt || "");
+    });
+  const latestForTarget = targetAssignments[0] || null;
+  const trustedRecoveryIdentity = !explicitWorkId &&
+    normalizedTeamSendIntent(sourceEnvelope?.intent) === "assignment_recovery_request" &&
+    trim(sourceEnvelope?.from).toLowerCase() === "clawmanager"
+      ? trim(sourceEnvelope?.assignmentId || sourceEnvelope?.workId)
+      : "";
+  const candidateAssignmentId = trustedRecoveryIdentity || message.assignmentId || message.workId;
+  const existing = workflowAssignment(workflowState, candidateAssignmentId);
+  const currentRevision = Math.max(1, intFrom(existing?.revision, 1));
+
+  if (targetIsLeader) {
+    return { kind: "context", reason: "message_to_leader", assignmentId: existing?.assignmentId, revision: existing ? currentRevision : 1, authorized: false };
+  }
+  if (teamSendIntentIsContext(intent)) {
+    return { kind: intent === "peer_request" ? "peer_request" : "context", reason: "explicit_context_intent", assignmentId: existing?.assignmentId || latestForTarget?.assignmentId, revision: Math.max(1, intFrom(existing?.revision ?? latestForTarget?.revision, 1)), authorized: false };
+  }
+  const existingOwner = trim(existing?.ownerMemberKey);
+  if (existing && existingOwner && existingOwner !== trim(message.to)) {
+    return { kind: "ambiguous", reason: "assignment_owner_conflict", revision: currentRevision, authorized: false };
+  }
+  if (existing && ["pending", "dispatched", "running"].includes(trim(existing.status).toLowerCase())) {
+    return { kind: "context", reason: "existing_attempt_active", assignmentId: existing.assignmentId, revision: currentRevision, authorized: false };
+  }
+  if (existing && terminalWorkflowAttempt(existing)) {
+    if (activeRuntimeStatus(targetStatus) &&
+      taskIdsMatch(targetStatus.currentTaskId || targetStatus.rootTaskId, message.rootTaskId || message.taskId) &&
+      taskIdsMatch(targetStatus.currentAssignmentId || targetStatus.assignmentId || targetStatus.workId, existing.assignmentId) &&
+      Math.max(1, intFrom(targetStatus.currentRevision, 1)) === currentRevision) {
+      return {
+        kind: "context",
+        reason: "runtime_attempt_still_active",
+        assignmentId: existing.assignmentId,
+        revision: currentRevision,
+        authorized: false,
+      };
+    }
+    if (existing.nextRevisionAllowed === true && intFrom(existing.nextRevision, 0) === currentRevision + 1) {
+      return { kind: "assignment", reason: "ledger_authorized_recovery", assignmentId: existing.assignmentId, revision: currentRevision + 1, authorized: true };
+    }
+    return { kind: "ambiguous", reason: "terminal_attempt_follow_up", assignmentId: existing.assignmentId, revision: currentRevision, authorized: false };
+  }
+  if (!explicitWorkId && latestForTarget) {
+    const latestRevision = Math.max(1, intFrom(latestForTarget.revision, 1));
+    return { kind: "ambiguous", reason: "target_has_existing_assignment", assignmentId: latestForTarget.assignmentId, revision: latestRevision, authorized: false };
+  }
+  if (!explicitWorkId && recentTargetDispatch) {
+    return {
+      kind: "ambiguous",
+      reason: "target_has_recent_unprojected_assignment",
+      assignmentId: recentTargetDispatch.assignmentId,
+      revision: Math.max(1, intFrom(recentTargetDispatch.revision, 1)),
+      authorized: false,
+    };
+  }
+  if (!senderIsLeader && !explicitWorkId) {
+    return { kind: "peer_request", reason: "member_message_without_assignment_contract", revision: 1, authorized: false };
+  }
+  // A brand-new canonical assignment remains a valid next stage even when an
+  // earlier member has already completed. This is the common worker-1 ->
+  // worker-2 sequential plan and must not be mistaken for a revision.
+  return { kind: "assignment", reason: "new_assignment_contract", assignmentId: message.assignmentId, revision: 1, authorized: true };
+}
+
 function activeRuntimeStatus(status) {
   if (!status || typeof status !== "object") return false;
   const runtimeStatus = trim(status.runtimeStatus).toLowerCase();
@@ -3533,7 +3941,7 @@ function equivalentActiveAssignment(status, message) {
   if (!currentAssignment || !taskIdsMatch(currentAssignment, message.assignmentId || message.workId)) return false;
   const currentRevision = intFrom(status.currentRevision, 0);
   const requestedRevision = Math.max(1, intFrom(message.revision, 1));
-  if (!currentRevision || currentRevision > requestedRevision) return false;
+  if (!currentRevision || currentRevision !== requestedRevision) return false;
   const currentTarget = trim(status.currentValidationTargetAssignmentId);
   const messageTarget = trim(message.validationTargetAssignmentId);
   if (currentTarget && messageTarget && currentTarget !== messageTarget) return false;
@@ -3576,6 +3984,25 @@ async function recentEquivalentDispatch(redis, cfg, message) {
   } catch {
     return null;
   }
+}
+
+async function recentTargetAssignmentDispatch(redis, cfg, rootTaskId, targetMemberId) {
+  if (!redis || !rootTaskId || !targetMemberId) return null;
+  const rawEntries = await redis.command("HGETALL", assignmentDispatchStateKey(cfg, rootTaskId));
+  if (!Array.isArray(rawEntries) || rawEntries.length === 0) return null;
+  let latest = null;
+  let latestAt = 0;
+  for (let index = 0; index + 1 < rawEntries.length; index += 2) {
+    let state;
+    try { state = JSON.parse(String(rawEntries[index + 1])); } catch { continue; }
+    if (!state || trim(state.to) !== trim(targetMemberId) || !taskIdsMatch(state.rootTaskId, rootTaskId)) continue;
+    if (!["dispatched", "waiting_dependencies"].includes(trim(state.status).toLowerCase())) continue;
+    const createdAt = Date.parse(state.createdAt || "");
+    if (!Number.isFinite(createdAt) || Date.now() - createdAt > 120000 || createdAt <= latestAt) continue;
+    latest = state;
+    latestAt = createdAt;
+  }
+  return latest;
 }
 
 function equivalentWorkflowAttempt(workflowState, message) {
@@ -3762,6 +4189,15 @@ function normalizeEnvelopeWorkspaceContext(envelope) {
   return envelope;
 }
 
+function isSingleMemberEnvelope(cfg, envelope) {
+  return envelope?.executionType === "single_member" &&
+    trim(envelope.executorMemberKey) === trim(cfg.memberId) &&
+    ["clawmanager", "clawmanager-monitor"].includes(trim(envelope.from)) &&
+    isClawManagerRootTaskRef(envelope.rootTaskId || envelope.taskId) &&
+    trim(envelope.rootTaskId || envelope.taskId).startsWith(`team-${cfg.teamId}-task-`) &&
+    trim(envelope.assignmentId || envelope.workId) === "single-member";
+}
+
 function normalizeEnvelope(raw) {
   if (!raw || typeof raw !== "object") return null;
   const text = raw.text || raw.prompt || raw.rawPayload || "";
@@ -3790,6 +4226,10 @@ function normalizeEnvelope(raw) {
     rootMessageId: raw.rootMessageId || raw.root_message_id || textRootMessageId || raw.messageId || raw.message_id,
     workId: raw.workId || raw.work_id || raw.assignmentId || raw.assignment_id,
     assignmentId: raw.assignmentId || raw.assignment_id || raw.workId || raw.work_id,
+    executionType: raw.executionType,
+    executorMemberKey: raw.executorMemberKey,
+    contextTaskId: raw.contextTaskId,
+    followupContext: raw.followupContext,
     dependsOn: Array.isArray(raw.dependsOn) ? raw.dependsOn.filter(Boolean) : [],
     teamId: raw.teamId || raw.team_id,
     from: raw.from || raw.sender || raw.memberId || raw.member_id || "unknown",
@@ -3869,7 +4309,57 @@ function normalizeEnvelope(raw) {
           raw.metadata?.verification_url,
       ) || undefined,
     monitorPolicy: normalizeMonitorPolicy(raw.monitorPolicy || raw.monitor_policy || raw.metadata?.monitorPolicy || raw.metadata?.monitor_policy),
-    requiresCompletion: raw.requiresCompletion !== false,
+    turnOutcomePolicy:
+      raw.turnOutcomePolicy ||
+      raw.turn_outcome_policy ||
+      raw.metadata?.turnOutcomePolicy ||
+      raw.metadata?.turn_outcome_policy ||
+      {},
+    businessDeliveryKind:
+      raw.businessDeliveryKind ||
+      raw.business_delivery_kind ||
+      raw.metadata?.businessDeliveryKind ||
+      raw.metadata?.business_delivery_kind,
+    businessDeliveryReason:
+      raw.businessDeliveryReason ||
+      raw.business_delivery_reason ||
+      raw.metadata?.businessDeliveryReason ||
+      raw.metadata?.business_delivery_reason,
+    deliverySemanticsVersion: Math.max(
+      0,
+      intFrom(
+        raw.deliverySemanticsVersion ??
+          raw.delivery_semantics_version ??
+          raw.metadata?.deliverySemanticsVersion ??
+          raw.metadata?.delivery_semantics_version,
+        0,
+      ),
+    ),
+    businessMutation: boolFrom(
+      raw.businessMutation ?? raw.business_mutation ?? raw.metadata?.businessMutation,
+      false,
+    ),
+    revisionAuthorized: boolFrom(
+      raw.revisionAuthorized ?? raw.revision_authorized ?? raw.metadata?.revisionAuthorized,
+      false,
+    ),
+    nonAuthoritative: boolFrom(
+      raw.nonAuthoritative ?? raw.non_authoritative ?? raw.metadata?.nonAuthoritative,
+      false,
+    ),
+    decisionLedgerVersion: Math.max(
+      0,
+      intFrom(raw.decisionLedgerVersion ?? raw.decision_ledger_version, 0),
+    ),
+    decisionPlanVersion: Math.max(
+      0,
+      intFrom(raw.decisionPlanVersion ?? raw.decision_plan_version, 0),
+    ),
+    workItemId: Math.max(0, intFrom(raw.workItemId ?? raw.work_item_id, 0)) || undefined,
+    requiresCompletion: boolFrom(
+      raw.requiresCompletion ?? raw.requires_completion ?? raw.metadata?.requiresCompletion,
+      true,
+    ),
     completionTool: raw.completionTool || "team_complete_task",
     resultSink: raw.resultSink || {},
     idempotencyKey: raw.idempotencyKey || raw.messageId,
@@ -3963,6 +4453,13 @@ function createRuntime(api) {
 		const sourceRecordId = trim(message.id || message.messageId || message.message_id || event?.id) ||
 			[hookSessionKey(event, ctx), sourceSequence].filter(Boolean).join(":");
 		const contentHash = createHash("sha256").update(narrativeText).digest("hex");
+		projection.assistantNarratives.push({
+			text: narrativeText,
+			contentHash,
+			occurredAtMs: sourceTimestampMs,
+			sourceRecordId: sourceRecordId || undefined,
+		});
+		if (projection.assistantNarratives.length > 32) projection.assistantNarratives.shift();
 		projection.queue = projection.queue
 			.then(() => emitter(narrativeText, "before_message_write", {}, {
 				contentHash,
@@ -4073,6 +4570,16 @@ function createRuntime(api) {
 				return activeEnvelope.businessAssignmentEnvelope;
 			}
 			return activeEnvelope;
+    }
+    const exactAttempt = await readAttemptEnvelope(cfg, {
+      rootTaskId: params.rootTaskId || params.root_task_id || params.taskId || params.task_id,
+      taskId: params.taskId || params.task_id || params.rootTaskId || params.root_task_id,
+      assignmentId: params.assignmentId || params.assignment_id || params.workId || params.work_id,
+      workId: params.workId || params.work_id || params.assignmentId || params.assignment_id,
+      revision: params.revision,
+    });
+    if (exactAttempt && aliases.some((candidate) => taskMatchesEnvelope(exactAttempt, candidate))) {
+      return exactAttempt;
     }
     for (const alias of aliases) {
       const persisted = await readTaskEnvelope(cfg, alias);
@@ -4220,7 +4727,8 @@ function createRuntime(api) {
       isLeaderRosterMember(currentMember) ||
       isRosterLeaderTarget(roster, cfg.memberId) ||
       isLeaderMember(cfg);
-    const assignmentResultOnly = leaderMediated && !currentIsLeader;
+    const singleMember = isSingleMemberEnvelope(cfg, envelope);
+    const assignmentResultOnly = leaderMediated && !currentIsLeader && !singleMember;
     const completionStatus = ["failed", "cancelled"].includes(trim(meta.completionStatus).toLowerCase())
       ? "failed"
       : "succeeded";
@@ -4233,10 +4741,10 @@ function createRuntime(api) {
     // A Leader receives Worker result envelopes while coordinating the root
     // task. Those source envelopes are useful for audit, but they are not the
     // identity of the Leader's final synthesis lane.
-    const assignmentId = currentIsLeader ? "leader-final-synthesis" : inheritedAssignmentId;
+    const assignmentId = currentIsLeader && !singleMember ? "leader-final-synthesis" : inheritedAssignmentId;
     const workId = assignmentId;
     const revision = Math.max(1, intFrom(meta.revision ?? envelope.revision, 1));
-    const completionScope = currentIsLeader ? "root" : assignmentId || "root";
+    const completionScope = currentIsLeader || singleMember ? "root" : assignmentId || "root";
     // Completion idempotency belongs to the authenticated assignment contract,
     // not an arbitrary id an Agent happened to repeat in its tool arguments.
     // This makes same-assignment retries stable while allowing a correction,
@@ -4247,8 +4755,8 @@ function createRuntime(api) {
     const inReplyTo = trim(meta.inReplyTo) || envelope.messageId;
 
     const attemptId = trim(meta.attemptId) || ("attempt_" + randomUUID());
-    const workflowFinal = meta.workflowFinal === undefined ? currentIsLeader : boolFrom(meta.workflowFinal, false);
-    const finalAnswerReady = meta.finalAnswerReady === undefined ? currentIsLeader : boolFrom(meta.finalAnswerReady, false);
+    const workflowFinal = singleMember || (meta.workflowFinal === undefined ? currentIsLeader : boolFrom(meta.workflowFinal, false));
+    const finalAnswerReady = singleMember || (meta.finalAnswerReady === undefined ? currentIsLeader : boolFrom(meta.finalAnswerReady, false));
     const remainingActions = Array.isArray(meta.remainingActions) ? meta.remainingActions.filter(Boolean) : [];
 		await drainActiveReviewPersistence();
 		const durableTurnFacts = await readTurnFacts(cfg, envelope);
@@ -4284,7 +4792,7 @@ function createRuntime(api) {
         attemptId,
 		...completionProvenance,
         assignmentResultOnly: assignmentResultOnly || undefined,
-        rootTaskTerminal: leaderMediated ? (!assignmentResultOnly && currentIsLeader) : undefined,
+        rootTaskTerminal: singleMember || (leaderMediated ? (!assignmentResultOnly && currentIsLeader) : undefined),
         workId,
         assignmentId,
         canonicalWorkId: workId,
@@ -4478,7 +4986,7 @@ function createRuntime(api) {
       isLeaderRosterMember(currentMember) ||
       isRosterLeaderTarget(roster, cfg.memberId) ||
       isLeaderMember(cfg);
-    const assignmentResultOnly = isLeaderMediatedRoster(roster) && !currentIsLeader;
+    const assignmentResultOnly = isLeaderMediatedRoster(roster) && !currentIsLeader && !isSingleMemberEnvelope(cfg, envelope);
     const assignmentId = trim(envelope?.assignmentId || envelope?.workId) || undefined;
     const revision = Math.max(1, intFrom(meta.revision ?? envelope?.revision, 1));
     const completionScope = assignmentResultOnly ? assignmentId || cfg.memberId : "root";
@@ -4569,6 +5077,8 @@ function createRuntime(api) {
     params = params || {};
 		let dependencyAdvisory = null;
     if (!cfg.enabled) throw new Error("Redis Team channel is disabled");
+    const boundEnvelope = activeEnvelope || await readJson(privateActiveAssignmentPath(cfg));
+    if (isSingleMemberEnvelope(cfg, boundEnvelope)) return teamToolNormalizationError("single_member_no_delegation", { retryable: false, message: "This is a single-member root. Answer the user and submit team_complete_task; do not dispatch another member." });
     await ensureDirs(cfg);
 		const normalized = await normalizeTeamSendParams(cfg, params, activeEnvelope);
 		if (normalized.error) return normalized.error;
@@ -4788,34 +5298,52 @@ function createRuntime(api) {
         });
       }
       if (target.route === "unknown") {
-        const failureEvent = inferredEnvelope
-          ? taskEvent(cfg, "message_failed", inferredEnvelope, {
+        const warningDetails = {
               messageId: message.messageId,
               message_id: message.messageId,
               taskId: message.taskId,
               task_id: message.taskId,
+              rootTaskId: message.rootTaskId,
+              root_task_id: message.rootTaskId,
+              rootMessageId: message.rootMessageId,
+              root_message_id: message.rootMessageId,
+              assignmentId: message.assignmentId,
+              workId: message.workId,
+              revision: message.revision,
+              from: cfg.memberId,
               to: target.originalTo,
               availability: "busy",
               runtimeStatus: "running",
-              status: "message_failed",
+              status: "attention_required",
+              eventKind: "target_resolution_warning",
+              failureDomain: "transport",
+              failureKind: "target_resolution",
+              retryable: true,
+              nonAuthoritative: true,
+              stateEffect: "none",
+              rootTaskTerminal: false,
+              clarificationRequired: true,
+              targetCandidates: target.targetCandidates || [],
+              targetSuggestions: target.targetSuggestions || [],
               summary: target.error,
               error: target.error,
-            })
-          : eventFor(cfg, "message_failed", {
-              messageId: message.messageId,
-              message_id: message.messageId,
-              taskId: message.taskId,
-              task_id: message.taskId,
-              to: target.originalTo,
-              availability: "busy",
-              runtimeStatus: "running",
-              status: "message_failed",
-              summary: target.error,
-              error: target.error,
-            });
-        await xaddJson(redis, eventsKey(cfg), failureEvent);
-        lastOutbound = { message, target, failed: true, error: target.error };
-        return Object.assign({}, message, { failed: true, error: target.error });
+            };
+        const warningEvent = inferredEnvelope
+          ? taskEvent(cfg, "message_warning", inferredEnvelope, warningDetails)
+          : eventFor(cfg, "message_warning", warningDetails);
+        await xaddJson(redis, eventsKey(cfg), warningEvent);
+        lastOutbound = { message, target, delivered: false, clarificationRequired: true, error: target.error };
+        return Object.assign({}, message, {
+          sent: false,
+          messageDelivered: false,
+          failed: false,
+          retryable: true,
+          nonAuthoritative: true,
+          clarificationRequired: true,
+          targetCandidates: target.targetCandidates || [],
+          targetSuggestions: target.targetSuggestions || [],
+          error: target.error,
+        });
       }
       if (target.route === "control") {
         const monitorReply =
@@ -4864,10 +5392,65 @@ function createRuntime(api) {
       // the target Runtime's exact active-attempt snapshot and fails open for
       // old statuses that do not expose revision/validation identity.
       const targetStatus = await readStatuses(cfg, message.to);
-      if (equivalentActiveAssignment(targetStatus, message)) {
+      const workflowState = message.rootTaskId
+        ? await readCurrentRootWorkflowState(redis, cfg, message.rootTaskId)
+        : null;
+      // Only calls without an explicit business identity need the extra race
+      // check. Normal, correctly formed assignment traffic keeps the fast path.
+      const recentTargetDispatch = !explicitWorkId && message.rootTaskId
+        ? await recentTargetAssignmentDispatch(redis, cfg, message.rootTaskId, message.to)
+        : null;
+      const deliveryDecision = decideBusinessDelivery({
+        roster,
+        message,
+        sourceEnvelope: inferredEnvelope || activeEnvelope,
+        workflowState,
+        targetStatus,
+        explicitWorkId: !!explicitWorkId,
+        recentTargetDispatch,
+      });
+      message.businessDeliveryKind = deliveryDecision.kind;
+      message.businessDeliveryReason = deliveryDecision.reason;
+      message.deliverySemanticsVersion = 1;
+      message.sourceTool = "team_send";
+      message.agentIntent = trim(params.intent) || undefined;
+      if (trim(deliveryDecision.assignmentId)) {
+        message.assignmentId = trim(deliveryDecision.assignmentId);
+        message.canonicalWorkId = trim(deliveryDecision.assignmentId);
+        message.workId = trim(deliveryDecision.assignmentId);
+        message.sharedWorkspace = sharedWorkspaceForTarget(
+          cfg,
+          inheritedSharedWorkspace,
+          target.to,
+          rootTaskId || taskId,
+          message.assignmentId,
+        );
+      }
+      message.revision = deliveryDecision.revision;
+      message.revisionAuthorized = deliveryDecision.authorized === true;
+      message.businessMutation = deliveryDecision.kind === "assignment";
+      message.requiresCompletion = deliveryDecision.kind === "assignment";
+      message.decisionLedgerVersion = Number(workflowState?.ledgerVersion || 0);
+      message.decisionPlanVersion = Number(workflowState?.planVersion || 0);
+      if (deliveryDecision.kind !== "assignment") {
+        message.nonAuthoritative = true;
+        message.rootTaskTerminal = false;
+      }
+      if (deliveryDecision.kind === "assignment") {
+        if (trim(message.sharedWorkspace?.taskWorkPhysicalRoot)) {
+          await mkdirBestEffort(message.sharedWorkspace.taskWorkPhysicalRoot, TEAM_SHARED_DIR_MODE, "task-scoped shared work directory");
+        }
+        if (trim(message.sharedWorkspace?.taskContextPhysicalRoot)) {
+          await mkdirBestEffort(message.sharedWorkspace.taskContextPhysicalRoot, TEAM_SHARED_DIR_MODE, "task-scoped context directory");
+        }
+      }
+
+      if (deliveryDecision.kind === "assignment" && equivalentActiveAssignment(targetStatus, message)) {
         lastOutbound = { message, target, deduplicated: true, reason: "already_in_progress" };
         return Object.assign({}, message, {
-          sent: true,
+          sent: false,
+          messageDelivered: false,
+          businessMutationDeduplicated: true,
           deduplicated: true,
           reason: "already_in_progress",
           activeAttempt: {
@@ -4879,12 +5462,9 @@ function createRuntime(api) {
         });
       }
 
-      const workflowState = message.rootTaskId
-        ? await readCurrentRootWorkflowState(redis, cfg, message.rootTaskId)
-        : null;
-      const recordedDispatch = await recentEquivalentDispatch(redis, cfg, message);
-      const workflowAttempt = equivalentWorkflowAttempt(workflowState, message);
-      if (recordedDispatch || workflowAttempt) {
+      const recordedDispatch = deliveryDecision.kind === "assignment" ? await recentEquivalentDispatch(redis, cfg, message) : null;
+      const workflowAttempt = deliveryDecision.kind === "assignment" ? equivalentWorkflowAttempt(workflowState, message) : null;
+      if (deliveryDecision.kind === "assignment" && (recordedDispatch || workflowAttempt)) {
         const waiting = trim(recordedDispatch?.status).toLowerCase() === "waiting_dependencies";
 		if (waiting) {
 			// v4/v5 could leave a hidden dependency-delayed message behind. On an
@@ -4900,7 +5480,9 @@ function createRuntime(api) {
 			const activeAttempt = workflowAttempt || recordedDispatch;
 			lastOutbound = { message, target, deduplicated: true, deferred: false, reason: "already_in_progress" };
 			return Object.assign({}, message, {
-				sent: true,
+				sent: false,
+				messageDelivered: false,
+				businessMutationDeduplicated: true,
 				deduplicated: true,
 				deferred: false,
 				reason: "already_in_progress",
@@ -4916,7 +5498,7 @@ function createRuntime(api) {
 		}
       }
 
-	  if (message.rootTaskId && Array.isArray(message.dependsOn) && message.dependsOn.length > 0) {
+	  if (deliveryDecision.kind === "assignment" && message.rootTaskId && Array.isArray(message.dependsOn) && message.dependsOn.length > 0) {
         const dependencyStates = [];
         for (const dependency of message.dependsOn) {
           dependencyStates.push({ dependency, ...(await dependencyDispatchState(redis, cfg, message.rootTaskId, dependency, workflowState)) });
@@ -4938,7 +5520,9 @@ function createRuntime(api) {
       }
 
       await xaddJson(redis, inboxKey(cfg, message.to), message);
-		await recordAssignmentDispatch(redis, cfg, message, "dispatched");
+		if (deliveryDecision.kind === "assignment") {
+			await recordAssignmentDispatch(redis, cfg, message, "dispatched");
+		}
       const outbound = {
         messageId: message.messageId,
         taskId: message.taskId,
@@ -4967,12 +5551,27 @@ function createRuntime(api) {
         sourceMessageId: inferredEnvelope?.messageId || activeEnvelope?.messageId,
         source_message_id: inferredEnvelope?.messageId || activeEnvelope?.messageId,
         conversationId: message.conversationId,
+        businessDeliveryKind: message.businessDeliveryKind,
+        businessDeliveryReason: message.businessDeliveryReason,
+        deliverySemanticsVersion: message.deliverySemanticsVersion,
+        decisionLedgerVersion: message.decisionLedgerVersion,
+        decisionPlanVersion: message.decisionPlanVersion,
+        businessMutation: message.businessMutation,
+        requiresCompletion: message.requiresCompletion,
+        revisionAuthorized: message.revisionAuthorized,
+        sourceTool: message.sourceTool,
+        agentIntent: message.agentIntent,
+        nonAuthoritative: message.nonAuthoritative,
         to: message.to,
         originalTo: message.originalTo,
         text: message.text,
         summary: message.title,
       };
-      const eventName = target.system || target.group ? "reply" : "outbound";
+      const eventName = target.system || target.group
+        ? "reply"
+        : message.businessDeliveryKind === "peer_request"
+          ? "peer_request"
+          : "outbound";
       await xaddJson(redis, eventsKey(cfg), eventFor(cfg, eventName, Object.assign({}, outbound, {
         to: target.originalTo,
         inReplyTo: inferredEnvelope?.messageId || activeEnvelope?.messageId,
@@ -4984,6 +5583,14 @@ function createRuntime(api) {
     } finally {
       redis.close();
     }
+	if (message.businessDeliveryKind === "ambiguous") {
+		return Object.assign({}, message, {
+			sent: true,
+			deliveryState: "delivered_as_context",
+			clarificationRequired: true,
+			leaderGuidance: "The message was delivered without creating a new Work Item because the current ledger does not uniquely prove a new business assignment. For a real next stage, resend with a distinct assignmentId. For rework, confirm the exact failed/stale attempt so the control-plane recovery context can authorize its next revision.",
+		});
+	}
 	return dependencyAdvisory
 		? Object.assign({}, message, {
 			sent: true,
@@ -5061,12 +5668,24 @@ function createRuntime(api) {
 				sequence: 0,
 				terminalSubmitted: false,
 				sessionKeys: new Set(),
+				assistantNarratives: [],
+				toolEvents: [],
 			};
 			activeNarrativeProjections.add(projection);
 			try {
 				return await narrativeProjectionStorage.run(projection, async () => {
 					try {
-						return await fn();
+						const result = await fn();
+						const evidenceTarget = result?.dispatchResult && typeof result.dispatchResult === "object"
+							? result.dispatchResult
+							: result;
+						if (evidenceTarget && typeof evidenceTarget === "object") {
+							evidenceTarget.redisTeamHookEvidence = {
+								assistantNarratives: projection.assistantNarratives.slice(),
+								toolEvents: projection.toolEvents.slice(),
+							};
+						}
+						return result;
 					} finally {
 						await drainAssistantSessionNarratives(projection);
 					}
@@ -5083,6 +5702,32 @@ function createRuntime(api) {
 
 		observeAssistantSessionMessage(event, ctx) {
 			enqueueAssistantSessionNarrative(event, ctx);
+		},
+
+		observeToolHook(phase, event, ctx = {}) {
+			const projection = narrativeProjectionForContext(event, ctx);
+			if (!projection || !projection.envelope) return;
+			const toolName = trim(event?.toolName || event?.name);
+			if (!toolName) return;
+			const structuredResult = event?.result && typeof event.result === "object" ? event.result : {};
+			const errorValue = event?.error || structuredResult.error;
+			const failed = phase === "after" && (
+				!!errorValue || event?.isError === true || structuredResult.ok === false || structuredResult.success === false
+			);
+			const retryable = failed && !!teamToolFamily(toolName) && structuredResult.retryable !== false;
+			projection.toolEvents.push({
+				phase,
+				toolName,
+				toolCallId: trim(event?.toolCallId || event?.callId || ctx?.toolCallId),
+				ok: phase === "before" ? undefined : !failed,
+				retryable: structuredResult.retryable === true || retryable,
+				errorCode: trim(errorValue?.code || event?.errorCode || structuredResult.code),
+				candidates: Array.isArray(structuredResult.candidates)
+					? structuredResult.candidates.map(trim).filter(Boolean).slice(0, 16)
+					: [],
+				occurredAtMs: Date.now(),
+			});
+			if (projection.toolEvents.length > 64) projection.toolEvents.shift();
 		},
 
 		async flushAssistantSessionNarratives() {
@@ -5164,9 +5809,20 @@ function createRuntime(api) {
       const contextOnly = isContextOnlyEnvelope(envelope);
       const previousPersistedEnvelope = contextOnly ? await readJson(privateActiveAssignmentPath(config)) : null;
       if (contextOnly) {
-		if (previousPersistedEnvelope && !isContextOnlyEnvelope(previousPersistedEnvelope)) {
-			envelope = Object.assign({}, envelope, { businessAssignmentEnvelope: previousPersistedEnvelope });
-		}
+        // A control/context message carries the exact business identity it is
+        // observing. Resolve that immutable attempt first; the member-wide
+        // "last active" pointer is only a compatibility fallback. This avoids
+        // a later close notice or another assignment stealing Monitor tools.
+        const exactAttemptEnvelope = await readAttemptEnvelope(config, envelope);
+        const businessAssignmentEnvelope =
+          exactAttemptEnvelope && !isContextOnlyEnvelope(exactAttemptEnvelope)
+            ? exactAttemptEnvelope
+            : previousPersistedEnvelope && !isContextOnlyEnvelope(previousPersistedEnvelope)
+              ? previousPersistedEnvelope
+              : null;
+        if (businessAssignmentEnvelope) {
+          envelope = Object.assign({}, envelope, { businessAssignmentEnvelope });
+        }
         const rootTaskId = preferredRootTaskId(envelope?.rootTaskId, envelope?.taskId);
         const persistedRootEnvelope = rootTaskId ? await readTaskEnvelope(config, rootTaskId) : null;
         const contextRefs = [
@@ -5317,7 +5973,7 @@ function createRuntime(api) {
       return {
         path: resolved.canonical,
         bytes: Buffer.byteLength(String(params?.content ?? ""), "utf8"),
-        ...optionalPreviewFields(cfg, resolved.candidate),
+        ...await optionalPreviewFields(cfg, resolved.candidate),
       };
     },
 
@@ -5348,7 +6004,7 @@ function createRuntime(api) {
           offset,
           truncated: nextOffset < stat.size,
           nextOffset: nextOffset < stat.size ? nextOffset : undefined,
-          ...optionalPreviewFields(cfg, resolved.candidate),
+          ...await optionalPreviewFields(cfg, resolved.candidate),
         };
       } finally {
         await handle.close();
@@ -5372,7 +6028,7 @@ function createRuntime(api) {
           type: entry.isDirectory() ? "directory" : entry.isFile() ? "file" : "other",
           path: canonicalArtifactRef(cfg, candidate),
           bytes: entry.isFile() ? stat.size : undefined,
-          ...(entry.isFile() ? optionalPreviewFields(cfg, candidate) : {}),
+          ...(entry.isFile() ? await optionalPreviewFields(cfg, candidate) : {}),
         });
       }
       return { path: resolved.canonical, entries: result };
@@ -5385,7 +6041,7 @@ function createRuntime(api) {
       const resolved = await resolveTeamArtifactPath(cfg, params || {}, currentEnvelope, "team");
       const stat = await fs.stat(resolved.candidate);
       if (!stat.isFile()) throw new Error("Team artifact is not a file: " + resolved.canonical);
-      const preview = previewUrlForTeamArtifact(cfg, resolved.candidate);
+      const preview = await previewUrlForTeamArtifact(cfg, resolved.candidate);
       if (["evidence", "code-review"].includes(resolveRedisTeamVerificationRole(currentEnvelope))) {
 		activeReviewVerification = mergeBrowserVerificationState(activeReviewVerification, {
           previewGenerated: true,
@@ -5878,11 +6534,14 @@ async function startConsumer(cfg, onMessage, onProcessingFailure, log) {
 
   async function emitPresence() {
     try {
+		const maintenance = await teamMaintenanceState(presenceRedis, cfg);
       const status = await writeLocalStatus(cfg, {
         liveness: "online",
+		maintenance: maintenance.enabled,
+		maintenanceRolloutId: maintenance.rolloutId || "",
       });
       await presenceRedis.command("HSET", presenceKey(cfg), cfg.memberId, JSON.stringify(status));
-		await releaseAllReadyDeferredAssignments(presenceRedis, cfg);
+		if (!maintenance.enabled) await releaseAllReadyDeferredAssignments(presenceRedis, cfg);
     } catch (err) {
       log.warn("redis-team: presence update failed: " + (err.message || err));
     }
@@ -5896,6 +6555,12 @@ async function startConsumer(cfg, onMessage, onProcessingFailure, log) {
     let pendingDrainBatches = 3;
     while (running) {
       try {
+		const maintenance = await teamMaintenanceState(redis, cfg);
+		if (maintenance.enabled) {
+			await emitPresence();
+			await new Promise((resolve) => setTimeout(resolve, 1000));
+			continue;
+		}
         const response = await redis.command(
           "XREADGROUP",
           "GROUP",
@@ -5910,6 +6575,13 @@ async function startConsumer(cfg, onMessage, onProcessingFailure, log) {
           readID,
         );
         const messages = parseReadGroupResponse(response);
+		if ((await teamMaintenanceState(redis, cfg)).enabled) {
+			// XREADGROUP may already have been blocked when the controller enabled
+			// maintenance. Leave the newly delivered entries pending and process
+			// them only after maintenance is cleared; never acknowledge or dispatch.
+			readID = "0";
+			continue;
+		}
         if (readID !== ">") {
           if (messages.length === 0) {
             readID = ">";
@@ -5922,6 +6594,14 @@ async function startConsumer(cfg, onMessage, onProcessingFailure, log) {
           }
         }
         for (const msg of messages) {
+          if ((await teamMaintenanceState(redis, cfg)).enabled) {
+            // Maintenance can start while the previous message in this batch
+            // is executing. Keep the remainder pending, including after the
+            // pending-drain batch limit has switched readID to new messages.
+            readID = "0";
+            pendingDrainBatches = 3;
+            break;
+          }
           try {
             const envelope = normalizeEnvelope(msg);
             if (!envelope) continue;
@@ -6306,6 +6986,7 @@ export default definePluginEntry({
     api.on(
       "before_tool_call",
       async (event, ctx) => {
+				runtime.observeToolHook("before", event, ctx);
 				const processDecision = teamProcessToolDecision(runtime.currentActiveEnvelope(), event);
 				if (processDecision.block) return processDecision;
         if (trim(event?.toolName).toLowerCase() !== "browser") return;
@@ -6333,6 +7014,7 @@ export default definePluginEntry({
     api.on(
       "after_tool_call",
       async (event, ctx) => {
+				runtime.observeToolHook("after", event, ctx);
         if (trim(event?.toolName).toLowerCase() !== "browser") return;
 				const callKey = browserHookContextKey(event, ctx);
 				const guardKey = (callKey && reviewerBrowserGuardKeysByCall.get(callKey)) || runtime.browserGuardKey(event, ctx);
@@ -6401,8 +7083,23 @@ export default definePluginEntry({
       }
     }
 
-    // --- Register Tools (backward compatible) ---
-    api.registerTool({
+    // --- Register Team tools through the OpenClaw 8.1 context factory. ---
+    // A normal Web/UI session receives no Team tool surface. The host-owned
+    // channel/session/native group facts, not model arguments, authorize the
+    // current Team binding.
+    function registerBoundTeamTool(tool) {
+      api.registerTool((ctx = {}) => {
+        const cfg = readChannelConfig(api.config || {});
+        const expectedSuffix = ":" + CHANNEL_ID + ":group:" + safeName(cfg.teamId);
+        const channelMatches = trim(ctx.messageChannel) === CHANNEL_ID;
+        const sessionMatches = trim(ctx.sessionKey).endsWith(expectedSuffix);
+        const nativeMatches = !trim(ctx.nativeChannelId) || trim(ctx.nativeChannelId) === trim(cfg.teamId);
+        if (!channelMatches || !sessionMatches || !nativeMatches) return null;
+        return tool;
+      }, { name: tool.name, optional: true });
+    }
+
+    registerBoundTeamTool({
       name: "team_send",
       label: "Team Send",
       description: "Send a message to another team member via Redis Streams.",
@@ -6413,7 +7110,7 @@ export default definePluginEntry({
         return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
       },
     });
-    api.registerTool({
+    registerBoundTeamTool({
       name: "team_status",
       label: "Team Status",
       description: "Read team member status snapshots.",
@@ -6422,7 +7119,7 @@ export default definePluginEntry({
         return { content: [{ type: "text", text: JSON.stringify({ ok: true, status: await runtime.status(params?.memberId) }, null, 2) }] };
       },
     });
-    api.registerTool({
+    registerBoundTeamTool({
       name: "team_update_progress",
       label: "Team Update Progress",
       description: "Update this member's structured task status. Active Team assignment identity is inherited automatically; do not invent assignment or work ids.",
@@ -6431,7 +7128,7 @@ export default definePluginEntry({
         return { content: [{ type: "text", text: JSON.stringify({ ok: true, status: await runtime.updateProgress(params || {}) }, null, 2) }] };
       },
     });
-    api.registerTool({
+    registerBoundTeamTool({
       name: "team_complete_task",
       label: "Team Complete Task",
       description: "Submit completion for the active Team assignment or Leader root task. Active identity is inherited automatically; do not invent assignment or work ids.",
@@ -6440,7 +7137,7 @@ export default definePluginEntry({
         return { content: [{ type: "text", text: JSON.stringify({ ok: true, ...(await runtime.completeTask(params || {})) }, null, 2) }] };
       },
     });
-    api.registerTool({
+    registerBoundTeamTool({
       name: "team_artifact_write",
       label: "Team Artifact Write",
       description: "Atomically write a UTF-8 artifact inside the current Team workspace with cooperative permissions.",
@@ -6449,7 +7146,7 @@ export default definePluginEntry({
         return { content: [{ type: "text", text: JSON.stringify({ ok: true, artifact: await runtime.artifactWrite(params || {}) }, null, 2) }] };
       },
     });
-    api.registerTool({
+    registerBoundTeamTool({
       name: "team_artifact_read",
       label: "Team Artifact Read",
       description: "Read a UTF-8 artifact from the current Team workspace without allowing path traversal.",
@@ -6458,7 +7155,7 @@ export default definePluginEntry({
         return { content: [{ type: "text", text: JSON.stringify({ ok: true, artifact: await runtime.artifactRead(params || {}) }, null, 2) }] };
       },
     });
-    api.registerTool({
+    registerBoundTeamTool({
       name: "team_artifact_preview",
       label: "Team Artifact Preview",
       description: "Create a signed, read-only ClawManager URL for opening a current-Team file in Browser. The URL remains valid for the life of the Team token. Use this instead of file:// or a temporary server.",
@@ -6467,7 +7164,7 @@ export default definePluginEntry({
         return { content: [{ type: "text", text: JSON.stringify({ ok: true, artifact: await runtime.artifactPreview(params || {}) }, null, 2) }] };
       },
     });
-    api.registerTool({
+    registerBoundTeamTool({
       name: "team_artifact_list",
       label: "Team Artifact List",
       description: "List artifacts in the current Team workspace without following symlinks.",
@@ -6476,7 +7173,7 @@ export default definePluginEntry({
         return { content: [{ type: "text", text: JSON.stringify({ ok: true, ...(await runtime.artifactList(params || {})) }, null, 2) }] };
       },
     });
-    api.registerTool({
+    registerBoundTeamTool({
       name: "team_artifact_mkdir",
       label: "Team Artifact Mkdir",
       description: "Create a cooperative member-scoped artifact directory inside the current Team workspace.",
@@ -6499,7 +7196,7 @@ export default definePluginEntry({
           order: 200,
         },
         capabilities: {
-          chatTypes: ["direct"],
+          chatTypes: ["direct", "group"],
           media: false,
           polls: false,
           voice: false,
@@ -6542,7 +7239,9 @@ export default definePluginEntry({
               type: "object",
               additionalProperties: {
                 type: "object",
+                additionalProperties: false,
                 properties: {
+                  enabled: { type: "boolean", default: false },
                   redisUrl: { type: "string", description: "Redis connection URL" },
                   teamId: { type: "string", description: "Team identifier" },
                   memberId: { type: "string", description: "Your member ID in the team" },
@@ -6556,6 +7255,7 @@ export default definePluginEntry({
                   dlqKey: { type: "string" },
                   embeddedTimeoutSeconds: { type: "number", minimum: 1, default: 1800 },
                   fromEnv: { type: "boolean", default: true },
+                  managerUrl: { type: "string" },
                 },
               },
             },
@@ -6736,8 +7436,13 @@ export default definePluginEntry({
 					// writer. Even when local status looks terminal, let the member inspect
 					// the supplied evidence and emit the real completion tool call if the
 					// control plane never received it.
+                    const contextDispatchStartedAt = Date.now();
+                    let contextActiveResult = null;
+                    let contextDispatchFailed = false;
+                    const contextAnswer = createTurnAnswerCapture();
                     try {
-                      await runtime.withActiveEnvelope(envelope, async () => dispatchInboundDirectDmWithRuntime({
+                      contextActiveResult = await runtime.withActiveEnvelope(envelope, async () =>
+						runtime.withNarrativeProjection(envelope, null, async () => dispatchInboundRedisTeamGroupWithRuntime({
                         cfg: ctx.cfg,
                         runtime: { channel: ctx.channelRuntime },
                         channel: CHANNEL_ID,
@@ -6751,7 +7456,7 @@ export default definePluginEntry({
                         rawBody: textIn,
                         messageId: envelope.messageId,
                         timestamp: ts,
-                        commandAuthorized: true,
+                        commandAuthorized: false,
                         bodyForAgent: textIn,
                         provider: CHANNEL_ID,
                         surface: "Redis Team",
@@ -6770,7 +7475,7 @@ export default definePluginEntry({
                             "- requiresCompletion: false",
                           ],
                         },
-                        deliver: async () => {},
+                        deliver: async (payload) => { contextAnswer.capture(payload); },
                         onRecordError: (err) => {
                           ctx.log?.error?.(
                             "redis-team: record context notification failed: " + (err?.message || String(err)),
@@ -6784,10 +7489,75 @@ export default definePluginEntry({
                               (err?.message || String(err)),
                           );
                         },
-                      }), cfg);
+                      })), cfg);
                     } catch (err) {
+                      contextDispatchFailed = true;
                       ctx.log?.warn?.(
                         "redis-team: context notification dispatch skipped after error: " +
+                          (err?.message || String(err)),
+                      );
+                    } finally {
+                      contextAnswer.close();
+                    }
+                    // Context/reminder turns are not business assignments, but
+                    // their model/tool turn still needs the same accounting as
+                    // a formal assignment. This observer only publishes hidden,
+                    // state-neutral evidence. It cannot create a Work Item,
+                    // revision, success, failure, or root terminal state.
+                    try {
+                      const durableTurnFacts = await readTurnFacts(cfg, envelope);
+                      contextActiveResult = mergeActiveTurnFacts(contextActiveResult, durableTurnFacts);
+                      const contextDispatchResult =
+                        contextActiveResult?.result?.dispatchResult || contextActiveResult?.result;
+                      const turnToolEvidence = await readHookToolEvidenceFromDispatch(
+                        contextDispatchResult,
+                        contextDispatchStartedAt,
+                      );
+                      const terminalAfterDispatch = await runtime.isTaskTerminal(
+                        cfg,
+                        envelope.businessAssignmentEnvelope || envelope,
+                      );
+                      const observation = observeTeamTurnOutcome({
+                        envelope,
+                        activeResult: contextActiveResult,
+                        durableFacts: durableTurnFacts,
+                        toolEvidence: turnToolEvidence,
+                        terminalAfterDispatch,
+                        dispatchFailed: contextDispatchFailed,
+                        incompleteTurnDetected: false,
+                        contextOnly: true,
+                      });
+                      if (!terminalAfterDispatch && !contextActiveResult?.completed && !contextActiveResult?.completionPending) {
+                        const narratives = await readHookAssistantNarrativesFromDispatch(
+                          contextDispatchResult,
+                          contextDispatchStartedAt,
+                        );
+                        const fallbackText = contextAnswer.text || (narratives.length
+                          ? narratives[narratives.length - 1].text
+                          : "");
+                        const turnEvent = turnFinishedWithoutCompletionEvent(envelope, {
+                          assistantNarratives: narratives,
+                          fallbackText,
+                          hadOutboundAssignment: !!contextActiveResult?.outbound,
+                          artifactRefs: contextActiveResult?.artifactRefs || [],
+                          browserVerification: contextActiveResult?.browserVerification || {},
+                          lastToolOutcome: turnToolEvidence.lastToolOutcome,
+                          observation,
+                        });
+                        const r = new RedisClient(cfg.redisUrl);
+                        await r.connect();
+                        try {
+                          await xaddJson(r, eventsKey(cfg), taskEvent(cfg, "task_progress", envelope, turnEvent));
+                        } finally {
+                          r.close();
+                        }
+                      }
+                    } catch (err) {
+                      // Observation is optional recovery telemetry. Any bug or
+                      // temporary Redis/session read failure here must never
+                      // block the already completed context dispatch.
+                      ctx.log?.warn?.(
+                        "redis-team: context turn observation skipped after error: " +
                           (err?.message || String(err)),
                       );
                     }
@@ -6841,6 +7611,7 @@ export default definePluginEntry({
 
                   let dispatchFailed = false;
                   let deliveredViaCallback = false;
+                  const turnAnswer = createTurnAnswerCapture();
                   const dispatchStartedAt = Date.now();
                   const emittedNarrativeHashes = new Set();
 					const emitAgentNarrative = async (narrativeText, source, media = {}, sourceMeta = {}) => {
@@ -6873,7 +7644,7 @@ export default definePluginEntry({
                   try {
                     activeResult = await runtime.withActiveEnvelope(envelope, async () =>
                       runtime.withNarrativeProjection(envelope, emitAgentNarrative, async () => {
-                    const dispatchResult = await dispatchInboundDirectDmWithRuntime({
+                    const dispatchResult = await dispatchInboundRedisTeamGroupWithRuntime({
                     cfg: ctx.cfg,
                     runtime: { channel: ctx.channelRuntime },
                     channel: CHANNEL_ID,
@@ -6887,7 +7658,7 @@ export default definePluginEntry({
                     rawBody: textIn,
                     messageId: envelope.messageId,
                     timestamp: ts,
-                    commandAuthorized: true,
+                    commandAuthorized: false,
                     bodyForAgent: appendRedisTeamCompletionGuidance(teamContextBody, envelope),
                     provider: CHANNEL_ID,
                     surface: "Redis Team",
@@ -6917,6 +7688,7 @@ export default definePluginEntry({
                         return;
                       }
                       if (isIncompleteTurnDelivery(payload)) incompleteTurnDetected = true;
+                      turnAnswer.capture(payload);
                       ctx.log?.info?.("redis-team: delivering reply for " + envelope.messageId);
                       try {
                         const projected = await emitAgentNarrative(
@@ -6969,6 +7741,7 @@ export default definePluginEntry({
                       }),
                     cfg);
                   } finally {
+                    turnAnswer.close();
                     stopHeartbeat();
                     await activityObserver.stop(
                       runtime.isActiveTaskCompleted(envelope.taskId)
@@ -6979,21 +7752,20 @@ export default definePluginEntry({
                     );
                   }
 
-                  activeResult = mergeActiveTurnFacts(
-                    activeResult,
-                    await readTurnFacts(cfg, envelope),
-                  );
-                  const assistantNarratives = await readAssistantNarrativesFromDispatch(
+                  const durableTurnFacts = await readTurnFacts(cfg, envelope);
+                  activeResult = mergeActiveTurnFacts(activeResult, durableTurnFacts);
+                  const assistantNarratives = await readHookAssistantNarrativesFromDispatch(
                     activeResult?.result?.dispatchResult,
                     dispatchStartedAt,
                   );
-                  const lastToolOutcome = await readLastToolOutcomeFromDispatch(
+                  const turnToolEvidence = await readHookToolEvidenceFromDispatch(
                     activeResult?.result?.dispatchResult,
                     dispatchStartedAt,
                   );
-                  const fallbackText = assistantNarratives.length
+                  const lastToolOutcome = turnToolEvidence.lastToolOutcome;
+                  const fallbackText = turnAnswer.text || (assistantNarratives.length
                     ? assistantNarratives[assistantNarratives.length - 1].text
-                    : await readLatestAssistantTextFromDispatch(activeResult?.result?.dispatchResult);
+                    : "");
                   const routing = await activeMemberRouting(cfg, activeResult?.outbound);
                   const workerOutboundText = routing.workerDelivery
                     ? trim(activeResult?.outbound?.message?.text)
@@ -7005,6 +7777,17 @@ export default definePluginEntry({
                     ? workerOutboundText || fallbackText
                     : fallbackText;
                   const terminalAfterDispatch = await runtime.isTaskTerminal(cfg, envelope);
+                  const turnObservation = observeTeamTurnOutcome({
+                    envelope,
+                    activeResult,
+                    durableFacts: durableTurnFacts,
+                    toolEvidence: turnToolEvidence,
+                    terminalAfterDispatch,
+                    dispatchFailed,
+                    incompleteTurnDetected,
+                    contextOnly: false,
+                    memberRouting: routing,
+                  });
 
                   // OpenClaw can execute tools in a runtime/plugin instance that
                   // does not invoke this channel's deliver callback. Recover the
@@ -7069,6 +7852,7 @@ export default definePluginEntry({
                             artifactRefs: turnArtifactRefs,
                             browserVerification: turnBrowserVerification,
                             lastToolOutcome,
+                            observation: turnObservation,
                           });
                       await writeLocalStatus(cfg, {
                         availability: retryEvent.availability,

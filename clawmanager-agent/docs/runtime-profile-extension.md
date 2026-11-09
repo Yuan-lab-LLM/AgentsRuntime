@@ -41,6 +41,23 @@ Configuration is resolved in this order:
 
 Unknown runtime types are allowed only when `RUNTIME_GATEWAY_COMMAND` is set.
 
+## Shared LLM Configuration
+
+Model environment precedence, JSON/scalar parsing, legacy compatibility,
+`provider/model` normalization, deduplication, and provider grouping belong to
+`internal/llmconfig`. Runtime profiles must consume that package and only render
+the normalized settings into their native configuration format.
+
+Container bootstrap scripts must not reimplement model parsing. Images that need
+normalized settings before the runtime agent loop starts should invoke:
+
+```text
+clawmanager-agent llm-config --format canonical
+```
+
+Runtime-specific code remains responsible for schema details such as Hermes
+YAML fields, OpenClaw reasoning compatibility, or OpenCode provider enablement.
+
 ## Required Runtime Decisions
 
 Every new runtime profile must define:

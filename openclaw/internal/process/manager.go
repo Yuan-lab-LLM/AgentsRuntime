@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -325,15 +326,8 @@ func (m *Manager) waitForGatewayReady(ctx context.Context) error {
 	}
 	client := &http.Client{Timeout: gatewayReadyHTTPTimeout}
 	for {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, readyURL, nil)
-		if err == nil {
-			resp, err := client.Do(req)
-			if err == nil {
-				_ = resp.Body.Close()
-				if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-					return nil
-				}
-			}
+		if gatewayAdmissionReady(ctx, client, readyURL) {
+			return nil
 		}
 		if err := ctx.Err(); err != nil {
 			return err
@@ -572,8 +566,15 @@ func (m *Manager) tryNotifyStartup(ctx context.Context, message string, generati
 }
 
 func (m *Manager) notifySendArgs(message string) []string {
+	runtimeName := strings.TrimSpace(m.cfg.RuntimeName)
+	if runtimeName == "" {
+		runtimeName = strings.TrimSpace(m.cfg.RuntimeType)
+	}
+	if runtimeName == "" {
+		runtimeName = "OpenClaw"
+	}
 	args := []string{
-		"-a", "OpenClaw",
+		"-a", runtimeName,
 		"-t", fmt.Sprintf("%d", startupNotificationTTL.Milliseconds()),
 		"-h", "boolean:transient:true",
 		"-p",
@@ -583,7 +584,7 @@ func (m *Manager) notifySendArgs(message string) []string {
 		args = append(args, "-r", m.notificationID)
 	}
 	m.notifyMu.Unlock()
-	return append(args, "OpenClaw", message)
+	return append(args, runtimeName, message)
 }
 
 func (m *Manager) storeNotificationID(generation int, id string) {
@@ -953,17 +954,46 @@ func (m *Manager) checkHealth() bool {
 	if readyURL == "" {
 		return true
 	}
-	req, err := http.NewRequest(http.MethodGet, readyURL, nil)
+	client := &http.Client{Timeout: 3 * time.Second}
+	return gatewayAdmissionReady(context.Background(), client, readyURL)
+}
+
+func gatewayAdmissionReady(ctx context.Context, client *http.Client, readyURL string) bool {
+	// The tested 10.2 native readiness can allow pending Agent inspections.
+	// Startup admission is a separate prerequisite for model warmup and Running.
+	if os.Getenv("CLAWMANAGER_OPENCLAW_VERSION") == "2026.10.2" {
+		startup, err := url.Parse(readyURL)
+		if err != nil {
+			return false
+		}
+		startup.Path = "/startupz"
+		return gatewayProbeFlag(ctx, client, startup.String(), "ok") && gatewayProbeFlag(ctx, client, readyURL, "ready")
+	}
+	return gatewayProbeFlag(ctx, client, readyURL, "")
+}
+
+func gatewayProbeFlag(ctx context.Context, client *http.Client, rawURL, flag string) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return false
 	}
-	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return false
 	}
 	defer resp.Body.Close()
-	return resp.StatusCode >= 200 && resp.StatusCode < 300
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return false
+	}
+	if flag == "" {
+		return true
+	}
+	var result map[string]json.RawMessage
+	if json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&result) != nil {
+		return false
+	}
+	var ready bool
+	return json.Unmarshal(result[flag], &ready) == nil && ready
 }
 
 func (m *Manager) wait(cmd *exec.Cmd, repairOnStartupExit bool) {

@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+# The shared runtime agent has already validated and atomically written this
+# instance's configuration. Never source a user-controlled .env as shell code.
+fail() { printf '%s\n' "$1" >&2; exit 64; }
+[[ "${CLAWMANAGER_HERMES_DESKTOP_WEB_ENABLED:-}" == true ]] || fail 'unsupported_hermes_protocol: Lite deployment flag required'
+[[ "${CLAWMANAGER_HERMES_BACKEND_MODE:-serve}" == serve ]] || fail 'unsupported_hermes_protocol: only headless serve mode is enabled'
+[[ -n "${CLAWMANAGER_WORKSPACE_PATH:-}" && "${HOME:-}" == "${CLAWMANAGER_WORKSPACE_PATH}/home" && "${HERMES_HOME:-}" == "${HOME}/.hermes" ]] || fail 'workspace_unavailable: invalid instance home'
+[[ -r "${HERMES_HOME}/config.yaml" && -r "${HERMES_HOME}/gateway.json" ]] || fail 'workspace_unavailable: managed configuration missing'
+# This runs as the actual isolated member UID. Root Agent health/startup cannot
+# prove that this reader can traverse the managed lease directory.
+[[ -z "${CLAWMANAGER_PROXY_POLICY_FILE:-}" || -r "${CLAWMANAGER_PROXY_POLICY_FILE}" ]] || fail 'proxy_policy_unreadable: managed trust lease is not readable by this instance'
+[[ -n "${CLAWMANAGER_LLM_BASE_URL:-}" && -n "${CLAWMANAGER_LLM_API_KEY:-}" ]] || fail 'missing_llm_credentials'
+[[ -n "${HERMES_DASHBOARD_BASIC_AUTH_USERNAME:-}" && -n "${HERMES_DASHBOARD_BASIC_AUTH_PASSWORD:-}" ]] || fail 'dashboard_auth_failed: managed credentials missing'
+[[ "${PORT:-}" =~ ^[0-9]{1,5}$ && "${CLAWMANAGER_GATEWAY_PORT:-}" == "${PORT}" ]] || fail 'port_conflict: assigned port required'
+(( 10#${PORT} > 0 && 10#${PORT} <= 65535 )) || fail 'port_conflict: invalid assigned port'
+
+cd -- "${CLAWMANAGER_WORKSPACE_PATH}"
+# v0.22.5's HTTP session readers require a store initialized by its owner.
+# Lite owns initial creation/migration. Healthy existing databases are probed
+# read-only, without repeating writable SessionDB initialization on every boot.
+/opt/hermes-agent/.venv/bin/python /opt/hermes-agent/hermes_cli/lite_startup.py
+exec hermes serve --host 0.0.0.0 --port "${PORT}" --isolated

@@ -6,10 +6,52 @@ import path from "node:path";
 
 const distPath = path.resolve(import.meta.dirname, "..", "dist", "index.js");
 const source = (await fs.readFile(distPath, "utf8"))
-  .replace('import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";', 'const definePluginEntry = (entry) => entry;')
-  .replace('import { dispatchInboundDirectDmWithRuntime } from "openclaw/plugin-sdk/direct-dm";', 'const dispatchInboundDirectDmWithRuntime = async () => ({});');
-const testSource = source + "\nexport { createRuntime, normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, assignmentAttemptFailedEvent, isIncompleteTurnDelivery, activeMemberRouting, mergeActiveTurnFacts, normalizeRedisTeamTarget, resolveRedisTeamTarget, normalizeTeamSendParams, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, inferCanonicalArtifactWriteContract, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, lateNarrativeProjectionMeta, normalizeAssistantSessionText, assistantSessionNarrativesForProjection, verificationTargetUrl, reviewerBrowserToolDecision, reviewerBrowserToolResultDecision, reviewerBrowserGuardKey, browserVerificationForCompletion, mergeBrowserVerificationState, browserToolCallFailed, browserToolResultUrl, teamProcessToolDecision, assignmentHasIndependentReview, rootWorkflowStateIsTerminal, previewUrlForTeamArtifact, sessionToolOutcome, readLastToolOutcomeFromDispatch, latestRuntimeSessionActivity, completionProposalProvenance, validationRevisionDirectory, equivalentActiveAssignment, equivalentWorkflowAttempt };\n";
+  .replace('import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";', 'const definePluginEntry = (entry) => entry;');
+const testSource = source + "\nexport { dispatchInboundRedisTeamGroupWithRuntime, createRuntime, normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, assignmentAttemptFailedEvent, isIncompleteTurnDelivery, activeMemberRouting, mergeActiveTurnFacts, normalizeRedisTeamTarget, resolveRedisTeamTarget, resolveRosterIdentity, decideBusinessDelivery, normalizeTeamSendParams, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, inferCanonicalArtifactWriteContract, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, lateNarrativeProjectionMeta, normalizeAssistantSessionText, assistantSessionNarrativesForProjection, verificationTargetUrl, reviewerBrowserToolDecision, reviewerBrowserToolResultDecision, reviewerBrowserGuardKey, browserVerificationForCompletion, mergeBrowserVerificationState, browserToolCallFailed, browserToolResultUrl, teamProcessToolDecision, assignmentHasIndependentReview, rootWorkflowStateIsTerminal, previewUrlForTeamArtifact, sessionToolOutcome, readHookAssistantNarrativesFromDispatch, readHookToolEvidenceFromDispatch, observeTeamTurnOutcome, contextTurnOutcomePolicy, completionProposalProvenance, validationRevisionDirectory, equivalentActiveAssignment, equivalentWorkflowAttempt };\n";
 const pluginModule = await import(`data:text/javascript;base64,${Buffer.from(testSource).toString("base64")}`);
+
+{
+  let routedPeer;
+  let builtContext;
+  let inboundPlan;
+  const dispatched = await pluginModule.dispatchInboundRedisTeamGroupWithRuntime({
+    cfg: {},
+    runtime: { channel: {
+      routing: { resolveAgentRoute(input) {
+        routedPeer = input.peer;
+        return { accountId: "default", agentId: "main", sessionKey: "agent:main:redis-team:group:team-contract" };
+      } },
+      inbound: {
+        async buildContext(input) { builtContext = input; return input; },
+        async run(input) { inboundPlan = input.adapter.resolveTurn(); return { ok: true }; },
+      },
+    } },
+    channel: "redis-team",
+    accountId: "default",
+    peer: { kind: "group", id: "team-contract" },
+    senderId: "leader",
+    senderAddress: "redis-team:leader",
+    recipientAddress: "worker",
+    conversationLabel: "Team contract",
+    rawBody: "assignment",
+    messageId: "message-contract",
+    timestamp: Date.now(),
+    extraContext: {
+      NativeChannelId: "team-contract-task-99",
+      OriginatingChannel: "untrusted-caller-value",
+      RedisTeamTaskId: "team-contract-task-99",
+    },
+    deliver: async () => {},
+  });
+  assert.deepEqual(routedPeer, { kind: "group", id: "team-contract" });
+  assert.equal(builtContext.conversation.kind, "group");
+  assert.equal(builtContext.access.commands.authorized, false);
+  assert.equal(builtContext.extra.NativeChannelId, "team-contract", "task context cannot replace the authenticated Team id");
+  assert.equal(builtContext.extra.OriginatingChannel, "redis-team", "task context cannot replace the authenticated channel");
+  assert.equal(builtContext.extra.RedisTeamTaskId, "team-contract-task-99", "root task identity remains separately available");
+  assert.equal(inboundPlan.route.sessionKey, "agent:main:redis-team:group:team-contract");
+  assert.equal(dispatched.route.sessionKey, "agent:main:redis-team:group:team-contract");
+}
 const plugin = pluginModule.default;
 
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "redis-team-75-"));
@@ -42,7 +84,21 @@ function createHarness(memberId, role) {
   };
   plugin.register({
     config,
-    registerTool(tool) {
+    registerTool(tool, options = {}) {
+      if (typeof tool === "function") {
+        const resolved = tool({
+          messageChannel: "redis-team",
+          sessionKey: "agent:main:redis-team:group:75",
+          nativeChannelId: "75",
+          agentAccountId: "default",
+        });
+        for (const item of Array.isArray(resolved) ? resolved : [resolved]) {
+          if (item?.name) registered.set(item.name, item);
+        }
+        registered.factories ??= [];
+        registered.factories.push({ factory: tool, options });
+        return;
+      }
       registered.set(tool.name, tool);
     },
     on(name, handler) {
@@ -96,6 +152,22 @@ function resultContentHash(content, refs) {
 try {
   await fs.mkdir(shared, { recursive: true });
 	const hookHarness = createHarness("hook-member", "developer");
+	const expectedTeamTools = [
+		"team_send",
+		"team_status",
+		"team_update_progress",
+		"team_complete_task",
+		"team_artifact_write",
+		"team_artifact_read",
+		"team_artifact_preview",
+		"team_artifact_list",
+		"team_artifact_mkdir",
+	];
+	assert.deepEqual(
+		expectedTeamTools.filter((name) => hookHarness.has(name)),
+		expectedTeamTools,
+		"all nine Team tools must resolve before the first legal Group Channel turn",
+	);
 	const beforeToolHooks = hookHarness.hooks.get("before_tool_call") || [];
 	const afterToolHooks = hookHarness.hooks.get("after_tool_call") || [];
 	assert.ok(beforeToolHooks.length > 0, "the real plugin entry registers before_tool_call");
@@ -123,69 +195,9 @@ try {
 		for (const hook of afterToolHooks) await hook({ ...event, result: { ok: true } }, { sessionKey: "agent:main:test" });
 	}
 
-	const previousHome = process.env.HOME;
-	try {
-		const activityHome = path.join(root, "activity-home");
-		const sessionsDir = path.join(activityHome, ".openclaw", "agents", "main", "sessions");
-		await fs.mkdir(sessionsDir, { recursive: true });
-		process.env.HOME = activityHome;
-		const sessionFile = path.join(sessionsDir, "real-openclaw-shape.jsonl");
-		const startedAt = Date.now() - 1000;
-		const assistantAt = new Date().toISOString();
-		const resultAt = new Date(Date.now() + 1).toISOString();
-		await fs.writeFile(sessionFile, [
-			JSON.stringify({
-				type: "message",
-				id: "assistant-real-shape",
-				timestamp: assistantAt,
-				message: {
-					role: "assistant",
-					content: [
-						{ type: "text", text: "正在写入协作计划。" },
-						{ type: "toolCall", id: "call-real-shape", name: "team_artifact_write", arguments: {} },
-					],
-				},
-			}),
-			JSON.stringify({
-				type: "message",
-				id: "tool-result-real-shape",
-				timestamp: resultAt,
-				message: {
-					role: "toolResult",
-					toolCallId: "call-real-shape",
-					toolName: "team_artifact_write",
-					content: [{ type: "text", text: "tool failed" }],
-					isError: true,
-				},
-			}),
-		].join("\n") + "\n", "utf8");
-		const completedActivity = await pluginModule.latestRuntimeSessionActivity(startedAt);
-		assert.equal(completedActivity.lastActivityKind, "tool_result", "camelCase OpenClaw toolResult is observed");
-		assert.equal(completedActivity.lastAssistantText, "正在写入协作计划。");
-		assert.equal(completedActivity.lastToolName, "team_artifact_write");
-		assert.equal(completedActivity.lastToolFailed, true);
-		assert.equal(completedActivity.pendingToolName, "");
-
-		await fs.appendFile(sessionFile, JSON.stringify({
-			type: "message",
-			id: "assistant-pending-real-shape",
-			timestamp: new Date(Date.now() + 2).toISOString(),
-			message: {
-				role: "assistant",
-				content: [
-					{ type: "text", text: "现在派发任务。" },
-					{ type: "toolCall", id: "call-pending", name: "team_send", arguments: {} },
-				],
-			},
-		}) + "\n", "utf8");
-		const pendingActivity = await pluginModule.latestRuntimeSessionActivity(startedAt);
-		assert.equal(pendingActivity.lastActivityKind, "tool_call", "camelCase OpenClaw toolCall is observed");
-		assert.equal(pendingActivity.pendingToolName, "team_send");
-		assert.equal(pendingActivity.lastAssistantText, "现在派发任务。");
-		assert.equal(pendingActivity.lastToolName, "team_artifact_write", "the last completed tool remains factual");
-	} finally {
-		if (previousHome === undefined) delete process.env.HOME;
-		else process.env.HOME = previousHome;
+	for (const { factory } of hookHarness.factories || []) {
+		assert.equal(factory({ messageChannel: "web", sessionKey: "agent:main:web:direct:user" }), null, "non-Team sessions receive no Team tools");
+		assert.equal(factory({ messageChannel: "redis-team", sessionKey: "agent:main:redis-team:group:76", nativeChannelId: "76" }), null, "another Team cannot receive this member's tools");
 	}
 
 	const liveRuntime = pluginModule.createRuntime({ config: {}, logger: { warn() {} } });
@@ -390,7 +402,13 @@ try {
     taskId: "team-75-task-149",
     rootTaskId: "team-75-task-149",
     messageId: "root-149",
+    turnOutcomePolicy: { actionExpected: true, immediateRecoveryAllowed: false, reason: "test" },
     metadata: {},
+  });
+  assert.deepEqual(leaderContextEnvelope.turnOutcomePolicy, {
+    actionExpected: true,
+    immediateRecoveryAllowed: false,
+    reason: "test",
   });
   const fullLeaderContext = await pluginModule.appendLeaderTeamContext(
     "Please inspect the team.",
@@ -939,10 +957,81 @@ try {
     },
   }, toolCalls), {
     failed: true,
+    retryable: true,
+    succeeded: false,
     toolName: "team_send",
     toolCallId: "call-1",
     sourceRecordId: "tool-result-1",
   });
+  const retryableToolOutcome = pluginModule.sessionToolOutcome({
+    id: "tool-result-2",
+    message: {
+      role: "tool",
+      tool_call_id: "call-2",
+      name: "team_send",
+      content: [{ type: "text", text: JSON.stringify({ ok: false, retryable: true, code: "ambiguous_team_target", candidates: ["developer", "reviewer"] }) }],
+    },
+  }, new Map());
+  assert.equal(retryableToolOutcome.failed, true, "structured ok=false is a failed tool call even when OpenClaw did not set isError");
+  assert.equal(retryableToolOutcome.retryable, true);
+  assert.equal(retryableToolOutcome.code, "ambiguous_team_target");
+  assert.deepEqual(retryableToolOutcome.candidates, ["developer", "reviewer"]);
+  const correctedEvidence = await pluginModule.readHookToolEvidenceFromDispatch({ redisTeamHookEvidence: { toolEvents: [
+    { phase: "before", toolName: "team_send", toolCallId: "send-corrected", occurredAtMs: Date.now() },
+    { phase: "after", toolName: "team_send", toolCallId: "send-corrected", ok: true, occurredAtMs: Date.now() },
+  ] } });
+  assert.equal(correctedEvidence.lastToolOutcome.failed, false);
+  assert.equal(correctedEvidence.lastToolOutcome.callId, "send-corrected");
+  const retryableObservation = pluginModule.observeTeamTurnOutcome({
+    envelope: {
+      requiresCompletion: false,
+      intent: "member_result_confirmed",
+      turnOutcomePolicy: { actionExpected: true, immediateRecoveryAllowed: true },
+    },
+    activeResult: {},
+    durableFacts: { available: true, completionProposed: false },
+    toolEvidence: { source: "dispatch_session", retryableTeamToolGap: retryableToolOutcome },
+    contextOnly: true,
+  });
+  assert.equal(retryableObservation.outcome, "retryable_tool_gap");
+  assert.equal(retryableObservation.immediateRecoveryEligible, true);
+  const conflictingObservation = pluginModule.observeTeamTurnOutcome({
+    envelope: { requiresCompletion: false, intent: "member_result_confirmed" },
+    activeResult: { completionPending: true },
+    durableFacts: { available: true, completionProposed: true },
+    toolEvidence: { source: "dispatch_session", retryableTeamToolGap: retryableToolOutcome },
+    contextOnly: true,
+  });
+  assert.equal(conflictingObservation.outcome, "runtime_observation_unknown", "conflicting facts must degrade instead of driving recovery");
+  assert.equal(conflictingObservation.immediateRecoveryEligible, false);
+  const ordinaryContextObservation = pluginModule.observeTeamTurnOutcome({
+    envelope: { requiresCompletion: false, intent: "context" },
+    activeResult: {},
+    durableFacts: { available: true, completionProposed: false },
+    toolEvidence: { source: "dispatch_session", retryableTeamToolGap: null },
+    contextOnly: true,
+  });
+  assert.equal(ordinaryContextObservation.outcome, "ordinary_open_turn");
+  assert.equal(ordinaryContextObservation.immediateRecoveryEligible, false, "ordinary context must never create a reminder loop");
+  const handoffObservation = pluginModule.observeTeamTurnOutcome({
+    envelope: { requiresCompletion: false, intent: "member_result_confirmed" },
+    activeResult: { outbound: { message: { to: "reviewer", businessMutation: true, businessDeliveryKind: "assignment" } } },
+    durableFacts: { available: true, completionProposed: false },
+    toolEvidence: { source: "dispatch_session", retryableTeamToolGap: null },
+    contextOnly: true,
+  });
+  assert.equal(handoffObservation.outcome, "legitimate_wait");
+  assert.equal(handoffObservation.immediateRecoveryEligible, false, "a successful handoff must not be nudged again");
+  const workerReturnObservation = pluginModule.observeTeamTurnOutcome({
+    envelope: { requiresCompletion: true },
+    activeResult: { outbound: { message: { to: "leader", businessMutation: false, businessDeliveryKind: "peer_request" } } },
+    durableFacts: { available: true, completionProposed: false },
+    toolEvidence: { source: "dispatch_session", retryableTeamToolGap: null },
+    memberRouting: { workerToLeader: true, leaderCoordination: false },
+  });
+  assert.equal(workerReturnObservation.outcome, "completion_receipt_gap", "a Worker return to Leader is not downstream delegation");
+  assert.equal(workerReturnObservation.downstreamAssignmentStarted, false);
+  assert.equal(workerReturnObservation.hadOutboundAssignment, true, "transport evidence remains available for compatibility auditing");
   const incompleteAttempt = pluginModule.assignmentAttemptFailedEvent({ taskId: "team-75-task-150" });
   assert.equal(incompleteAttempt.eventKind, "assignment_attempt_failed");
   assert.equal(incompleteAttempt.stateEffect, "none");
@@ -1003,6 +1092,29 @@ try {
   );
   assert.equal(controlTarget.route, "control");
   assert.equal(controlTarget.completion, false);
+	const decoratedLeaderTarget = await pluginModule.resolveRedisTeamTarget(
+		{ teamId: "75", memberId: "developer", sharedDir: shared },
+		"user:leader",
+	);
+	assert.equal(decoratedLeaderTarget.route, "member");
+	assert.equal(decoratedLeaderTarget.to, "leader", "decorated identity is resolved from roster information, not a prefix table");
+	const wrappedDeveloperTarget = await pluginModule.resolveRedisTeamTarget(
+		{ teamId: "75", memberId: "leader", sharedDir: shared },
+		"recipient=[developer]",
+	);
+	assert.equal(wrappedDeveloperTarget.to, "developer");
+	const ambiguousRosterTarget = await pluginModule.resolveRedisTeamTarget(
+		{ teamId: "75", memberId: "leader", sharedDir: shared },
+		"ask developer, then report to leader",
+	);
+	assert.equal(ambiguousRosterTarget.route, "unknown");
+	assert.deepEqual(ambiguousRosterTarget.targetCandidates.sort(), ["developer", "leader"]);
+	const typoRosterTarget = await pluginModule.resolveRedisTeamTarget(
+		{ teamId: "75", memberId: "developer", sharedDir: shared },
+		"leadr",
+	);
+	assert.equal(typoRosterTarget.route, "unknown", "a fuzzy suggestion must never silently route a Team message");
+	assert.deepEqual(typoRosterTarget.targetSuggestions, ["leader"]);
   await seedActive("leader", "leader", "leader-final-synthesis");
   const leaderTools = createHarness("leader", "leader");
 	const missingTargetResult = toolResult(await leaderTools.get("team_send").execute("missing-target", {
@@ -1199,7 +1311,7 @@ try {
 	assert.equal(new URL(preview.artifact.previewUrl).port, "3128", "interactive previews bootstrap through the resolvable managed proxy");
   assert.equal(new URL(preview.artifact.previewUrl).search, "", "preview links must not carry an expiry");
   process.env.CLAWMANAGER_TEAM_PREVIEW_ORIGIN = "http://clawmanager-team-preview.invalid";
-  const legacyPreviewUrl = pluginModule.previewUrlForTeamArtifact(
+  const legacyPreviewUrl = await pluginModule.previewUrlForTeamArtifact(
     { teamId: "75", sharedDir: shared },
     path.join(shared, "notes.txt"),
   );
@@ -1210,7 +1322,7 @@ try {
   );
   assert.equal(new URL(legacyPreviewUrl.url).port, "3128");
   process.env.CLAWMANAGER_TEAM_PREVIEW_ORIGIN = "http://attacker.example";
-  assert.throws(
+  await assert.rejects(
     () => pluginModule.previewUrlForTeamArtifact(
       { teamId: "75", sharedDir: shared },
       path.join(shared, "index.html"),
@@ -1550,6 +1662,42 @@ try {
   assert.equal(monotonicEvidence.managedPreviewInspected, undefined);
 
 	const freshStatusAt = new Date().toISOString();
+	const activeRecoveryDecision = pluginModule.decideBusinessDelivery({
+		roster: {
+			members: [
+				{ memberId: "leader", aliases: ["leader"], isLeader: true },
+				{ memberId: "developer", aliases: ["developer"], isLeader: false },
+			],
+			raw: { communicationMode: "leader_mediated" },
+		},
+		message: {
+			from: "leader",
+			to: "developer",
+			rootTaskId: "team-75-task-150",
+			assignmentId: "dev-01",
+			workId: "dev-01",
+			intent: "send",
+		},
+		sourceEnvelope: { from: "clawmanager", intent: "assignment_recovery_request", assignmentId: "dev-01" },
+		workflowState: {
+			assignments: {
+				"dev-01": { assignmentId: "dev-01", ownerMemberKey: "developer", revision: 1, status: "failed", nextRevisionAllowed: true, nextRevision: 2 },
+			},
+		},
+		targetStatus: {
+			runtimeStatus: "awaiting_completion_receipt",
+			availability: "busy",
+			lastSeenAt: freshStatusAt,
+			currentTaskId: "team-75-task-150",
+			currentAssignmentId: "dev-01",
+			currentRevision: 1,
+		},
+		explicitWorkId: false,
+		recentTargetDispatch: null,
+	});
+	assert.equal(activeRecoveryDecision.kind, "context");
+	assert.equal(activeRecoveryDecision.reason, "runtime_attempt_still_active");
+	assert.equal(activeRecoveryDecision.revision, 1, "a transport/projection conflict must stay on the live attempt instead of manufacturing r2");
 	assert.equal(pluginModule.equivalentActiveAssignment({
 		runtimeStatus: "running",
 		availability: "busy",
@@ -1565,7 +1713,7 @@ try {
 		revision: 3,
 		validationTargetAssignmentId: "dev-01",
 		validationTargetRevision: 2,
-	}), true, "a newer duplicate request must not replace a healthy equivalent validation attempt");
+	}), false, "a different requested revision is not the same active attempt and must reach business-delivery reconciliation");
 	assert.equal(pluginModule.equivalentActiveAssignment({
 		runtimeStatus: "running",
 		availability: "busy",

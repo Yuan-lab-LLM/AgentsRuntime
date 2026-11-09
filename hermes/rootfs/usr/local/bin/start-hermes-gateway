@@ -88,21 +88,6 @@ has_scheduled_tasks_env() {
     return 1
 }
 
-is_hermes_pro_desktop() {
-    runtime="$(printf '%s' "${CLAWMANAGER_RUNTIME_TYPE:-}" | tr '[:upper:]' '[:lower:]')"
-    agent_rt="$(printf '%s' "${CLAWMANAGER_AGENT_RUNTIME_TYPE:-}" | tr '[:upper:]' '[:lower:]')"
-    case "${runtime}" in
-        desktop) return 0 ;;
-    esac
-    # Dedicated Pro containers set agent runtime to hermes without Runtime Pod tokens.
-    if [ "${agent_rt}" = "hermes" ] &&
-        [ -z "${RUNTIME_AGENT_CONTROL_TOKEN:-}" ] &&
-        [ -z "${RUNTIME_AGENT_REPORT_TOKEN:-}" ]; then
-        return 0
-    fi
-    return 1
-}
-
 ensure_default_gateway_profile() {
     if hermes profile list 2>/dev/null | grep -Eq '(^|[[:space:]◆*])default([[:space:]]|$)'; then
         return 0
@@ -123,14 +108,14 @@ case "${gateway_mode}" in
         ;;
     *)
         if has_runtime_channel_env || has_redis_team_env || has_gateway_env_file ||
-            has_scheduled_tasks_env || is_hermes_pro_desktop; then
+            has_scheduled_tasks_env; then
             should_start_gateway=true
         fi
         ;;
 esac
 
 if [ "${should_start_gateway}" != "true" ]; then
-    echo "Hermes gateway disabled; no channel/scheduled-task/Pro configuration detected"
+    echo "Hermes gateway disabled; no channel, Team, or scheduled-task configuration detected"
     exec sleep infinity
 fi
 

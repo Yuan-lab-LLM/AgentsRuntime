@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/iamlovingit/clawmanager-agent/internal/heartbeat"
 )
 
 type Agent struct {
@@ -60,7 +62,7 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	a.tryInitialReports(ctx)
 
-	heartbeatTimer := time.NewTimer(1 * time.Second)
+	heartbeatTimer := time.NewTimer(heartbeat.NextDelay(a.cfg.HeartbeatEvery))
 	commandTimer := time.NewTimer(2 * time.Second)
 	stateTimer := time.NewTimer(8 * time.Second)
 	skillTimer := time.NewTimer(15 * time.Second)
@@ -81,7 +83,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			if pending {
 				go a.processNextCommand(context.WithoutCancel(ctx))
 			}
-			heartbeatTimer.Reset(a.cfg.HeartbeatEvery)
+			heartbeatTimer.Reset(heartbeat.NextDelay(a.cfg.HeartbeatEvery))
 		case <-commandTimer.C:
 			go a.processNextCommand(context.WithoutCancel(ctx))
 			commandTimer.Reset(a.cfg.CommandPollEvery)
@@ -357,6 +359,36 @@ func (a *Agent) executeCommand(ctx context.Context, cmd *Command) (map[string]an
 			return nil, err
 		}
 		return map[string]any{"message": "skill inventory refreshed", "skill_count": len(skills)}, nil
+	case "install_skill", "update_skill":
+		skillVersion := firstPayloadString(cmd.Payload, "skill_version", "skill_version_id")
+		if skillVersion == "" {
+			return nil, errors.New("skill_version is required")
+		}
+		var archive []byte
+		if err := a.withSession(ctx, func(token string) error {
+			var downloadErr error
+			archive, downloadErr = a.client.downloadSkill(ctx, token, skillVersion)
+			return downloadErr
+		}); err != nil {
+			return nil, err
+		}
+		result, err := InstallSkillArchive(a.cfg.SkillInstallDir, cmd.Payload, archive)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := a.syncSkillInventory(ctx, "incremental", cmd.Type); err != nil {
+			return nil, err
+		}
+		return result, nil
+	case "uninstall_skill", "remove_skill":
+		result, err := UninstallSkill(a.cfg.SkillInstallDir, cmd.Payload)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := a.syncSkillInventory(ctx, "incremental", cmd.Type); err != nil {
+			return nil, err
+		}
+		return result, nil
 	case "collect_skill_package":
 		skill, err := a.findCommandSkill(ctx, cmd)
 		if err != nil {

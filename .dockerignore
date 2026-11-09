@@ -7,4 +7,6 @@
 !plugins/openclaw-redis-team/dist/
 !plugins/openclaw-redis-team/dist/**
 **/coverage
+**/__pycache__
+**/*.pyc
 .tmp/

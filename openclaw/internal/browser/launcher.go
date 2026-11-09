@@ -1,5 +1,5 @@
-// Package browser is responsible for opening the OpenClaw control UI in
-// the user-facing Chromium browser as soon as the Wayland session is ready.
+// Package browser is responsible for opening the configured runtime UI in the
+// user-facing Chromium browser as soon as the Wayland session is ready.
 //
 // The linuxserver/webtop:ubuntu-kde image launches `plasmashell` directly
 // without `ksmserver` (or a systemd user session that would host the
@@ -82,7 +82,7 @@ func waitForWaylandSocket(ctx context.Context, cfg appconfig.Config) error {
 }
 
 func browserLaunchURL(ctx context.Context, cfg appconfig.Config) string {
-	waitURL := openClawWaitURL(cfg)
+	waitURL := runtimeWaitURL(cfg)
 	if waitURL == "" {
 		return cfg.BrowserURL
 	}
@@ -125,7 +125,7 @@ func waitForAgentHTTP(ctx context.Context, waitURL string) error {
 	}
 }
 
-func openClawWaitURL(cfg appconfig.Config) string {
+func runtimeWaitURL(cfg appconfig.Config) string {
 	if cfg.LocalHTTPBind == "" || cfg.BrowserURL == "" {
 		return ""
 	}
@@ -137,7 +137,7 @@ func openClawWaitURL(cfg appconfig.Config) string {
 			host = parsedHost
 		}
 	}
-	return "http://" + net.JoinHostPort(host, port) + "/openclaw-wait?target=" + url.QueryEscape(cfg.BrowserURL)
+	return "http://" + net.JoinHostPort(host, port) + "/runtime-wait?target=" + url.QueryEscape(cfg.BrowserURL)
 }
 
 func spawnBrowser(ctx context.Context, cfg appconfig.Config, launchURL string) error {

@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Pro desktop helper: bind localhost only (portal goes through Webtop 3001).
+export HOST="${HOST:-127.0.0.1}"
+export PORT="${OPENCODE_WEB_PORT:-${PORT:-4096}}"
+export CLAWMANAGER_GATEWAY_PORT="${CLAWMANAGER_GATEWAY_PORT:-${PORT}}"
+# Init-container exports do not propagate to this service. Match the browser's
+# selected project explicitly, including the first-boot default.
+export CLAWMANAGER_WORKSPACE_PATH="${CLAWMANAGER_WORKSPACE_PATH:-${CLAWMANAGER_PROJECT_PATH:-/config/workspace}}"
+export CLAWMANAGER_DEFAULT_PROJECT_PATH="${CLAWMANAGER_DEFAULT_PROJECT_PATH:-${CLAWMANAGER_WORKSPACE_PATH%/}/project}"
+export HOME="${HOME:-/config}"
+export OPENCODE_CONFIG_DIR="${OPENCODE_CONFIG_DIR:-/config/.opencode}"
+mkdir -p "${OPENCODE_CONFIG_DIR}"
+if [ -z "${OPENCODE_CONFIG:-}" ] && [ -f "${OPENCODE_CONFIG_DIR}/opencode.json" ]; then
+  export OPENCODE_CONFIG="${OPENCODE_CONFIG_DIR}/opencode.json"
+fi
+
+# V2 always requires authentication. Keep a stable managed password instead
+# of allowing serve to generate an unknown password. The launcher obtains a
+# native browser session token so the desktop does not show a login prompt.
+export OPENCODE_PASSWORD="${OPENCODE_PASSWORD:-${OPENCODE_SERVER_PASSWORD:-${CLAWMANAGER_INSTANCE_TOKEN:-}}}"
+if [ -z "${OPENCODE_PASSWORD}" ]; then
+  echo "OpenCode Pro v2 requires managed server credentials" >&2
+  exit 64
+fi
+export OPENCODE_SERVER_PASSWORD="${OPENCODE_PASSWORD}"
+export OPENCODE_SERVER_USERNAME=opencode
+
+# The desktop launcher resolves or creates the native v2 project session.
+exec /usr/local/bin/start-opencode-web

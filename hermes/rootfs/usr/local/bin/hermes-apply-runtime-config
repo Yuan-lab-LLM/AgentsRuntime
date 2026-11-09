@@ -6,6 +6,15 @@ export HERMES_HOME="${HERMES_HOME:-/config/.hermes}"
 
 mkdir -p "${HERMES_HOME}"
 
+if [ -z "${CLAWMANAGER_LLM_RESOLVED_CONFIG_JSON:-}" ]; then
+    resolved_llm_config="$(
+        /usr/local/bin/clawmanager-agent llm-config \
+            --format canonical \
+            --fallback-provider clawmanager
+    )"
+    export CLAWMANAGER_LLM_RESOLVED_CONFIG_JSON="${resolved_llm_config}"
+fi
+
 python_bin="/usr/local/lib/hermes-agent/venv/bin/python"
 if [ ! -x "${python_bin}" ]; then
     python_bin="$(command -v python3 || command -v python)"
@@ -1701,6 +1710,35 @@ def apply_redis_team_config(hermes_home, data):
     platforms_cfg["redis_team"] = redis_team_cfg
     data["platforms"] = platforms_cfg
 
+    # The isolated Team gateway is leader-mediated by ClawManager. Give it the
+    # execution tools a Worker needs, but do not expose competing orchestration
+    # systems (Todo/Kanban/Delegation/Messaging) that create redundant model
+    # iterations and bypass the Team assignment ledger.
+    platform_toolsets = data.get("platform_toolsets")
+    if not isinstance(platform_toolsets, dict):
+        platform_toolsets = {}
+    platform_toolsets["redis_team"] = [
+        "redis_team",
+        "file",
+        "terminal",
+        "code_execution",
+        "web",
+        "browser",
+        "vision",
+        "no_mcp",
+    ]
+    data["platform_toolsets"] = platform_toolsets
+
+    if truthy_env("CLAWMANAGER_HERMES_TEAM_WORKER_PROFILE"):
+        agent_cfg = data.get("agent")
+        if not isinstance(agent_cfg, dict):
+            agent_cfg = {}
+        disabled_toolsets = agent_cfg.get("disabled_toolsets")
+        if not isinstance(disabled_toolsets, list):
+            disabled_toolsets = []
+        agent_cfg["disabled_toolsets"] = unique_nonempty([*disabled_toolsets, "kanban"])
+        data["agent"] = agent_cfg
+
     persist_bootstrap_payload(hermes_home, "redis-team", record)
     return record
 
@@ -1796,14 +1834,22 @@ hermes_home = Path(os.environ.get("HERMES_HOME", "/config/.hermes"))
 config_path = hermes_home / "config.yaml"
 env_path = hermes_home / ".env"
 
+resolved_llm = json.loads(os.environ.get("CLAWMANAGER_LLM_RESOLVED_CONFIG_JSON", "{}"))
+resolved_model_ids = resolved_llm.get("model_ids")
+if not isinstance(resolved_model_ids, list):
+    resolved_model_ids = []
+resolved_model_ids = unique_nonempty(resolved_model_ids)
+resolved_models_qualified = bool(resolved_llm.get("models_qualified"))
+resolved_model_src = str(resolved_llm.get("model_source") or "").strip()
+resolved_base_url = str(resolved_llm.get("base_url") or "").strip()
+resolved_api_key_src = str(resolved_llm.get("api_key_env") or "").strip()
+
 model_src, model_value = first_env(
     "CLAWMANAGER_LLM_MODELS",
-    "CLAWMANAGER_LLM_MODEL",
     "CLAWMANAGER_MODELS",
     "CLAWMANAGER_MODEL",
     "HERMES_MODELS",
     "HERMES_MODEL",
-    "OPENAI_MODEL",
     "LLM_MODELS",
     "LLM_MODEL",
     "MODEL_NAME",
@@ -1822,37 +1868,62 @@ provider_src, provider = first_env(
     "LLM_PROVIDER",
     "MODEL_PROVIDER",
 )
-base_src, base_url = first_env(
-    "CLAWMANAGER_LLM_BASE_URL",
+runtime_base_src, runtime_base_url = first_env(
     "CLAWMANAGER_LLM_API_BASE_URL",
     "CLAWMANAGER_LLM_OPENAI_BASE_URL",
     "CLAWMANAGER_OPENAI_BASE_URL",
-    "OPENAI_BASE_URL",
-    "OPENAI_API_BASE",
     "LLM_BASE_URL",
     "API_BASE_URL",
 )
-key_src, api_key = first_env(
-    "CLAWMANAGER_LLM_API_KEY",
+if resolved_base_url:
+    base_src, base_url = "clawmanager-agent", resolved_base_url
+else:
+    base_src, base_url = runtime_base_src, runtime_base_url
+
+runtime_key_src, runtime_api_key = first_env(
     "CLAWMANAGER_LLM_TOKEN",
     "CLAWMANAGER_LLM_OPENAI_API_KEY",
     "CLAWMANAGER_OPENAI_API_KEY",
-    "OPENAI_API_KEY",
     "LLM_API_KEY",
     "API_KEY",
 )
+resolved_api_key = os.environ.get(resolved_api_key_src, "").strip() if resolved_api_key_src else ""
+if resolved_api_key:
+    key_src, api_key = resolved_api_key_src, resolved_api_key
+else:
+    key_src, api_key = runtime_key_src, runtime_api_key
 mode_src, api_mode = first_env(
     "CLAWMANAGER_LLM_API_MODE",
     "HERMES_MODEL_API_MODE",
     "HERMES_API_MODE",
 )
 
-has_llm_config = any([model_value, default_model_value, provider, base_url, api_key, api_mode])
+qualified_provider_models = {}
+if resolved_models_qualified:
+    for group in resolved_llm.get("providers") or []:
+        if not isinstance(group, dict):
+            continue
+        provider_id = str(group.get("provider_id") or "").strip()
+        model_ids = unique_nonempty(group.get("model_ids") or [])
+        if provider_id and model_ids:
+            qualified_provider_models[provider_id] = model_ids
 
-models = parse_models(model_value) if model_value else []
-default_models = parse_models(default_model_value) if default_model_value else []
-default_model = default_models[0] if default_models else (models[0] if models else "")
-provider = normalize_provider(provider, base_url) if has_llm_config else ""
+has_qualified_models = bool(qualified_provider_models)
+has_llm_config = any([resolved_model_ids, model_value, default_model_value, provider, base_url, api_key, api_mode])
+
+if has_qualified_models:
+    provider = next(iter(qualified_provider_models))
+    models = [model_id for values in qualified_provider_models.values() for model_id in values]
+    default_model = qualified_provider_models[provider][0]
+    model_src = resolved_model_src
+    provider_src = resolved_model_src
+else:
+    models = parse_models(model_value) if model_value else resolved_model_ids
+    if not model_src:
+        model_src = resolved_model_src
+    default_models = parse_models(default_model_value) if default_model_value else []
+    default_model = default_models[0] if default_models else (models[0] if models else "")
+    provider = normalize_provider(provider, base_url) if has_llm_config else ""
 base_url = base_url.rstrip("/") if base_url else ""
 
 if config_path.exists():
@@ -1871,69 +1942,109 @@ elif not isinstance(model_cfg, dict):
     model_cfg = {}
 
 if has_llm_config:
-    if provider == "custom" and base_url:
-        provider_key = os.environ.get("CLAWMANAGER_LLM_PROVIDER_ID", "").strip()
-        provider_key = provider_key or os.environ.get("HERMES_CUSTOM_PROVIDER_ID", "").strip()
-        provider_key = provider_key or "clawmanager"
-
-    if default_model:
+    if has_qualified_models:
         model_cfg["default"] = default_model
-    if provider_key:
-        model_cfg["provider"] = provider_key
+        model_cfg["provider"] = provider
         model_cfg.pop("base_url", None)
         model_cfg.pop("api_key", None)
-    elif provider:
-        model_cfg["provider"] = provider
-        if base_url:
-            model_cfg["base_url"] = base_url
+        providers_cfg = {}
+        for provider_id, model_ids in qualified_provider_models.items():
+            provider_entry = {
+                "name": provider_id,
+                "base_url": base_url,
+                "default_model": model_ids[0],
+                "transport": "openai_chat",
+                "models": {model_id: {} for model_id in model_ids},
+            }
+            if api_mode:
+                provider_entry["api_mode"] = api_mode
+            else:
+                provider_entry["api_mode"] = "chat_completions"
+            if api_key:
+                provider_entry["key_env"] = "OPENAI_API_KEY"
+            providers_cfg[provider_id] = provider_entry
+        data["providers"] = providers_cfg
+    else:
+        if provider == "custom" and base_url:
+            provider_key = os.environ.get("CLAWMANAGER_LLM_PROVIDER_ID", "").strip()
+            provider_key = provider_key or os.environ.get("HERMES_CUSTOM_PROVIDER_ID", "").strip()
+            provider_key = provider_key or "clawmanager"
+
+        if default_model:
+            model_cfg["default"] = default_model
+        if provider_key:
+            model_cfg["provider"] = provider_key
+            model_cfg.pop("base_url", None)
+            model_cfg.pop("api_key", None)
+        elif provider:
+            model_cfg["provider"] = provider
+            if base_url:
+                model_cfg["base_url"] = base_url
+
+        if provider_key:
+            providers_cfg = data.get("providers")
+            if not isinstance(providers_cfg, dict):
+                providers_cfg = {}
+            provider_entry = providers_cfg.get(provider_key)
+            if not isinstance(provider_entry, dict):
+                provider_entry = {}
+
+            provider_name = (
+                os.environ.get("CLAWMANAGER_LLM_PROVIDER_NAME", "").strip()
+                or provider_entry.get("name")
+                or "ClawManager"
+            )
+            provider_entry["name"] = provider_name
+            provider_entry["base_url"] = base_url
+            provider_entry["default_model"] = default_model
+            provider_entry["transport"] = "openai_chat"
+            if api_mode:
+                provider_entry["api_mode"] = api_mode
+            elif provider_entry.get("api_mode") not in {
+                "chat_completions",
+                "codex_responses",
+                "anthropic_messages",
+                "bedrock_converse",
+            }:
+                provider_entry["api_mode"] = "chat_completions"
+            if api_key:
+                provider_entry["key_env"] = "OPENAI_API_KEY"
+
+            provider_models = provider_entry.get("models")
+            if not isinstance(provider_models, dict):
+                provider_models = {}
+            for model_name in models:
+                existing = provider_models.get(model_name)
+                provider_models[model_name] = existing if isinstance(existing, dict) else {}
+            provider_entry["models"] = provider_models
+
+            providers_cfg[provider_key] = provider_entry
+            if provider_key == "clawmanager":
+                custom_entry = dict(provider_entry)
+                custom_entry["name"] = "custom"
+                providers_cfg["custom"] = custom_entry
+            data["providers"] = providers_cfg
+
     if api_mode:
         model_cfg["api_mode"] = api_mode
 
-    if provider_key:
-        providers_cfg = data.get("providers")
-        if not isinstance(providers_cfg, dict):
-            providers_cfg = {}
-        provider_entry = providers_cfg.get(provider_key)
-        if not isinstance(provider_entry, dict):
-            provider_entry = {}
-
-        provider_name = (
-            os.environ.get("CLAWMANAGER_LLM_PROVIDER_NAME", "").strip()
-            or provider_entry.get("name")
-            or "ClawManager"
-        )
-        provider_entry["name"] = provider_name
-        provider_entry["base_url"] = base_url
-        provider_entry["default_model"] = default_model
-        provider_entry["transport"] = "openai_chat"
-        if api_mode:
-            provider_entry["api_mode"] = api_mode
-        elif provider_entry.get("api_mode") not in {
-            "chat_completions",
-            "codex_responses",
-            "anthropic_messages",
-            "bedrock_converse",
-        }:
-            provider_entry["api_mode"] = "chat_completions"
-        if api_key:
-            provider_entry["key_env"] = "OPENAI_API_KEY"
-
-        provider_models = provider_entry.get("models")
-        if not isinstance(provider_models, dict):
-            provider_models = {}
-        for model_name in models:
-            existing = provider_models.get(model_name)
-            provider_models[model_name] = existing if isinstance(existing, dict) else {}
-        provider_entry["models"] = provider_models
-
-        providers_cfg[provider_key] = provider_entry
-        if provider_key == "clawmanager":
-            custom_entry = dict(provider_entry)
-            custom_entry["name"] = "custom"
-            providers_cfg["custom"] = custom_entry
-        data["providers"] = providers_cfg
-
     data["model"] = model_cfg
+
+# Managed image analysis must use the same owner-authenticated Gateway.
+if "CLAWMANAGER_LLM_VISION" in os.environ:
+    vision_flags = json.loads(os.environ["CLAWMANAGER_LLM_VISION"])
+    if not isinstance(vision_flags, dict) or any(type(v) is not bool for v in vision_flags.values()):
+        raise ValueError("invalid CLAWMANAGER_LLM_VISION")
+    if not base_url or not api_key:
+        raise ValueError("managed vision requires Gateway URL and token")
+    auxiliary = data.setdefault("auxiliary", {})
+    if not isinstance(auxiliary, dict):
+        raise ValueError("auxiliary must be an object")
+    vision = auxiliary.setdefault("vision", {})
+    if not isinstance(vision, dict):
+        raise ValueError("auxiliary.vision must be an object")
+    vision.update(provider="custom", model="auto", base_url=base_url,
+                  api_key="", api_mode="chat_completions", extra_body={})
 
 skill_sources = apply_skill_config(data, hermes_home)
 messaging_env_updates, messaging_sources, configured_platforms, gateway_written, channel_error = apply_messaging_config(

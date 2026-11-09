@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+consent=false
+for argument in "$@"; do
+  if [ "$argument" = "--accept-capabilities" ]; then
+    consent=true
+    break
+  fi
+done
+
+if [ "$consent" != "true" ]; then
+  echo "refusing OpenClaw plugin install without explicit capability consent" >&2
+  exit 64
+fi
+
+exec openclaw plugins install "$@"

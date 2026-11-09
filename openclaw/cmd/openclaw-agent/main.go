@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/iamlovingit/clawmanager-openclaw-image/internal/bootstrap"
@@ -18,6 +19,14 @@ import (
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	// The shared Agent owns all member Gateway lifecycles in a Lite pool.
+	// Match its service activation contract before Desktop bootstrap touches
+	// /config or starts a second, unrelated default Gateway.
+	if sharedRuntimeAgentEnabled() {
+		log.Print("Shared Runtime Agent owns Gateway lifecycle; Desktop service is inactive")
+		<-ctx.Done()
+		return
+	}
 
 	cfg, err := appconfig.Load()
 	if err != nil {
@@ -49,6 +58,11 @@ func main() {
 	if err := s.Run(ctx); err != nil {
 		log.Fatalf("run supervisor: %v", err)
 	}
+}
+
+func sharedRuntimeAgentEnabled() bool {
+	return strings.TrimSpace(os.Getenv("RUNTIME_AGENT_CONTROL_TOKEN")) != "" ||
+		strings.TrimSpace(os.Getenv("RUNTIME_AGENT_REPORT_TOKEN")) != ""
 }
 
 func normalizeRuntimeConfig(cfg appconfig.Config) error {

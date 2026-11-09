@@ -19,6 +19,44 @@
       "team_artifact_mkdir"
     ]
   },
+  "channelConfigs": {
+    "redis-team": {
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": false },
+          "accounts": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean", "default": false },
+                "redisUrl": { "type": "string" },
+                "teamId": { "type": "string" },
+                "memberId": { "type": "string" },
+                "role": { "type": "string", "default": "member" },
+                "sharedDir": { "type": "string", "default": "/team" },
+                "autoRun": { "type": "boolean", "default": true },
+                "consumerGroup": { "type": "string", "default": "team-members" },
+                "inboxKey": { "type": "string" },
+                "eventsKey": { "type": "string" },
+                "presenceKey": { "type": "string" },
+                "dlqKey": { "type": "string" },
+                "embeddedTimeoutSeconds": { "type": "number", "minimum": 1, "default": 1800 },
+                "fromEnv": { "type": "boolean", "default": true },
+                "managerUrl": { "type": "string" }
+              }
+            }
+          }
+        }
+      },
+      "label": "Redis Team",
+      "description": "ClawManager Redis Streams Team channel."
+    }
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

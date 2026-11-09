@@ -1,0 +1,8 @@
+# Preserve the accepted OpenClaw core/Agent/managed proxy and update only the
+# installed Team plugin. No upstream download or unrelated runtime migration.
+ARG BASE_IMAGE=10.130.14.23:5000/agentsruntime/openclaw-lite:team-idle-access-20261008-v1
+FROM ${BASE_IMAGE}
+COPY --chown=abc:abc plugins/openclaw-redis-team/dist/index.js /defaults/.openclaw/extensions/redis-team/dist/index.js
+RUN node --check /defaults/.openclaw/extensions/redis-team/dist/index.js \
+    && node /usr/local/share/openclaw/patches/test_redis_team_plugin_hooks.mjs
+LABEL io.clawmanager.team.execution="single-member-v1"

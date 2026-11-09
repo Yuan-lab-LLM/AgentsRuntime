@@ -1,0 +1,44 @@
+#!/usr/bin/with-contenv bash
+set -euo pipefail
+
+if [ -n "${RUNTIME_AGENT_CONTROL_TOKEN:-}" ] || [ -n "${RUNTIME_AGENT_REPORT_TOKEN:-}" ]; then
+  runtime_agent_data_dir="${RUNTIME_AGENT_DATA_DIR:-/var/lib/clawmanager-agent}"
+  mkdir -p "${runtime_agent_data_dir}"
+  exec /usr/local/bin/clawmanager-agent
+fi
+
+if [ "${CLAWMANAGER_AGENT_ENABLED:-false}" != "true" ]; then
+  echo "ClawManager OpenCode instance agent disabled"
+  exec sleep infinity
+fi
+
+export HOME="${HOME:-/config}"
+export OPENCODE_CONFIG_DIR="${OPENCODE_CONFIG_DIR:-/config/.opencode}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/config/.cache}"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-/config/.config}"
+export XDG_DATA_HOME="${XDG_DATA_HOME:-/config/.local/share}"
+
+mkdir -p \
+  "${CLAWMANAGER_AGENT_PERSISTENT_DIR:-/config}/opencode-agent" \
+  "${OPENCODE_CONFIG_DIR}" \
+  "${XDG_CACHE_HOME}" \
+  "${XDG_CONFIG_HOME}" \
+  "${XDG_DATA_HOME}"
+
+/usr/local/bin/opencode-apply-runtime-config || true
+
+# A Pro desktop runs OpenCode and its terminal as abc.  The agent launches
+# OpenCode Web as a child, so keeping this service as root leaves root-owned
+# logs in the persistent volume and blocks the terminal client on later use.
+if [ "${CLAWMANAGER_RUNTIME_TYPE:-}" = "desktop" ] && command -v s6-setuidgid >/dev/null 2>&1; then
+  chown -R abc:abc \
+    "${CLAWMANAGER_AGENT_PERSISTENT_DIR:-/config}/opencode-agent" \
+    "${OPENCODE_CONFIG_DIR}" \
+    "${XDG_CACHE_HOME}" \
+    "${XDG_CONFIG_HOME}" \
+    "${XDG_DATA_HOME}" \
+    2>/dev/null || true
+  exec s6-setuidgid abc /usr/local/bin/clawmanager-agent
+fi
+
+exec /usr/local/bin/clawmanager-agent

@@ -17,22 +17,24 @@
 
 镜像现在也内置了 **OpenClaw Agent** 服务。它会在容器内自动启动，负责向 ClawManager 注册、发送心跳、轮询命令、托管 OpenClaw 进程，并提供基于 Gin 的本地健康检查接口。
 
-**推荐优先使用 `Dockerfile.openclaw` 一键构建。** 若需在 WebTop 桌面内手动安装组件后再执行 `docker commit`，请见下文 **进阶：基础流程（手动 / docker commit）**。
+**发布镜像请在仓库根目录使用 `openclaw/Dockerfile.openclaw`。** 它通过[版本锁](openclaw102.lock.json)固定 OpenClaw **2026.10.2** 和 Node **24.21.0**，校验包完整性及实际安装版本。添加工具请参考下文的 **可复现的定制构建**。
 
 
 ## 项目概览
 
 在 ClawManager 批量管理场景下，逐台手动配置容器不可扩展。本项目提供：
 
-* **预装运行环境**：Node.js 与最新 OpenClaw CLI，开箱即用。
-* **Agent 驱动启动**：容器启动时，`openclaw-agent`（Go 实现）以 root 身份运行，从 `/defaults/.openclaw` 同步到 `/config/.openclaw`、规范化 channels、修正归属权，然后降权到 `abc` 再派生 OpenClaw 进程。
+* **锁定运行环境**：Node.js 24.21.0、OpenClaw 2026.10.2 及受管 Channel 版本，不使用无版本约束的 `openclaw@latest` 安装。
+* **Agent 驱动启动**：独立／Pro 模式下，`openclaw-agent`（Go 实现）准备 `/config/.openclaw`、规范化 channels 与文件归属，并以 `abc` 启动 OpenClaw。共享池 Lite 则使用分配给每个实例的 HOME 和 Linux 身份。
 * **动态注入**：用环境变量更新 `openclaw.json`，无需在桌面会话里手改文件。
 
 ---
 
 ## 快速开始（推荐）
 
-镜像基于 `lscr.io/linuxserver/webtop:ubuntu-xfce`：Dockerfile 会安装 Node.js 与全局 OpenClaw，写入 `/defaults/.openclaw`，并将 `openclaw-agent` 二进制安装为 s6 服务。每次容器启动时，agent 会完成所有 bootstrap 工作（defaults 同步、extensions 目录、XFCE autostart、配置规范化、channels 合并），然后降权到 `abc` 再派生 `openclaw gateway run`。运行时配置位于 **`/config/.openclaw`**，而非 `~/.openclaw`。启动后可在容器日志中查找 `openclaw-agent` 相关输出。
+标准镜像使用固定摘要的 `lscr.io/linuxserver/webtop:ubuntu-kde-version-cc2e18a4` 基础镜像，安装锁定的 Node.js／OpenClaw、准备 `/defaults/.openclaw` 并提供 Agent 服务。独立／Pro 模式配置位于 **`/config/.openclaw`**；共享池 Lite 使用 ClawManager 分配的每实例 HOME 与 workspace，不能让所有用户共用一份 `/config`。启动后核对 Agent 日志与实际实例健康。
+
+`openclaw` 与 `openclaw-lite` 都使用这一 Dockerfile。Team UI 和文件编辑来自配套的 ClawManager App，Runtime 适配器提供成员执行与交付协议；只更新镜像不会更新界面，也不能安全迁移已有数据。存量实例应使用 ClawManager 数据安全升级流程，并验收真实源版本到目标版本的迁移路径。`openclaw-shell` 是独立构建，不随此版本锁升级。
 
 ### 构建
 
@@ -97,18 +99,18 @@ agent 默认配置位于 `/etc/openclaw-agent/config.yaml`，初次启动时由 
 
 ## GitHub Actions 与 GHCR（可选）
 
-工作流 [`.github/workflows/docker-ghcr.yml`](.github/workflows/docker-ghcr.yml) 会在推送到默认分支（`main` / `master`）或推送 `v*` 标签时构建 `Dockerfile.openclaw`，并推送到 **GitHub Container Registry**，发布时无需在本地执行 `docker build`。
+工作流 [`.github/workflows/docker-ghcr.yml`](../.github/workflows/docker-ghcr.yml) 在匹配源码路径的更改合入 `main` 时，或在默认分支手动运行时构建。自动运行还要求 `main` 是仓库默认分支。推送开发分支、`v*` 标签或仅修改 README 不会触发发布；当前路径过滤也未包含 `plugins/**`，仅修改插件时需在合并后手动运行。
 
 **简要步骤**
 
-1. 将仓库推送到 GitHub，在 **Actions** 中确认 **Build and push to GHCR** 成功。
-2. 在 **Packages** 中查找镜像，地址一般为 `ghcr.io/<user>/<repo>`。
+1. 将源码合入 `main`，在 **Actions** 中确认 **Build and push runtime images** 的双架构构建及最终 manifest 发布均成功。
+2. 默认镜像地址是 `ghcr.io/<owner>/<repo>/openclaw` 和 `ghcr.io/<owner>/<repo>/openclaw-lite`，owner／repo 小写；自己的 fork 不会更新上游仓库的包。
 3. 私有包需先执行 `docker login ghcr.io`；若希望匿名 `docker pull`，请将 Package 设为 **Public**。
 
 **Bash**
 
 ```
-docker pull ghcr.io/<github_user>/<repo>:latest
+docker pull ghcr.io/<owner>/<repo>/openclaw:latest
 
 docker run -d \
   --name=webtop-openclaw \
@@ -120,52 +122,39 @@ docker run -d \
   -e CLAWMANAGER_LLM_MODEL=gpt-4o \
   -e CLAWMANAGER_OPENCLAW_CHANNELS_JSON='{"feishu":{"enabled":true,"accounts":{"main":{"appId":"cli_xxx","appSecret":"your-secret"}}}}' \
   -p 3000:3000 -p 3001:3001 \
-  ghcr.io/<github_user>/<repo>:latest
+  ghcr.io/<owner>/<repo>/openclaw:latest
 ```
 
-推送如 `v1.0.0` 等标签时，工作流还会按 metadata 规则发布语义化版本标签。
+成功发布后生成 `latest` 与按 Asia/Shanghai 日期命名的 `vYYYY.M.D` 标签。两者都可能移动；可复现部署应记录并使用已核对的 `@sha256` 摘要。即使 OpenClaw 版本都是 2026.10.2，新的 CI 构建也不一定与之前测试镜像的摘要相同。
+
+不启动 Gateway、不挂载用户数据即可核对镜像中安装的实际版本：
+
+```bash
+docker run --rm --network none --entrypoint node <image>@sha256:<verified-digest> \
+  -p 'require("/usr/local/lib/node_modules/openclaw/package.json").version'
+```
 
 ---
 
-## 进阶：基础流程（`docker commit`）
+## 可复现的定制构建
 
-仅在需要在保存镜像前于 WebTop 内安装额外工具时使用；与 `Dockerfile.openclaw` 二选一。
+从已验证摘要的 Runtime 镜像派生一个纳入版本管理的 Dockerfile，添加工具后重新构建并验收。不要安装浮动版本的 Node／OpenClaw，不要用 `docker commit` 打包用户 HOME 或凭据，也不要删除持久化状态来强制初始化。旧版交互安装／commit 方法不属于正式发布或迁移流程。
 
-### 安装软件
-
-在浏览器中打开 `https://<IP>:3001`，在终端中执行：
-
-**Bash**
-
-```
-curl -fsSL https://deb.nodesource.com/setup_current.x | sudo -E bash -
-sudo apt-get install -y nodejs
-
-npm config set registry https://registry.npmmirror.com
-sudo npm install -g openclaw@latest
+```dockerfile
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+# 在此添加明确版本的工具；保留 Runtime 与 Agent 服务。
 ```
 
-### 初始化脚本与清理
-
-1. **写入默认模板**：`cp -rp /config/.openclaw /defaults/`。
-2. **安装 agent**：将编译好的 `openclaw-agent` 二进制放到 `/usr/local/bin/`，并把 `scripts/openclaw-agent-run` / `openclaw-agent-finish` 放到 `/etc/services.d/openclaw-agent/`。agent 会在每次启动时完成 `/defaults` → `/config` 同步与环境变量写入。
-3. **保存镜像前清理**：`rm -rf /config/.openclaw`。若跳过此步，新容器可能无法按预期执行首次启动初始化。
-
-### 保存镜像
-
-**Bash**
-
-```
-docker commit webtop-running openclaw:v1.0
-```
+Overlay Dockerfile 只更新选定组件，核心版本由基础镜像决定。请按已核对的摘要选择基础镜像并重新执行相关兼容性测试；overlay 构建成功不代表已经升级 OpenClaw 到 10.2。
 
 ---
 
 ## 说明
 
-* **权限**：agent 会在降权前对 `/config/.openclaw` 与 `/config/.config/autostart` 执行 `chown -R abc:abc`，保证默认用户可读写持久化配置。
+* **权限**：保留 Agent 分配的文件归属与实例身份。独立／Pro 和共享池 Lite 的 HOME、UID 边界不同，不能把共享 Lite 工作区递归 chown 成 `abc`。
 * **Docker Compose**：将 `image` 指向您构建的标签，或在仓库根目录使用 `build`，设置 `context: .` 和 `dockerfile: openclaw/Dockerfile.openclaw`。不要仅依赖官方 `webtop` 镜像，其中不包含本仓库的模板与 agent 服务。
-* **单独使用 WebTop**：若不使用 ClawManager 批量能力，可跳过进阶流程中与 ClawManager 相关的步骤。
+* **单独使用 WebTop**：桌面启动成功不代表共享池 Lite 隔离、Team 交付或数据迁移已经通过验收，应分别验证托管模式。
 
 ---
 

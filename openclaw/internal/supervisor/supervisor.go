@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -69,7 +70,7 @@ func New(cfg appconfig.Config) (*Supervisor, error) {
 	configManager := configmanager.New(cfg, client, st)
 	skillManager := skills.New(cfg, client, st)
 	executor := command.New(client, proc, prof, configManager, skillManager, st)
-	httpServer := httpserver.New(cfg.LocalHTTPBind, proc, prof, inspector, st)
+	httpServer := httpserver.New(cfg, proc, prof, inspector, st)
 
 	return &Supervisor{
 		cfg:       cfg,
@@ -318,7 +319,7 @@ func optionalInt(value int) *int {
 }
 
 func defaultCapabilities() []string {
-	return []string{
+	capabilities := []string{
 		"runtime.status",
 		"runtime.health",
 		"metrics.report",
@@ -330,6 +331,25 @@ func defaultCapabilities() []string {
 		"process.management",
 		"local-debug-http",
 	}
+	if isOpenClaw81Runtime(os.Getenv("CLAWMANAGER_OPENCLAW_VERSION")) {
+		capabilities = append(capabilities,
+			"openclaw.state.sqlite",
+			"openclaw.automation.rpc",
+			"openclaw.backup.sqlite",
+			"openclaw.database.preflight",
+			"openclaw.plugin.capability-consent",
+		)
+	}
+	return capabilities
+}
+
+func isOpenClaw81Runtime(version string) bool {
+	version = strings.TrimSpace(strings.TrimPrefix(strings.ToLower(version), "v"))
+	var year, month, patch int
+	if _, err := fmt.Sscanf(version, "%d.%d.%d", &year, &month, &patch); err != nil {
+		return false
+	}
+	return year > 2026 || year == 2026 && (month > 8 || month == 8 && patch >= 1)
 }
 
 func runtimeProcessHealth(status process.Status) string {

@@ -1,9 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
 
-const expectedVersion = "2026.7.1-2";
+const expectedVersion = "2026.8.1";
 const packageRoot = process.env.OPENCLAW_PACKAGE_ROOT || "/usr/local/lib/node_modules/openclaw";
 const packageJson = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8"));
+if (packageJson.version === "2026.10.2") {
+  await import("./patch_browser_proxy_navigation_102.mjs");
+  process.exit(0);
+}
 if (packageJson.version !== expectedVersion) {
   throw new Error(`refusing to patch OpenClaw ${packageJson.version}; expected ${expectedVersion}`);
 }
@@ -16,9 +20,7 @@ function singleModule(pattern, needle, label) {
     .filter((name) => pattern.test(name))
     .map((name) => path.join(distDir, name))
     .filter((file) => fs.readFileSync(file, "utf8").includes(needle));
-  if (candidates.length !== 1) {
-    throw new Error(`expected one OpenClaw ${label} module, found ${candidates.length}`);
-  }
+  if (candidates.length !== 1) throw new Error(`expected one OpenClaw ${label} module, found ${candidates.length}`);
   return candidates[0];
 }
 
@@ -28,15 +30,15 @@ function replaceOnce(source, needle, replacement, label) {
   return source.replace(needle, replacement);
 }
 
-function replaceEvery(source, needle, replacement, label) {
+function replaceEvery(source, needle, replacement, label, expectedCount) {
   const occurrences = source.split(needle).length - 1;
-  if (occurrences < 1) throw new Error(`expected at least one ${label}, found ${occurrences}`);
+  if (occurrences !== expectedCount) throw new Error(`expected ${expectedCount} ${label}, found ${occurrences}`);
   return source.split(needle).join(replacement);
 }
 
-function verify(source, requirements, label) {
-  for (const required of requirements) {
-    if (!source.includes(required)) throw new Error(`${label} patch is incomplete: ${required}`);
+function requireAll(source, fragments, label) {
+  for (const fragment of fragments) {
+    if (!source.includes(fragment)) throw new Error(`${label} patch is incomplete: ${fragment}`);
   }
 }
 
@@ -46,137 +48,144 @@ let chromeSource = fs.readFileSync(chromeTarget, "utf8");
 const dnsCall = "\tawait resolvePinnedHostnameWithPolicy(parsed.hostname, {";
 if (patching && !chromeSource.includes(chromeMarker)) {
   chromeSource = replaceOnce(chromeSource, dnsCall, [
-    `\t// ${chromeMarker}: Chromium is already forced through the operator-managed`,
-    "\t// forward proxy. Interactive Team previews use a signature-derived,",
-    "\t// non-resolving origin. Delegate only that exact reserved host shape;",
-    "\t// direct profiles and every ordinary destination retain upstream checks.",
+    `\t// ${chromeMarker}: the operator-managed explicit proxy resolves only`,
+    "\t// ClawManager's signature-derived Preview origin. All other hosts and",
+    "\t// direct profiles keep the upstream DNS and redirect checks.",
     "\tif (opts.browserProxyMode === \"explicit-browser-proxy\" &&",
     "\t\tisPrivateNetworkAllowedByPolicy(opts.ssrfPolicy) &&",
     "\t\t/^p-[a-z0-9_-]{16}\\.clawmanager-team-preview\\.invalid$/.test(normalizeHostname(parsed.hostname))) return;",
     dnsCall,
-  ].join("\n"), "navigation DNS call");
+  ].join("\n"), "browser navigation DNS call");
   fs.writeFileSync(chromeTarget, chromeSource);
 }
 chromeSource = fs.readFileSync(chromeTarget, "utf8");
-verify(chromeSource, [
-  chromeMarker,
-  'opts.browserProxyMode === "explicit-browser-proxy"',
-  "isPrivateNetworkAllowedByPolicy(opts.ssrfPolicy)",
-  "/^p-[a-z0-9_-]{16}\\.clawmanager-team-preview\\.invalid$/",
-  dnsCall,
-], "OpenClaw managed Preview Browser DNS");
+requireAll(chromeSource, [chromeMarker, 'opts.browserProxyMode === "explicit-browser-proxy"', "isPrivateNetworkAllowedByPolicy(opts.ssrfPolicy)", "/^p-[a-z0-9_-]{16}\\.clawmanager-team-preview\\.invalid$/", dnsCall], "managed Preview DNS");
 
-const contextMarker = "CLAWMANAGER_MANAGED_PREVIEW_PROXY_CONTEXT";
+const routeMarker = "CLAWMANAGER_NATIVE_BROWSER_PROXY_MODE_SNAPSHOTS";
 const routeTarget = singleModule(/^routes-.*\.js$/, "function browserNavigationPolicyForProfile(ctx, profileCtx)", "browser routes");
 let routeSource = fs.readFileSync(routeTarget, "utf8");
-const policyFunction = [
-  "function browserNavigationPolicyForProfile(ctx, profileCtx) {",
-  "\treturn withBrowserNavigationPolicy(ctx.state().resolved.ssrfPolicy, { browserProxyMode: resolveBrowserNavigationProxyMode({",
-  "\t\tresolved: ctx.state().resolved,",
-  "\t\tprofile: profileCtx.profile",
-  "\t}) });",
-  "}",
-].join("\n");
-const patchedPolicyFunction = [
-  "function browserNavigationPolicyForProfile(ctx, profileCtx) {",
-  `\t// ${contextMarker}: keep the resolved proxy mode attached to the`,
-  "\t// per-call SSRF policy so nested Playwright helpers cannot silently",
-  "\t// fall back to local DNS after a managed-proxy navigation.",
-  "\tconst policy = withBrowserNavigationPolicy(ctx.state().resolved.ssrfPolicy, { browserProxyMode: resolveBrowserNavigationProxyMode({",
-  "\t\tresolved: ctx.state().resolved,",
-  "\t\tprofile: profileCtx.profile",
-  "\t}) });",
-  "\tif (policy.ssrfPolicy && policy.browserProxyMode) policy.ssrfPolicy = {",
-  "\t\t...policy.ssrfPolicy,",
-  "\t\t__clawmanagerBrowserProxyMode: policy.browserProxyMode",
-  "\t};",
-  "\treturn policy;",
-  "}",
-].join("\n");
-if (patching && !routeSource.includes(contextMarker)) {
-  routeSource = replaceOnce(routeSource, policyFunction, patchedPolicyFunction, "profile navigation policy function");
-  routeSource = replaceOnce(
-    routeSource,
-    "\t\t\t\tconst ssrfPolicy = ctx.state().resolved.ssrfPolicy;",
-    "\t\t\t\tconst ssrfPolicy = browserNavigationPolicyForProfile(ctx, profileCtx).ssrfPolicy;",
-    "Playwright act SSRF policy binding",
-  );
+const routeReplacements = [
+  [[
+    "\t\t\t\t\t\tconst snap = await pw.snapshotRoleViaPlaywright({",
+    "\t\t\t\t\t\t\tcdpUrl,",
+    "\t\t\t\t\t\t\ttargetId: tab.targetId,",
+    "\t\t\t\t\t\t\tssrfPolicy: ctx.state().resolved.ssrfPolicy",
+    "\t\t\t\t\t\t});",
+  ].join("\n"), [
+    `\t\t\t\t\t\t// ${routeMarker}`,
+    "\t\t\t\t\t\tconst snap = await pw.snapshotRoleViaPlaywright({",
+    "\t\t\t\t\t\t\tcdpUrl,",
+    "\t\t\t\t\t\t\ttargetId: tab.targetId,",
+    "\t\t\t\t\t\t\t...browserNavigationPolicyForProfile(ctx, profileCtx)",
+    "\t\t\t\t\t\t});",
+  ].join("\n"), "labeled screenshot snapshot"],
+  [[
+    "\t\t\t\t\t\t\trefsMode: plan.refsMode,",
+    "\t\t\t\t\t\t\tssrfPolicy: ctx.state().resolved.ssrfPolicy,",
+    "\t\t\t\t\t\t\turls: plan.urls,",
+  ].join("\n"), [
+    "\t\t\t\t\t\t\trefsMode: plan.refsMode,",
+    "\t\t\t\t\t\t\t...browserNavigationPolicyForProfile(ctx, profileCtx),",
+    "\t\t\t\t\t\t\turls: plan.urls,",
+  ].join("\n"), "role snapshot policy"],
+  [[
+    "\t\t\t\t\t\t\ttargetId: tab.targetId,",
+    "\t\t\t\t\t\t\tssrfPolicy: ctx.state().resolved.ssrfPolicy,",
+    "\t\t\t\t\t\t\turls: plan.urls,",
+  ].join("\n"), [
+    "\t\t\t\t\t\t\ttargetId: tab.targetId,",
+    "\t\t\t\t\t\t\t...browserNavigationPolicyForProfile(ctx, profileCtx),",
+    "\t\t\t\t\t\t\turls: plan.urls,",
+  ].join("\n"), "AI snapshot policy"],
+  [[
+    "\t\t\t\t\t\t\t\ttimeoutMs: plan.timeoutMs,",
+    "\t\t\t\t\t\t\t\tssrfPolicy: ctx.state().resolved.ssrfPolicy",
+  ].join("\n"), [
+    "\t\t\t\t\t\t\t\ttimeoutMs: plan.timeoutMs,",
+    "\t\t\t\t\t\t\t\t...browserNavigationPolicyForProfile(ctx, profileCtx)",
+  ].join("\n"), "ARIA snapshot policy"],
+];
+if (patching && !routeSource.includes(routeMarker)) {
+  for (const [needle, replacement, label] of routeReplacements) routeSource = replaceOnce(routeSource, needle, replacement, label);
+  fs.writeFileSync(routeTarget, routeSource);
 }
-if (patching && routeSource.includes("ssrfPolicy: ctx.state().resolved.ssrfPolicy")) {
-  if (routeSource.includes("\t\t\trun: async ({ cdpUrl, tab, pw, resolveTabUrl }) => {")) {
-    routeSource = replaceEvery(
-      routeSource,
-      "\t\t\trun: async ({ cdpUrl, tab, pw, resolveTabUrl }) => {",
-      "\t\t\trun: async ({ profileCtx, cdpUrl, tab, pw, resolveTabUrl }) => {",
-      "Playwright route profile context binding",
-    );
-  }
-  routeSource = replaceEvery(
-    routeSource,
-    "ssrfPolicy: ctx.state().resolved.ssrfPolicy",
-    "ssrfPolicy: browserNavigationPolicyForProfile(ctx, profileCtx).ssrfPolicy",
-    "profile-scoped Browser SSRF policy binding",
-  );
-}
-if (patching) fs.writeFileSync(routeTarget, routeSource);
 routeSource = fs.readFileSync(routeTarget, "utf8");
-verify(routeSource, [
-  contextMarker,
-  "__clawmanagerBrowserProxyMode: policy.browserProxyMode",
-  "const ssrfPolicy = browserNavigationPolicyForProfile(ctx, profileCtx).ssrfPolicy;",
-  "run: async ({ profileCtx, cdpUrl, tab, pw, resolveTabUrl }) => {",
-  "ssrfPolicy: browserNavigationPolicyForProfile(ctx, profileCtx).ssrfPolicy",
-], "OpenClaw managed Preview Browser route context");
-if (routeSource.includes("ssrfPolicy: ctx.state().resolved.ssrfPolicy")) {
-  throw new Error("OpenClaw managed Preview Browser route context still contains an unscoped SSRF policy");
-}
+requireAll(routeSource, [routeMarker, "...browserNavigationPolicyForProfile(ctx, profileCtx)", "function browserNavigationPolicyForProfile(ctx, profileCtx)"], "native browser proxy route");
 
-const playwrightMarker = "CLAWMANAGER_MANAGED_PREVIEW_PROXY_POLICY";
-const playwrightTarget = singleModule(/^pw-ai-.*\.js$/, "async function assertPageNavigationCompletedSafely(opts)", "Playwright bridge");
+const playwrightMarker = "CLAWMANAGER_NATIVE_BROWSER_PROXY_MODE_SNAPSHOT_GUARD";
+const playwrightTarget = singleModule(/^pw-ai-.*\.js$/, "async function prepareSnapshotPageViaPlaywright(opts)", "Playwright snapshots");
 let playwrightSource = fs.readFileSync(playwrightTarget, "utf8");
-const pageGuardStart = [
-  "/** Validate a completed page navigation and quarantine policy-denied targets. */",
-  "async function assertPageNavigationCompletedSafely(opts) {",
-  "\tconst navigationPolicy = withBrowserNavigationPolicy(opts.ssrfPolicy, { browserProxyMode: opts.browserProxyMode });",
-].join("\n");
-const patchedPageGuardStart = [
-  `// ${playwrightMarker}: recover only the proxy mode resolved by the route`,
-  "// for this call. The marker never grants access by itself; the central",
-  "// navigation guard still checks the exact managed Preview host and policy.",
-  "function clawmanagerBrowserProxyModeForPolicy(policy) {",
-  "\treturn policy?.__clawmanagerBrowserProxyMode === \"explicit-browser-proxy\"",
-  "\t\t? \"explicit-browser-proxy\"",
-  "\t\t: void 0;",
-  "}",
-  "/** Validate a completed page navigation and quarantine policy-denied targets. */",
-  "async function assertPageNavigationCompletedSafely(opts) {",
-  "\tconst navigationPolicy = withBrowserNavigationPolicy(opts.ssrfPolicy, {",
-  "\t\tbrowserProxyMode: opts.browserProxyMode ?? clawmanagerBrowserProxyModeForPolicy(opts.ssrfPolicy)",
-  "\t});",
-].join("\n");
 if (patching && !playwrightSource.includes(playwrightMarker)) {
-  playwrightSource = replaceOnce(playwrightSource, pageGuardStart, patchedPageGuardStart, "Playwright page navigation guard");
-  playwrightSource = replaceOnce(
-    playwrightSource,
-    "\t\t...withBrowserNavigationPolicy(ssrfPolicy)\n",
-    "\t\t...withBrowserNavigationPolicy(ssrfPolicy, { browserProxyMode: clawmanagerBrowserProxyModeForPolicy(ssrfPolicy) })\n",
-    "Playwright subframe navigation policy",
-  );
-  playwrightSource = replaceOnce(
-    playwrightSource,
-    "\t\t\t...withBrowserNavigationPolicy(opts.ssrfPolicy)\n",
-    "\t\t\t...withBrowserNavigationPolicy(opts.ssrfPolicy, { browserProxyMode: clawmanagerBrowserProxyModeForPolicy(opts.ssrfPolicy) })\n",
-    "Playwright download navigation policy",
-  );
+  const snapshotStart = playwrightSource.indexOf("async function prepareSnapshotPageViaPlaywright(opts)");
+  const snapshotEnd = playwrightSource.indexOf("async function navigateViaPlaywright(opts)", snapshotStart);
+  if (snapshotStart < 0 || snapshotEnd <= snapshotStart) throw new Error("could not isolate Playwright snapshot functions");
+  const prefix = playwrightSource.slice(0, snapshotStart);
+  let snapshotSource = playwrightSource.slice(snapshotStart, snapshotEnd);
+  snapshotSource = replaceOnce(snapshotSource,
+    "async function prepareSnapshotPageViaPlaywright(opts) {",
+    `// ${playwrightMarker}\nasync function prepareSnapshotPageViaPlaywright(opts) {`,
+    "snapshot marker");
+  snapshotSource = replaceOnce(snapshotSource, [
+    "\t\tssrfPolicy: opts.ssrfPolicy,",
+    "\t\ttargetId: opts.targetId",
+  ].join("\n"), [
+    "\t\tssrfPolicy: opts.ssrfPolicy,",
+    "\t\tbrowserProxyMode: opts.browserProxyMode,",
+    "\t\ttargetId: opts.targetId",
+  ].join("\n"), "snapshot completed-navigation guard");
+  snapshotSource = replaceEvery(snapshotSource, [
+    "\t\tssrfPolicy: opts.ssrfPolicy",
+    "\t});",
+  ].join("\n"), [
+    "\t\tssrfPolicy: opts.ssrfPolicy,",
+    "\t\tbrowserProxyMode: opts.browserProxyMode",
+    "\t});",
+  ].join("\n"), "snapshot proxy mode forwarding", 3);
+  playwrightSource = prefix + snapshotSource + playwrightSource.slice(snapshotEnd);
   fs.writeFileSync(playwrightTarget, playwrightSource);
 }
 playwrightSource = fs.readFileSync(playwrightTarget, "utf8");
-verify(playwrightSource, [
-  playwrightMarker,
-  "clawmanagerBrowserProxyModeForPolicy(opts.ssrfPolicy)",
-  "clawmanagerBrowserProxyModeForPolicy(ssrfPolicy)",
-], "OpenClaw managed Preview Playwright policy");
+requireAll(playwrightSource, [playwrightMarker, "browserProxyMode: opts.browserProxyMode", "async function snapshotAiViaPlaywright(opts)", "async function snapshotRoleViaPlaywright(opts)", "async function snapshotAriaViaPlaywright(opts)"], "native browser proxy Playwright snapshot");
 
-process.stdout.write(
-  `OpenClaw managed Preview Browser patch verified in ${path.basename(chromeTarget)}, ${path.basename(routeTarget)}, and ${path.basename(playwrightTarget)}\n`,
-);
+const navigationFailureMarker = "CLAWMANAGER_CONTAIN_DOCUMENT_DNS_FAILURE";
+const playwrightSessionTarget = singleModule(/^pw-session-.*\.js$/, "async function gotoPageWithNavigationGuard(opts)", "Playwright navigation session");
+let playwrightSessionSource = fs.readFileSync(playwrightSessionTarget, "utf8");
+const uncontainedNavigationFailure = [
+  "\t\t} catch (err) {",
+  "\t\t\tif (isPolicyDenyNavigationError(err)) {",
+  "\t\t\t\tif (requestKind === \"top-level\") blockedError = err;",
+  "\t\t\t\tawait route.abort().catch(() => {});",
+  "\t\t\t\treturn;",
+  "\t\t\t}",
+  "\t\t\tthrow err;",
+  "\t\t}",
+].join("\n");
+const containedNavigationFailure = [
+  "\t\t} catch (err) {",
+  `\t\t\t// ${navigationFailureMarker}: DNS and transport lookup failures are`,
+  "\t\t\t// request failures, not process failures. Preserve policy denials and",
+  "\t\t\t// surface top-level failures to the browser tool while quietly aborting",
+  "\t\t\t// failed subframes so a third-party document cannot kill the Gateway.",
+  "\t\t\tif (requestKind === \"top-level\") blockedError = err;",
+  "\t\t\tawait route.abort().catch(() => {});",
+  "\t\t\treturn;",
+  "\t\t}",
+].join("\n");
+if (patching && !playwrightSessionSource.includes(navigationFailureMarker)) {
+  const navigationStart = playwrightSessionSource.indexOf("async function gotoPageWithNavigationGuard(opts)");
+  const navigationEnd = playwrightSessionSource.indexOf("/** Resolve a browser snapshot ref", navigationStart);
+  if (navigationStart < 0 || navigationEnd <= navigationStart) throw new Error("could not isolate Playwright guarded navigation");
+  const prefix = playwrightSessionSource.slice(0, navigationStart);
+  let navigationSource = playwrightSessionSource.slice(navigationStart, navigationEnd);
+  navigationSource = replaceOnce(navigationSource, uncontainedNavigationFailure, containedNavigationFailure, "uncontained document DNS failure");
+  playwrightSessionSource = prefix + navigationSource + playwrightSessionSource.slice(navigationEnd);
+  fs.writeFileSync(playwrightSessionTarget, playwrightSessionSource);
+}
+playwrightSessionSource = fs.readFileSync(playwrightSessionTarget, "utf8");
+requireAll(playwrightSessionSource, [navigationFailureMarker, 'if (requestKind === "top-level") blockedError = err;', "await route.abort().catch(() => {});", "async function gotoPageWithNavigationGuard(opts)"], "Playwright document DNS containment");
+
+for (const [label, source] of [["routes", routeSource], ["Playwright", playwrightSource], ["Playwright session", playwrightSessionSource]]) {
+  if (source.includes("__clawmanagerBrowserProxyMode")) throw new Error(`${label} still contains the retired hidden proxy marker`);
+}
+
+process.stdout.write(`OpenClaw native Browser proxy patch verified in ${path.basename(chromeTarget)}, ${path.basename(routeTarget)}, ${path.basename(playwrightTarget)}, and ${path.basename(playwrightSessionTarget)}\n`);

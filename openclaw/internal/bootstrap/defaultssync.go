@@ -14,6 +14,7 @@ import (
 )
 
 const bundledRedisTeamPluginID = "redis-team"
+const bundledRedisTeamPackageName = "@clawmanager/openclaw-redis-team"
 
 // syncDefaults copies cfg.OpenClawDefaultsDir into the parent directory of
 // cfg.OpenClawConfigPath when the state directory or the active config file
@@ -59,11 +60,74 @@ func syncBundledRedisTeamPlugin(cfg appconfig.Config) error {
 	if !pathExists(src) {
 		return nil
 	}
+	if err := validateManagedRedisTeamPlugin(src, true); err != nil {
+		return fmt.Errorf("invalid managed source: %w", err)
+	}
 	if sameBundledPlugin(src, dst) {
 		return nil
 	}
+	if pathExists(dst) {
+		if err := validateManagedRedisTeamPlugin(dst, false); err != nil {
+			return fmt.Errorf("preserve unrecognized existing redis-team extension: %w", err)
+		}
+	}
 	if err := replaceTree(dst, src, cfg.OpenClawExtensionsDir); err != nil {
 		return fmt.Errorf("replace %s: %w", bundledRedisTeamPluginID, err)
+	}
+	return nil
+}
+
+func validateManagedRedisTeamPlugin(root string, requireCurrentPackage bool) error {
+	packageData, err := os.ReadFile(filepath.Join(root, "package.json"))
+	if err != nil {
+		return fmt.Errorf("read package.json: %w", err)
+	}
+	var pkg struct {
+		Name    string `json:"name"`
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(packageData, &pkg); err != nil {
+		return fmt.Errorf("parse package.json: %w", err)
+	}
+	if pkg.Name != bundledRedisTeamPackageName {
+		if requireCurrentPackage || pkg.Name != "@clawmanager/redis-team" {
+			return fmt.Errorf("unexpected package name %q", pkg.Name)
+		}
+	}
+	if pkg.Version == "" {
+		return fmt.Errorf("package version is empty")
+	}
+
+	manifestData, err := os.ReadFile(filepath.Join(root, "openclaw.plugin.json"))
+	if err != nil {
+		return fmt.Errorf("read manifest: %w", err)
+	}
+	var manifest struct {
+		ID       string   `json:"id"`
+		Channels []string `json:"channels"`
+	}
+	if err := json.Unmarshal(manifestData, &manifest); err != nil {
+		return fmt.Errorf("parse manifest: %w", err)
+	}
+	if manifest.ID != bundledRedisTeamPluginID {
+		return fmt.Errorf("unexpected manifest id %q", manifest.ID)
+	}
+	hasChannel := false
+	for _, channel := range manifest.Channels {
+		if channel == bundledRedisTeamPluginID {
+			hasChannel = true
+			break
+		}
+	}
+	if !hasChannel {
+		return fmt.Errorf("manifest does not declare redis-team channel")
+	}
+	entry, err := os.Stat(filepath.Join(root, "dist", "index.js"))
+	if err != nil {
+		return fmt.Errorf("stat dist/index.js: %w", err)
+	}
+	if !entry.Mode().IsRegular() || entry.Size() == 0 {
+		return fmt.Errorf("dist/index.js is missing or empty")
 	}
 	return nil
 }
@@ -129,10 +193,45 @@ func replaceTree(dst, src, allowedRoot string) error {
 	if rel == "." || rel == "" || relHasParentPrefix(rel) {
 		return fmt.Errorf("refusing to replace path outside extensions dir: %s", cleanDst)
 	}
-	if err := os.RemoveAll(cleanDst); err != nil {
+	if err := os.MkdirAll(cleanRoot, 0o755); err != nil {
 		return err
 	}
-	return copyTreeIfMissing(src, cleanDst)
+	staging, err := os.MkdirTemp(cleanRoot, ".redis-team-staging-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(staging)
+	if err := copyTreeIfMissing(src, staging); err != nil {
+		return err
+	}
+	if err := validateManagedRedisTeamPlugin(staging, true); err != nil {
+		return fmt.Errorf("validate staged plugin: %w", err)
+	}
+
+	backup, err := os.MkdirTemp(cleanRoot, ".redis-team-backup-")
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(backup); err != nil {
+		return err
+	}
+	defer os.RemoveAll(backup)
+	hadDestination := pathExists(cleanDst)
+	if hadDestination {
+		if err := os.Rename(cleanDst, backup); err != nil {
+			return err
+		}
+	}
+	if err := os.Rename(staging, cleanDst); err != nil {
+		if hadDestination {
+			_ = os.Rename(backup, cleanDst)
+		}
+		return err
+	}
+	if hadDestination {
+		_ = os.RemoveAll(backup)
+	}
+	return nil
 }
 
 func relHasParentPrefix(rel string) bool {

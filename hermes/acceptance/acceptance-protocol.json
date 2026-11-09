@@ -1,0 +1,46 @@
+{
+  "browser_checks": [
+    "candidate_admission_identity",
+    "cm_build_renderer_resources",
+    "browser_login_ownership",
+    "desktop_boot_original_dom",
+    "cm_cookie_scope",
+    "http_contract",
+    "browser_origin_rejection",
+    "ws_single_use_identity",
+    "ui_prompt_stream_history",
+    "rpc_session_lifecycle_reconnect",
+    "interrupt",
+    "approval_once",
+    "approval_deny",
+    "clarify",
+    "three_replica_tickets",
+    "lease_renewal_logout",
+    "secret_surface_audit",
+    "stub_only_observation"
+  ],
+  "observation_checks": [
+    "runtime_identity",
+    "cm_identity",
+    "renderer_identity",
+    "isolation"
+  ],
+  "promotion_suites": [
+    "lite_image",
+    "lite_provider",
+    "lite_agent",
+    "lite_non_native",
+    "desktop_rpc"
+  ],
+  "protocol": "hermes-lite-campaign-v1",
+  "report_schema_version": 2,
+  "schema_version": 1,
+  "suites": [
+    "lite_image",
+    "lite_provider",
+    "lite_agent",
+    "lite_non_native",
+    "desktop_rpc",
+    "cm_bff_browser"
+  ]
+}

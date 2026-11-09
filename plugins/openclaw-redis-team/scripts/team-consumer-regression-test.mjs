@@ -11,7 +11,6 @@ if (!redisUrl) {
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "redis-team-consumer-"));
 const state = path.join(root, "state");
 const shared = path.join(root, "shared");
-const sessionFile = path.join(root, "session.jsonl");
 process.env.XDG_STATE_HOME = state;
 
 const distPath = path.resolve(import.meta.dirname, "..", "dist", "index.js");
@@ -20,11 +19,8 @@ const source = (await fs.readFile(distPath, "utf8"))
     'import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";',
     "const definePluginEntry = (entry) => entry;",
   )
-  .replace(
-    'import { dispatchInboundDirectDmWithRuntime } from "openclaw/plugin-sdk/direct-dm";',
-    "const dispatchInboundDirectDmWithRuntime = (...args) => globalThis.__redisTeamTestDispatch(...args);",
-  );
-const testSource = source + "\nexport { RedisClient, completionAckKey, completionKey };\n";
+  ;
+const testSource = source + "\nexport { RedisClient, completionAckKey, completionKey, createTurnAnswerCapture };\n";
 const pluginModule = await import(
   `data:text/javascript;base64,${Buffer.from(testSource).toString("base64")}`
 );
@@ -61,9 +57,45 @@ const config = {
 };
 
 const sessionResult = "开发任务已完成，产物已经保存并可交给 Reviewer 验收。";
-globalThis.__redisTeamTestDispatch = async () => {
+const callbackAnswer = "本轮完整答案：来自十二个已核对的资讯来源，不需要额外文件。";
+const capture = pluginModule.createTurnAnswerCapture();
+capture.capture({text:callbackAnswer});
+capture.capture({text:'private reasoning',isReasoning:true});
+capture.capture({text:'NO_REPLY'});
+capture.close();
+capture.capture({text:'late other turn'});
+assert.equal(capture.text,callbackAnswer);
+let dispatchMode = "assignment";
+const hookHandlers = new Map();
+async function dispatchThroughHooks() {
   const timestamp = new Date().toISOString();
-  const records = [
+  const records = dispatchMode === "context-retryable" ? [
+    {
+      id: "assistant-context-tool-call",
+      timestamp,
+      message: {
+        role: "assistant",
+        content: [{ type: "tool_use", id: "tool-context-1", name: "team_send", input: {} }],
+      },
+    },
+    {
+      id: "context-tool-result",
+      timestamp,
+      message: {
+        role: "tool",
+        content: [{
+          type: "tool_result",
+          tool_use_id: "tool-context-1",
+          text: JSON.stringify({ ok: false, retryable: true, code: "ambiguous_team_target", candidates: ["developer", "reviewer"] }),
+        }],
+      },
+    },
+    {
+      id: "assistant-context-final",
+      timestamp,
+      message: { role: "assistant", content: [{ type: "text", text: "I will correct the Team recipient." }] },
+    },
+  ] : [
     {
       id: "assistant-tool-call",
       timestamp,
@@ -86,16 +118,41 @@ globalThis.__redisTeamTestDispatch = async () => {
       message: { role: "assistant", content: [{ type: "text", text: sessionResult }] },
     },
   ];
-  await fs.writeFile(sessionFile, records.map((record) => JSON.stringify(record)).join("\n") + "\n", "utf8");
-  return { storePath: sessionFile, route: { sessionKey: "consumer-regression-session" } };
-};
+  const hookContext = { sessionKey: "consumer-regression-session" };
+  for (const record of records) {
+    const role = String(record?.message?.role || "").toLowerCase();
+    if (role === "assistant") {
+      await hookHandlers.get("before_message_write")?.(record, hookContext);
+      for (const part of Array.isArray(record.message.content) ? record.message.content : []) {
+        if (!["tool_use", "tool_call"].includes(part?.type)) continue;
+        await hookHandlers.get("before_tool_call")?.({
+          toolName: part.name,
+          toolCallId: part.id,
+        }, hookContext);
+      }
+    }
+    if (role === "tool") {
+      const result = record.message.content?.[0] || {};
+      let structuredResult = {};
+      try { structuredResult = JSON.parse(result.text || "{}"); } catch {}
+      await hookHandlers.get("after_tool_call")?.({
+        toolName: dispatchMode === "context-retryable" ? "team_send" : "browser",
+        toolCallId: result.tool_use_id,
+        isError: result.isError === true,
+        result: structuredResult,
+        error: result.isError === true ? { code: "tool_failed" } : undefined,
+      }, hookContext);
+    }
+  }
+  return {};
+}
 
 let registeredChannel;
 pluginModule.default.register({
   config,
   logger: { info() {}, warn() {}, error() {} },
   registerTool() {},
-  on() {},
+  on(name, handler) { hookHandlers.set(name, handler); },
   registerChannel(channel) {
     registeredChannel = channel.plugin;
   },
@@ -109,7 +166,31 @@ const logs = [];
 const context = {
   accountId: "default",
   cfg: config,
-  channelRuntime: {},
+  channelRuntime: {
+    routing: {
+      resolveAgentRoute({ accountId, peer }) {
+        return {
+          accountId,
+          agentId: "main",
+          sessionKey: `agent:main:redis-team:group:${peer.id}`,
+        };
+      },
+    },
+    inbound: {
+      async buildContext(payload) { return payload; },
+      async run({ adapter }) {
+        const turn = adapter.resolveTurn();
+        assert.equal(turn.ctxPayload.conversation.kind, "group");
+        assert.equal(turn.ctxPayload.access.commands.authorized, false);
+        if (dispatchMode === "callback-only") {
+          await turn.delivery.deliverWithProviderMessageSending({text:callbackAnswer});
+          return {};
+        }
+        await dispatchThroughHooks();
+        return {};
+      },
+    },
+  },
   abortSignal: abortController.signal,
   setStatus(status) {
     statuses.push(status);
@@ -163,7 +244,7 @@ try {
     "utf8",
   );
   await redis.connect();
-  await redis.command("DEL", inboxKey, eventsKey, presenceKey, dlqKey);
+  await redis.command("DEL", inboxKey, eventsKey, presenceKey, dlqKey, `claw:team:${teamId}:maintenance`);
 
   gatewayPromise = registeredChannel.gateway.startAccount(context);
   await waitFor(() => statuses.some((status) => status.connected === true));
@@ -231,11 +312,79 @@ try {
     "a valid turn-end monitor record must not enter the dead-letter stream",
   );
 
+  // Exercise the channel's real delivery callback, not a prefilled hook record
+  // or direct completion tool invocation. Both assignment kinds share capture.
+  dispatchMode = "callback-only";
+  for (const single of [false,true]) {
+    const messageId=`callback-${single}-${runId}`;
+    const rootTaskId=`team-${teamId}-task-${single ? 'single' : 'ordinary'}-${runId}`;
+    const callbackEnvelope={...envelope,messageId,idempotencyKey:messageId,taskId:rootTaskId,rootTaskId,rootMessageId:messageId,
+      ...(single ? {from:'clawmanager',intent:'run_task',executionType:'single_member',executorMemberKey:memberId,assignmentId:'single-member',workId:'single-member'} : {})};
+    await redis.command('XADD',inboxKey,'*','payload',JSON.stringify(callbackEnvelope));
+    const end=await waitFor(async()=>streamPayloads(await redis.command('XRANGE',eventsKey,'-','+')).find(e=>e.eventKind==='turn_finished_without_completion' && (e.messageId===messageId || e.sourceMessageId===messageId)));
+    assert.equal(end.resultMarkdown,callbackAnswer);
+    assert.equal(end.hadAssistantNarrative,true);
+    assert.equal(end.immediateRecoveryEligible,true);
+    assert.equal(end.turnObservationOutcome,'completion_receipt_gap');
+    assert.equal(end.visibleToChat,false);
+    assert.equal(end.rootTaskTerminal,false);
+  }
+
+  dispatchMode = "context-retryable";
+  const contextMessageId = `consumer-context-${runId}`;
+  const contextEnvelope = {
+    ...envelope,
+    messageId: contextMessageId,
+    idempotencyKey: contextMessageId,
+    intent: "member_result_confirmed",
+    type: "notification",
+    text: "A member result was confirmed. Continue the current workflow decision.",
+    requiresCompletion: false,
+    turnOutcomePolicy: {
+      actionExpected: true,
+      immediateRecoveryAllowed: true,
+      reason: "consumer_regression",
+    },
+    createdAt: new Date().toISOString(),
+  };
+  const maintenanceKey = `claw:team:${teamId}:maintenance`;
+  await redis.command("SET", maintenanceKey, JSON.stringify({ enabled: true, rolloutId: "rollout-contract" }));
+  await redis.command("XADD", inboxKey, "*", "payload", JSON.stringify(contextEnvelope));
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+  const whileMaintained = streamPayloads(await redis.command("XRANGE", eventsKey, "-", "+"));
+  assert.equal(
+    whileMaintained.some((event) => event.sourceMessageId === contextMessageId || event.messageId === contextMessageId),
+    false,
+    "maintenance drain must finish the current turn but must not accept a new Team message",
+  );
+  await redis.command("DEL", maintenanceKey);
+  const contextTurn = await waitFor(async () => {
+    const response = await redis.command("XRANGE", eventsKey, "-", "+");
+    observed.splice(0, observed.length, ...streamPayloads(response));
+    return observed.find((event) =>
+      event.eventKind === "turn_finished_without_completion" &&
+      (event.sourceMessageId === contextMessageId || event.messageId === contextMessageId)) || false;
+  });
+  assert.equal(contextTurn.turnObservationOutcome, "retryable_tool_gap");
+  assert.equal(contextTurn.immediateRecoveryEligible, true);
+  assert.equal(contextTurn.contextOnlyTurn, true);
+  assert.equal(contextTurn.lastToolName, "team_send");
+  assert.equal(contextTurn.lastToolCode, "ambiguous_team_target");
+  assert.deepEqual(contextTurn.targetCandidates, ["developer", "reviewer"]);
+  assert.equal(contextTurn.stateEffect, "none");
+  assert.equal(contextTurn.rootTaskTerminal, false);
+  assert.equal(
+    observed.some((event) =>
+      (event.sourceMessageId === contextMessageId || event.messageId === contextMessageId) &&
+      ["task_received", "task_started", "completion_proposed", "task_failed"].includes(event.event)),
+    false,
+    "context observation must not create business lifecycle state",
+  );
+
   console.log("Redis Team real consumer regression: OK");
 } finally {
   abortController.abort();
   await gatewayPromise?.catch(() => {});
   redis.close();
-  delete globalThis.__redisTeamTestDispatch;
   await fs.rm(root, { recursive: true, force: true });
 }

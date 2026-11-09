@@ -1,0 +1,42 @@
+# ClawManager-owned DeepSeek Harness deployment overrides.
+# The runtime image is pinned, and request credentials remain environment references.
+- id: webserver
+  config:
+    host: !!js process.env.DSH_BIND_HOST ?? '127.0.0.1'
+    port: !!js ctx.webStartup.port ?? 3080
+
+- id: agent-default-model
+  config:
+    provider: !!js >-
+      (() => {
+        const config = JSON.parse(process.env.CLAWMANAGER_LLM_RESOLVED_CONFIG_JSON ?? '{}');
+        return config.default_provider ?? 'clawmanager';
+      })()
+    model: !!js >-
+      (() => {
+        const config = JSON.parse(process.env.CLAWMANAGER_LLM_RESOLVED_CONFIG_JSON ?? '{}');
+        return config.default_model ?? 'auto';
+      })()
+
+- id: llm-pi-ai
+  config:
+    providers: !!js >-
+      (() => {
+        const config = JSON.parse(process.env.CLAWMANAGER_LLM_RESOLVED_CONFIG_JSON ?? '{}');
+        const groups = Array.isArray(config.providers) ? config.providers : [];
+        return Object.fromEntries(groups.map((group) => [
+          group.provider_id,
+          {
+            displayName: group.provider_id,
+            apiKeyEnv: config.api_key_env ?? 'CLAWMANAGER_LLM_API_KEY',
+            api: 'openai-completions',
+            baseURL: config.base_url ?? process.env.CLAWMANAGER_LLM_BASE_URL,
+            models: group.model_ids.map((id) => ({ id })),
+          },
+        ]));
+      })()
+
+# The shipped web_search provider calls DeepSeek's public API directly. Managed
+# runtimes intentionally expose no direct-provider credential or bypass route.
+- id: tool-web
+  disabled: true

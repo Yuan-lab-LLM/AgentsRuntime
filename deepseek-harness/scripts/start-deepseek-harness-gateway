@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+gateway_port="${CLAWMANAGER_GATEWAY_PORT:-${PORT:-}}"
+case "${gateway_port}" in
+  ''|*[!0-9]*)
+    echo "CLAWMANAGER_GATEWAY_PORT must be a numeric port" >&2
+    exit 2
+    ;;
+esac
+if [ "${gateway_port}" -lt 1 ] || [ "${gateway_port}" -gt 65535 ]; then
+  echo "CLAWMANAGER_GATEWAY_PORT is outside 1-65535" >&2
+  exit 2
+fi
+
+export DSH_HOME="${DSH_HOME:-${HOME:-/tmp}/.dsh}"
+proxy_bind_host="${DSH_BIND_HOST:-0.0.0.0}"
+# The managed proxy owns the Pod-facing socket. Keep DSH itself on loopback so
+# neither BrowserAuth nor plugin-specific trust settings can expose its API.
+export DSH_BIND_HOST=127.0.0.1
+export DSH_TELEMETRY_DISABLED="${DSH_TELEMETRY_DISABLED:-1}"
+mkdir -p "${DSH_HOME}" "${DSH_HOME}/skills"
+
+resolved_llm_config="$(
+  /usr/local/bin/clawmanager-agent llm-config \
+    --format canonical \
+    --fallback-provider clawmanager \
+    --default-model auto
+)"
+export CLAWMANAGER_LLM_RESOLVED_CONFIG_JSON="${resolved_llm_config}"
+
+# Runtime-agent credentials belong to the supervisor, not the DSH child.
+unset RUNTIME_AGENT_CONTROL_TOKEN RUNTIME_AGENT_REPORT_TOKEN
+unset CLAWMANAGER_AGENT_CONTROL_TOKEN CLAWMANAGER_AGENT_REPORT_TOKEN
+
+/usr/local/bin/prepare-deepseek-harness-resources
+
+# ClawManager mounts its supervisor binary over /usr/local/bin/clawmanager-agent.
+# Use the image-owned copy so this DSH-specific subcommand cannot be shadowed by
+# an independently released runtime-agent overlay.
+exec /usr/local/libexec/clawmanager-agent-image dsh-web-proxy \
+	--listen-host "${proxy_bind_host}" \
+	--port "${gateway_port}" \
+	-- \
+	node --expose-internals /usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js web \
+  --patch /usr/local/share/deepseek-harness/managed.cordis.patch.yml \
+	--host 127.0.0.1 \
+	--port 0 \
+	--no-open

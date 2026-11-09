@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "${HERMES_AUTOSTART:-true}" in
+    0|false|FALSE|no|NO|off|OFF)
+        exit 0
+        ;;
+esac
+
+if command -v flock >/dev/null 2>&1; then
+    exec 9>/tmp/hermes-desktop-autostart.lock
+    flock -n 9 || exit 0
+fi
+
+export HOME="${HOME:-/config}"
+export HERMES_HOME="${HERMES_HOME:-/config/.hermes}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/config/.cache}"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-/config/.config}"
+export XDG_DATA_HOME="${XDG_DATA_HOME:-/config/.local/share}"
+export NPM_CONFIG_CACHE="${NPM_CONFIG_CACHE:-/config/.cache/npm}"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-/config/.cache/uv}"
+
+/usr/local/bin/hermes-apply-runtime-config >/tmp/hermes-runtime-config.log 2>&1 || true
+
+mkdir -p "${HOME}" "${HERMES_HOME}" "${XDG_CACHE_HOME}" "${XDG_CONFIG_HOME}" "${XDG_DATA_HOME}"
+
+# linuxserver/webtop starts Plasma directly rather than through a KDE session
+# manager, so XDG autostart entries are not consumed in Wayland mode.  The s6
+# desktop service invokes this launcher independently and must inherit the
+# display and session bus created for plasmashell before Electron starts.
+if [[ "${PIXELFLUX_WAYLAND:-false}" == "true" && -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+    while true; do
+        plasma_pid="$(pgrep -o -x plasmashell 2>/dev/null || true)"
+        if [[ -n "${plasma_pid}" && -r "/proc/${plasma_pid}/environ" ]]; then
+            while IFS= read -r entry; do
+                case "${entry}" in
+                    DBUS_SESSION_BUS_ADDRESS=*|DISPLAY=*|WAYLAND_DISPLAY=*|XDG_RUNTIME_DIR=*)
+                        export "${entry}"
+                        ;;
+                esac
+            done < <(tr '\0' '\n' < "/proc/${plasma_pid}/environ")
+        fi
+        if [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" && -n "${XDG_RUNTIME_DIR:-}" && -n "${WAYLAND_DISPLAY:-}" && -S "${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}" ]]; then
+            break
+        fi
+        sleep 1
+    done
+else
+    export DISPLAY="${DISPLAY:-:1}"
+    display_number="${DISPLAY#:}"
+    display_number="${display_number%%.*}"
+    while [[ ! -S "/tmp/.X11-unix/X${display_number}" ]]; do
+        sleep 1
+    done
+fi
+
+cd /config
+exec hermes desktop --skip-build --cwd /config --hermes-root /usr/local/lib/hermes-agent

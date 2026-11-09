@@ -11,17 +11,48 @@ const manifest = JSON.parse(fs.readFileSync(path.join(root, "openclaw.plugin.jso
 const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
 const dist = fs.readFileSync(path.join(root, "dist", "index.js"), "utf8");
 if (manifest.id !== "redis-team") throw new Error(`unexpected plugin id: ${manifest.id}`);
-if (pkg.version !== "0.2.1") {
+if (pkg.version !== "0.3.1") {
   throw new Error(`unexpected package version: ${pkg.version}`);
 }
-if (pkg.openclaw?.compat?.pluginApi !== ">=2026.5.4") {
-  throw new Error("package.json must preserve the OpenClaw 2026.5.4 plugin API compatibility floor");
+if (pkg.openclaw?.compat?.pluginApi !== ">=2026.8.1") {
+  throw new Error("package.json must require the OpenClaw 2026.8.1 plugin API baseline");
 }
-if (pkg.openclaw?.build?.openclawVersion !== "2026.7.1-2") {
-  throw new Error("package.json must declare the tested OpenClaw 2026.7.1-2 build baseline");
+if (pkg.openclaw?.build?.openclawVersion !== "2026.10.2") {
+  throw new Error("package.json must declare the tested OpenClaw 2026.10.2 build baseline");
+}
+if (!manifest.channelConfigs?.["redis-team"]?.schema) {
+  throw new Error("OpenClaw 2026.8.1 channel manifest must publish redis-team channelConfigs schema");
+}
+const accountProperties = manifest.channelConfigs["redis-team"].schema?.properties?.accounts?.additionalProperties?.properties || {};
+for (const key of [
+  "autoRun",
+  "consumerGroup",
+  "dlqKey",
+  "enabled",
+  "eventsKey",
+  "fromEnv",
+  "inboxKey",
+  "managerUrl",
+  "memberId",
+  "presenceKey",
+  "redisUrl",
+  "role",
+  "sharedDir",
+  "teamId",
+]) {
+  if (!accountProperties[key]) throw new Error(`redis-team account schema is missing production key: ${key}`);
 }
 if (!pkg.openclaw?.extensions?.includes("./dist/index.js")) {
   throw new Error("package.json openclaw.extensions must include ./dist/index.js");
+}
+if (dist.includes('from "openclaw/plugin-sdk/direct-dm"')) {
+  throw new Error("dist/index.js must not use the removed OpenClaw direct-dm SDK subpath");
+}
+if (dist.includes("await fs.chmod(tmp") || dist.includes("await fs.chmod(file")) {
+  throw new Error("atomic Team file publication must not chmod shared files after creation or rename");
+}
+if (!dist.includes('mode: fileMode') || !dist.includes('mode: 0o664')) {
+  throw new Error("atomic Team files must receive cooperative permissions when their temporary inode is created");
 }
 for (const token of [
   "CLAWMANAGER_TEAM_INBOX_KEY",
@@ -117,8 +148,15 @@ for (const token of [
   'stateEffect: "none"',
   "truncated:",
   "nextOffset:",
-  "assistant_session",
-  "readAssistantNarrativesFromDispatch",
+  "readHookAssistantNarrativesFromDispatch",
+	"readHookToolEvidenceFromDispatch",
+	"registerBoundTeamTool",
+	'chatTypes: ["direct", "group"]',
+	'"group_hooks_v1"',
+	'"maintenance_drain_v1"',
+	'teamMaintenanceState',
+	'maintenanceKey',
+	"dispatchInboundRedisTeamGroupWithRuntime",
   "sourceOccurredAt",
   "lateProjection",
   "suppressedAfterTerminal",
@@ -148,6 +186,15 @@ for (const token of [
   "reviewVerdict",
 ]) {
   if (!dist.includes(token)) throw new Error(`dist/index.js missing Redis Team completion token: ${token}`);
+}
+if (dist.includes("dispatchInboundDirectDmWithRuntime")) {
+  throw new Error("Redis Team Group traffic must not use the Direct-DM compatibility helper");
+}
+if (dist.includes("commandAuthorized: true")) {
+  throw new Error("Redis Team must not grant unconditional command authorization");
+}
+if (dist.toLowerCase().includes(".jsonl")) {
+  throw new Error("Redis Team 0.3 must not inspect OpenClaw transcript JSONL files");
 }
 if (dist.includes("params.taskId === activeEnvelope.taskId")) {
   throw new Error("dist/index.js must match active Redis Team task ids through aliases");
@@ -188,7 +235,11 @@ if (
 ) {
   throw new Error("Assigned validation publishing must be handled by the team-scope guard");
 }
-const deliverStart = dist.indexOf("deliver: async (payload) => {");
+// Context-only turns also capture reply evidence now; inspect the formal
+// assignment callback for its stronger post-completion suppression contract.
+const formalTurnStart = dist.indexOf("const turnAnswer = createTurnAnswerCapture()");
+if (formalTurnStart < 0) throw new Error("formal turn answer capture is missing");
+const deliverStart = dist.indexOf("deliver: async (payload) => {", formalTurnStart);
 const deliverEnd = dist.indexOf("onRecordError:", deliverStart);
 if (deliverStart < 0 || deliverEnd < 0) throw new Error("unable to locate Redis Team deliver callback");
 const deliverBody = dist.slice(deliverStart, deliverEnd);

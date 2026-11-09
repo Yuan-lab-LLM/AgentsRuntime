@@ -17,22 +17,24 @@ This guide helps you build an **OpenClaw** base image for the **ClawManager** co
 
 The image now also includes an **OpenClaw Agent** service inside the container. It auto-registers to ClawManager, sends heartbeats, polls commands, manages the OpenClaw process, and exposes a local Gin-based health endpoint.
 
-**Prefer `Dockerfile.openclaw` for a one-shot build.** If you need to install components manually inside the WebTop desktop and then `docker commit`, see **Advanced: manual flow** below.
+**Use `openclaw/Dockerfile.openclaw` from the repository root for release builds.** It pins OpenClaw **2026.10.2** and Node **24.21.0** through [the version lock](openclaw102.lock.json), checks package integrity, and verifies the installed version. For extra tools, see **Reproducible customization** below.
 
 
 ## Project overview
 
 In ClawManager batch scenarios, per-container manual setup does not scale. This project addresses:
 
-* **Pre-installed runtime**: Node.js and the latest OpenClaw CLI, ready to use.
-* **Agent-driven bootstrap**: `openclaw-agent` (Go) runs as root at container start, seeds `/config/.openclaw` from `/defaults/.openclaw`, reconciles channel plugins, fixes ownership, and drops privileges to `abc` before launching OpenClaw.
+* **Pinned runtime**: Node.js 24.21.0, OpenClaw 2026.10.2, and locked managed channel versions, rather than an unbounded `openclaw@latest` installation.
+* **Agent-driven bootstrap**: in standalone/Pro mode, `openclaw-agent` (Go) seeds `/config/.openclaw` from `/defaults/.openclaw`, reconciles channels and ownership, and launches OpenClaw as `abc`. Pooled Lite uses the assigned per-instance HOME and Linux identity instead.
 * **Dynamic injection**: Environment variables update `openclaw.json` without editing files in the desktop session.
 
 ---
 
 ## Quick start (recommended)
 
-The image is based on `lscr.io/linuxserver/webtop:ubuntu-xfce`. The Dockerfile installs Node.js and global OpenClaw, seeds `/defaults/.openclaw`, and ships the `openclaw-agent` binary as an s6 service. On every container start the agent performs all bootstrap work (defaults sync, extensions directory, XFCE autostart, config normalization, channel reconciliation) and then drops privileges to `abc` before launching `openclaw gateway run`. Runtime config lives under **`/config/.openclaw`**, not `~/.openclaw`. Look for `openclaw-agent` lines in the container logs after startup.
+The canonical image uses the digest-pinned `lscr.io/linuxserver/webtop:ubuntu-kde-version-cc2e18a4` base, installs the locked Node.js/OpenClaw packages, seeds `/defaults/.openclaw`, and ships the agent services. Standalone/Pro config lives under **`/config/.openclaw`**; pooled Lite gateways use their ClawManager-assigned per-instance HOME and workspace, not a shared `/config` for all users. Check agent logs and actual instance health after startup.
+
+Both `openclaw` and `openclaw-lite` use this Dockerfile. Team UI and file editing require a compatible ClawManager App; Runtime adapters provide member execution and delivery. Updating the image alone does not update the UI or safely migrate existing state. Use ClawManager's data-safe upgrade workflow and validate the actual source-to-target path. `openclaw-shell` is a separate build and is not upgraded by this pin.
 
 ### Build
 
@@ -98,18 +100,18 @@ The agent default config is stored at `/etc/openclaw-agent/config.yaml`, seeded 
 
 ## GitHub Actions and GHCR (optional)
 
-The workflow [`.github/workflows/docker-ghcr.yml`](.github/workflows/docker-ghcr.yml) builds `Dockerfile.openclaw` on push to the default branch (`main` / `master`) or on `v*` tags, and pushes to **GitHub Container Registry** so you do not need a local `docker build` for releases.
+The workflow [`.github/workflows/docker-ghcr.yml`](../.github/workflows/docker-ghcr.yml) builds after matching source changes reach `main`, or after a manual run on the default branch. Automatic runs require `main` to be the default branch too. Feature-branch pushes, `v*` tags, and README-only changes do not trigger publication. The current filter also excludes `plugins/**`; run the workflow manually after a plugin-only merge.
 
 **Short checklist**
 
-1. Push the repo to GitHub and confirm **Build and push to GHCR** succeeds under **Actions**.
-2. Find the package under **Packages**; the image is usually `ghcr.io/<user>/<repo>`.
+1. Merge into `main` and confirm **Build and push runtime images**, including both architectures and the final manifest publish job, succeeds under **Actions**.
+2. Default package paths are `ghcr.io/<owner>/<repo>/openclaw` and `ghcr.io/<owner>/<repo>/openclaw-lite`, with lowercase owner/repository names. Fork publications do not update upstream packages.
 3. For private packages, run `docker login ghcr.io` first; set the package to **Public** if you want anonymous `docker pull`.
 
 **Bash**
 
 ```
-docker pull ghcr.io/<github_user>/<repo>:latest
+docker pull ghcr.io/<owner>/<repo>/openclaw:latest
 
 docker run -d \
   --name=webtop-openclaw \
@@ -121,52 +123,39 @@ docker run -d \
   -e CLAWMANAGER_LLM_MODEL=gpt-4o \
   -e CLAWMANAGER_OPENCLAW_CHANNELS_JSON='{"feishu":{"enabled":true,"accounts":{"main":{"appId":"cli_xxx","appSecret":"your-secret"}}}}' \
   -p 3000:3000 -p 3001:3001 \
-  ghcr.io/<github_user>/<repo>:latest
+  ghcr.io/<owner>/<repo>/openclaw:latest
 ```
 
-Pushing tags like `v1.0.0` also publishes semver tags per the workflow metadata rules.
+Successful publication creates `latest` and `vYYYY.M.D` (Asia/Shanghai). These tags can move; record and deploy the verified `@sha256` digest. A new CI build need not have the same digest as an earlier test image, even when both use OpenClaw 2026.10.2.
+
+Inspect the installed core without starting a Gateway or mounting user data:
+
+```bash
+docker run --rm --network none --entrypoint node <image>@sha256:<verified-digest> \
+  -p 'require("/usr/local/lib/node_modules/openclaw/package.json").version'
+```
 
 ---
 
-## Advanced: manual flow (`docker commit`)
+## Reproducible customization
 
-Use this when you must install extra tooling inside WebTop before saving an image. It is an alternative to `Dockerfile.openclaw`.
+Add tools in a tracked Dockerfile derived from a verified runtime digest, then rebuild and test the resulting image. Do not replace Node or OpenClaw with floating versions, package a user's HOME or credentials with `docker commit`, or delete persisted state to force initialization. The historical interactive install/commit recipe is not a release or migration procedure.
 
-### Install software
-
-Open `https://<IP>:3001`, then in a terminal:
-
-**Bash**
-
-```
-curl -fsSL https://deb.nodesource.com/setup_current.x | sudo -E bash -
-sudo apt-get install -y nodejs
-
-npm config set registry https://registry.npmmirror.com
-sudo npm install -g openclaw@latest
+```dockerfile
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+# Add explicitly versioned tools here; preserve the runtime and agent services.
 ```
 
-### Init script and cleanup
-
-1. **Seed defaults**: `cp -rp /config/.openclaw /defaults/`.
-2. **Install agent**: copy the compiled `openclaw-agent` binary into `/usr/local/bin/` and install `scripts/openclaw-agent-run` / `openclaw-agent-finish` under `/etc/services.d/openclaw-agent/`. The agent performs the `/defaults` → `/config` sync and env-based edits on every start.
-3. **Clean before image save**: `rm -rf /config/.openclaw`. If this step is skipped, new containers may not run first-boot init as expected.
-
-### Save image
-
-**Bash**
-
-```
-docker commit webtop-running openclaw:v1.0
-```
+Overlay Dockerfiles update selected components only and inherit the base core version. Choose the base by verified digest and repeat the relevant compatibility tests; an overlay is not evidence of a 10.2 core upgrade.
 
 ---
 
 ## Notes
 
-* **Permissions**: the agent runs `chown -R abc:abc` on `/config/.openclaw` and `/config/.config/autostart` before dropping to `abc`, so the default user can read/write persisted config.
+* **Permissions**: preserve agent-assigned ownership and identity. Standalone/Pro and pooled Lite have different HOME and UID boundaries; do not recursively chown a shared Lite workspace to `abc`.
 * **Docker Compose**: point `image` at your built tag, or use `build` from the repository root with `context: .` and `dockerfile: openclaw/Dockerfile.openclaw`. Do not rely on the stock `webtop` image alone; it will not include this repo’s templates and agent services.
-* **Standalone WebTop**: if you do not use ClawManager batch features, you can skip the ClawManager-specific steps in the advanced flow.
+* **Standalone WebTop**: desktop startup alone does not validate pooled Lite isolation, Team delivery, or data migration; test the managed mode separately.
 
 ---
 

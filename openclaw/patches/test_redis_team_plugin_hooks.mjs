@@ -20,10 +20,10 @@ try {
   await fs.writeFile(path.join(pluginRoot, "package.json"), JSON.stringify({ type: "module" }), "utf8");
 
   const pluginModule = await import(pathToFileURL(path.join(pluginDist, "index.js")).href);
-  const agentHarness = await import(pathToFileURL(path.join(openclawDist, "plugin-sdk", "agent-harness.js")).href);
+  const agentHarness = await import(pathToFileURL(path.join(openclawDist, "plugin-sdk", "agent-harness-runtime.js")).href);
   let hookRunnerGlobal = null;
   for (const name of await fs.readdir(openclawDist)) {
-    if (!name.startsWith("hook-runner-global-") || !name.endsWith(".js")) continue;
+    if (!name.startsWith("hook-runner-global-") || !/\.m?js$/.test(name)) continue;
     const candidate = await import(pathToFileURL(path.join(openclawDist, name)).href);
     if (typeof candidate.i === "function" && typeof candidate.t === "function") {
       hookRunnerGlobal = candidate;
@@ -52,13 +52,13 @@ try {
       },
     },
   };
-  const tools = new Map();
+  const toolFactories = [];
   const typedHooks = [];
   pluginModule.default.register({
     config,
     logger: { debug() {}, info() {}, warn() {}, error() {} },
-    registerTool(tool) {
-      tools.set(tool.name, tool);
+    registerTool(factory) {
+		toolFactories.push(factory);
     },
     registerChannel() {},
     on(hookName, handler, options = {}) {
@@ -140,6 +140,15 @@ try {
     );
   }
 
+  const tools = new Map();
+  for (const factory of toolFactories) {
+	const tool = factory({
+		messageChannel: "redis-team",
+		sessionKey: "agent:main:redis-team:group:real-hook-host",
+		nativeChannelId: "real-hook-host",
+	});
+	if (tool) tools.set(tool.name, tool);
+  }
   const artifactTool = tools.get("team_artifact_write");
   assert.ok(artifactTool, "redis-team registered team_artifact_write in the real SDK host");
   const artifactResult = await artifactTool.execute("real-host-artifact", {

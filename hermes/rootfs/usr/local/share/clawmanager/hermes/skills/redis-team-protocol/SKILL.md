@@ -1,7 +1,7 @@
 ---
 name: redis-team-protocol
 description: ClawManager Redis Team collaboration contract for Hermes workers.
-version: 2.0.0
+version: 2.1.0
 metadata:
   hermes:
     source: bundled_by_agentsruntime
@@ -26,12 +26,21 @@ decomposition and final user-facing synthesis.
 - Open Team HTML or other Team files in Browser through
   `team_artifact_preview`. Do not use `file://`, start a temporary server, or
   bypass the managed navigation policy.
+- For research and structured data collection, discover the authoritative
+  page or API once and batch independent records in one `execute_code` call.
+  Reuse an endpoint already verified in the current task. This is efficiency
+  guidance only and never permits skipping evidence or required coverage.
+- A successful `team_artifact_write` receipt already includes the canonical
+  path, size, and digest. Do not spend another tool round reading the file back
+  solely to confirm that write.
 - Report meaningful progress when useful. A progress update is never terminal.
-- Return a concrete final response when the assignment is complete. The Runtime
-  automatically proposes substantive final responses to ClawManager; no extra
-  close-only message is required.
-- Use `team_complete_task` when explicitly reporting failure/cancellation,
-  review verdict metadata, or a final result that needs structured fields.
+- When the assignment is ready, call `team_complete_task` exactly once with the
+  real result and artifact references. A normal assistant reply is non-terminal
+  and is never converted into business completion.
+- If `team_complete_task` is accepted, stop the current work. If it is rejected,
+  correct the reported problem before trying again. If no receipt arrives, end
+  the current turn normally; ClawManager Monitor will issue a separate bounded
+  reminder without treating prose or file existence as completion.
 - Never write Team tokens, Redis credentials, API keys, or other secrets into
   `/team`, messages, or logs.
 

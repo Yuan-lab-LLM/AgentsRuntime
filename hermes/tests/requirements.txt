@@ -1,0 +1,2 @@
+# Keep host-side boundary tests aligned with the locked Hermes v0.22.5 environment.
+python-dotenv==1.2.2

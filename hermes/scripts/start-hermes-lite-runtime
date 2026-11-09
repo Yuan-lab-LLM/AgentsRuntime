@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask "${CLAWMANAGER_TEAM_UMASK:-0077}"
+
+backend=/usr/local/bin/start-hermes-lite-backend
+
+case "${CLAWMANAGER_TEAM_ENABLED:-false}" in
+    1|true|TRUE|yes|YES|on|ON|enabled|ENABLED) ;;
+    *) exec "${backend}" ;;
+esac
+
+fail() { printf '%s\n' "$1" >&2; exit 64; }
+[[ -n "${CLAWMANAGER_TEAM_REDIS_URL:-}" ]] || fail 'unsupported_hermes_protocol: Team Redis URL is required'
+[[ -n "${CLAWMANAGER_TEAM_ID:-}" ]] || fail 'unsupported_hermes_protocol: Team ID is required'
+[[ -n "${CLAWMANAGER_TEAM_MEMBER_ID:-}" ]] || fail 'unsupported_hermes_protocol: Team member ID is required'
+[[ -f /opt/hermes-agent/plugins/platforms/redis_team/adapter.py ]] || fail 'unsupported_hermes_protocol: Redis Team adapter is missing'
+
+# Reuse the established Hermes Team configurator. It enables the canonical
+# redis_team platform and worker toolset while preserving the Web auth fields
+# already written atomically by the runtime agent.
+/usr/local/bin/hermes-apply-runtime-config
+
+if ! hermes profile list 2>/dev/null | grep -Eq '(^|[[:space:]◆*])default([[:space:]]|$)'; then
+    hermes profile create default --description 'ClawManager default gateway profile' >/dev/null
+fi
+
+team_pid=''
+backend_pid=''
+cleanup() {
+    trap - EXIT INT TERM
+    [[ -z "${team_pid}" ]] || kill -TERM "${team_pid}" 2>/dev/null || true
+    [[ -z "${backend_pid}" ]] || kill -TERM "${backend_pid}" 2>/dev/null || true
+    [[ -z "${team_pid}" ]] || wait "${team_pid}" 2>/dev/null || true
+    [[ -z "${backend_pid}" ]] || wait "${backend_pid}" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+# This is the same gateway/redis_team path used by the established Hermes
+# image. Serve is the single HTTP listener; the gateway is only the
+# background Team transport and agent consumer.
+hermes gateway run --accept-hooks --no-supervise &
+team_pid=$!
+"${backend}" &
+backend_pid=$!
+
+set +e
+wait -n "${team_pid}" "${backend_pid}"
+status=$?
+set -e
+cleanup
+exit "${status}"

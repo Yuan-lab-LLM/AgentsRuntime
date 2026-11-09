@@ -1,0 +1,33 @@
+# Example only: align namespace and selectors with the ClawManager deployment.
+# Both selectors in a peer are ANDed. No public Service, hostPort or Ingress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hermes-lite-internal-gateways
+  namespace: clawmanager
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: hermes-lite-runtime
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: clawmanager
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: clawmanager-backend
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: clawmanager
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: clawmanager-gateway
+      ports:
+        - protocol: TCP
+          port: 19090
+        - protocol: TCP
+          port: 20000
+          endPort: 20299

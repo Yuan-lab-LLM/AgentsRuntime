@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+# The shared runtime agent has already validated and atomically written this
+# instance's configuration. Never source a user-controlled .env as shell code.
+fail() { printf '%s\n' "$1" >&2; exit 64; }
+[[ "${CLAWMANAGER_HERMES_DESKTOP_WEB_ENABLED:-}" == true ]] || fail 'unsupported_hermes_protocol: Lite deployment flag required'
+[[ "${CLAWMANAGER_HERMES_BACKEND_MODE:-dashboard}" == dashboard ]] || fail 'unsupported_hermes_protocol: only dashboard is enabled'
+[[ -n "${CLAWMANAGER_WORKSPACE_PATH:-}" && "${HOME:-}" == "${CLAWMANAGER_WORKSPACE_PATH}/home" && "${HERMES_HOME:-}" == "${HOME}/.hermes" ]] || fail 'workspace_unavailable: invalid instance home'
+[[ -r "${HERMES_HOME}/config.yaml" && -r "${HERMES_HOME}/gateway.json" ]] || fail 'workspace_unavailable: managed configuration missing'
+[[ -n "${CLAWMANAGER_LLM_BASE_URL:-}" && -n "${CLAWMANAGER_LLM_API_KEY:-}" ]] || fail 'missing_llm_credentials'
+[[ -n "${HERMES_DASHBOARD_BASIC_AUTH_USERNAME:-}" && -n "${HERMES_DASHBOARD_BASIC_AUTH_PASSWORD:-}" ]] || fail 'dashboard_auth_failed: managed credentials missing'
+[[ "${PORT:-}" =~ ^[0-9]{1,5}$ && "${CLAWMANAGER_GATEWAY_PORT:-}" == "${PORT}" ]] || fail 'port_conflict: assigned port required'
+(( 10#${PORT} > 0 && 10#${PORT} <= 65535 )) || fail 'port_conflict: invalid assigned port'
+
+cd -- "${CLAWMANAGER_WORKSPACE_PATH}"
+exec hermes dashboard --host 0.0.0.0 --port "${PORT}" --no-open --skip-build --isolated

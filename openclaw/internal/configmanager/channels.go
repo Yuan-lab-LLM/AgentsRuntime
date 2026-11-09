@@ -6,6 +6,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 
 	appconfig "github.com/iamlovingit/clawmanager-openclaw-image/internal/config"
@@ -85,10 +87,66 @@ func applyChannelOverrides(cfg map[string]any, opts channelOverrides) error {
 		sanitized[id] = value
 	}
 	reconcileRedisTeamChannel(sanitized, supported)
+	if teamEnabledFromEnv() && os.Getenv("CLAWMANAGER_OPENCLAW_VERSION") == "2026.10.2" {
+		materializeRedisTeamEnvDefaults(sanitized)
+	}
 	reconcileRedisTeamPluginEntry(cfg, supported)
+	// Native config validation discovers disabled entries too. Selecting the
+	// image-owned managed package is independent of enabling a Team channel.
+	if os.Getenv("CLAWMANAGER_OPENCLAW_VERSION") == "2026.10.2" && managedTeamBundleEligible(opts.UserExtensionsDir) {
+		if _, ok := supported[redisTeamChannelID]; ok {
+			selectManagedBundledTeamPath(cfg, filepath.Join(opts.BundledExtensionsDir, redisTeamChannelID))
+		}
+	}
 	reconcileEnvManagedChannelPlugins(cfg, fromEnv)
 	cfg["channels"] = sanitized
 	return nil
+}
+
+func managedTeamBundleEligible(extensions string) bool {
+	data, err := os.ReadFile(filepath.Join(extensions, redisTeamChannelID, "package.json"))
+	if os.IsNotExist(err) {
+		return true
+	}
+	if err != nil {
+		return false
+	}
+	var pkg struct {
+		Name string `json:"name"`
+	}
+	if json.Unmarshal(data, &pkg) != nil {
+		return false
+	}
+	return pkg.Name == "@clawmanager/openclaw-redis-team" || pkg.Name == "@clawmanager/redis-team"
+}
+
+// Use the native bundled selector, which retains bundled provenance while
+// outranking a legacy per-instance install of the same managed Team package.
+func selectManagedBundledTeamPath(cfg map[string]any, root string) {
+	plugins, ok := cfg["plugins"].(map[string]any)
+	if !ok {
+		plugins = map[string]any{}
+		cfg["plugins"] = plugins
+	}
+	load, ok := plugins["load"].(map[string]any)
+	if !ok {
+		load = map[string]any{}
+		plugins["load"] = load
+	}
+	paths := []any{}
+	switch previous := load["paths"].(type) {
+	case []any:
+		paths = previous
+	case []string:
+		for _, p := range previous {
+			paths = append(paths, p)
+		}
+	}
+	root = filepath.ToSlash(root)
+	if !slices.ContainsFunc(paths, func(p any) bool { s, ok := p.(string); return ok && s == root }) {
+		paths = append(paths, root)
+	}
+	load["paths"] = paths
 }
 
 func parseChannelsEnvJSON(raw string, present bool) (map[string]any, error) {
@@ -165,6 +223,54 @@ func reconcileRedisTeamChannel(channels map[string]any, supported map[string]str
 				"fromEnv": true,
 			},
 		},
+	}
+}
+
+// 10.2 inspects channel configuration before loading its env-aware adapter.
+// Publish the same effective defaults as readChannelConfig, preserving explicit
+// account values and fromEnv=false accounts. This does not grant extra tools.
+func materializeRedisTeamEnvDefaults(channels map[string]any) {
+	channel, ok := channels[redisTeamChannelID].(map[string]any)
+	if !ok {
+		return
+	}
+	accounts, ok := channel["accounts"].(map[string]any)
+	if !ok {
+		return
+	}
+	for _, raw := range accounts {
+		account, ok := raw.(map[string]any)
+		if !ok || account["fromEnv"] == false {
+			continue
+		}
+		if _, exists := account["enabled"]; !exists {
+			account["enabled"] = true // caller already checked managed Team enablement
+		}
+		for configKey, envKey := range map[string]string{
+			"redisUrl": "CLAWMANAGER_TEAM_REDIS_URL", "teamId": "CLAWMANAGER_TEAM_ID",
+			"memberId": "CLAWMANAGER_TEAM_MEMBER_ID", "role": "CLAWMANAGER_TEAM_ROLE",
+			"sharedDir": "CLAWMANAGER_TEAM_SHARED_DIR", "managerUrl": "CLAWMANAGER_TEAM_MANAGER_URL",
+			"consumerGroup": "CLAWMANAGER_TEAM_CONSUMER_GROUP", "inboxKey": "CLAWMANAGER_TEAM_INBOX_KEY",
+			"eventsKey": "CLAWMANAGER_TEAM_EVENTS_KEY", "presenceKey": "CLAWMANAGER_TEAM_PRESENCE_KEY",
+			"dlqKey": "CLAWMANAGER_TEAM_DLQ_KEY",
+		} {
+			current, _ := account[configKey].(string)
+			if strings.TrimSpace(current) == "" {
+				if value := strings.TrimSpace(os.Getenv(envKey)); value != "" {
+					account[configKey] = value
+				}
+			}
+		}
+		if _, exists := account["autoRun"]; !exists {
+			if value := strings.TrimSpace(os.Getenv("CLAWMANAGER_TEAM_AUTORUN")); value != "" {
+				account["autoRun"] = value == "1" || strings.EqualFold(value, "true") || strings.EqualFold(value, "yes") || strings.EqualFold(value, "on")
+			}
+		}
+		if _, exists := account["embeddedTimeoutSeconds"]; !exists {
+			if value, err := strconv.Atoi(os.Getenv("CLAWMANAGER_TEAM_EMBEDDED_TIMEOUT_SECONDS")); err == nil && value > 0 {
+				account["embeddedTimeoutSeconds"] = value
+			}
+		}
 	}
 }
 

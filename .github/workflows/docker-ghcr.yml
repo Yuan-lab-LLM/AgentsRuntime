@@ -1,12 +1,40 @@
 name: Build and push runtime images
 
 "on":
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/docker-ghcr.yml"
+      - ".dockerignore"
+      - "clawmanager-agent/**"
+      - "legacy-agent/**"
+      - "deepseek-harness/**"
+      - "hermes/**"
+      - "openclaw/**"
+      - "opencode/**"
+      - "tests/lite/**"
   workflow_dispatch:
     inputs:
       image_namespace:
         description: "Image namespace prefix, for example ghcr.io/owner/repo or 172.16.1.12:5010"
         required: false
         default: ""
+      runtime:
+        description: "Runtime image to build"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - hermes
+          - hermes-lite
+          - openclaw
+          - openclaw-lite
+          - opencode
+          - opencode-lite
+          - deepseek-harness
+          - deepseek-harness-lite
 
 permissions:
   contents: read
@@ -29,12 +57,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Verify Lite image build contracts
+        run: |
+          python3 tests/lite/check_build_contract.py
+          python3 tests/lite/check_entrypoints.py
+
       - name: Resolve image matrix
         id: prepare
         shell: bash
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           IMAGE_NAMESPACE_INPUT: ${{ inputs.image_namespace }}
+          RUNTIME_INPUT: ${{ inputs.runtime }}
         run: |
           set -euo pipefail
 
@@ -54,11 +88,42 @@ jobs:
 
           specs=(
             "hermes|.|./hermes/Dockerfile|hermes"
-            "hermes-lite|.|./hermes/Dockerfile|hermes-lite"
+            "hermes-lite|.|./hermes/Dockerfile.lite|hermes-lite"
             "openclaw|.|./openclaw/Dockerfile.openclaw|openclaw"
-            "openclaw-lite|.|./openclaw/Dockerfile.openclaw|openclaw-lite"
-            "openclaw-shell|.|./openclaw-shell/Dockerfile|openclaw-shell"
+            "openclaw-lite|.|./openclaw/Dockerfile.lite|openclaw-lite"
+            "opencode|.|./opencode/Dockerfile|opencode"
+            "opencode-lite|.|./opencode/Dockerfile.lite|opencode-lite"
+            "deepseek-harness|.|./deepseek-harness/Dockerfile.pro|deepseek-harness"
+            "deepseek-harness-lite|.|./deepseek-harness/Dockerfile.lite|deepseek-harness-lite"
           )
+
+          # Changes on the default branch publish all four Lite runtimes and the
+          # existing Pro variants selected by the workflow path filter. Manual
+          # dispatches may publish either the full matrix or one selected runtime.
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            specs=(
+              "hermes|.|./hermes/Dockerfile|hermes"
+              "hermes-lite|.|./hermes/Dockerfile.lite|hermes-lite"
+              "openclaw|.|./openclaw/Dockerfile.openclaw|openclaw"
+              "openclaw-lite|.|./openclaw/Dockerfile.lite|openclaw-lite"
+              "opencode-lite|.|./opencode/Dockerfile.lite|opencode-lite"
+              "deepseek-harness|.|./deepseek-harness/Dockerfile.pro|deepseek-harness"
+              "deepseek-harness-lite|.|./deepseek-harness/Dockerfile.lite|deepseek-harness-lite"
+            )
+          elif [ -n "${RUNTIME_INPUT}" ] && [ "${RUNTIME_INPUT}" != "all" ]; then
+            selected=()
+            for spec in "${specs[@]}"; do
+              IFS="|" read -r runtime _ <<< "${spec}"
+              if [ "${runtime}" = "${RUNTIME_INPUT}" ]; then
+                selected+=("${spec}")
+              fi
+            done
+            if [ "${#selected[@]}" -ne 1 ]; then
+              echo "Unknown runtime selection: ${RUNTIME_INPUT}" >&2
+              exit 1
+            fi
+            specs=("${selected[@]}")
+          fi
 
           entries=()
           for spec in "${specs[@]}"; do

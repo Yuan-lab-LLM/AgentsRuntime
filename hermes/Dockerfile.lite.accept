@@ -1,0 +1,15 @@
+# syntax=docker/dockerfile:1.7
+# Offline promotion only after a real signed six-suite campaign.
+# Use --no-cache-filter promotion so each attempt really reruns the five local
+# suites. The fixed public key and verifier are already inside the candidate.
+# Context contains only evidence/. No private key, source or workspace copied.
+ARG CANDIDATE
+FROM ${CANDIDATE} AS promotion
+ARG CANDIDATE
+COPY --chown=0:0 evidence/ /usr/local/share/hermes-lite/evidence/
+RUN --network=none --mount=type=tmpfs,target=/tmp chmod 1777 /tmp \
+    && find /usr/local/share/hermes-lite/evidence -type d -exec chmod 0755 '{}' + \
+    && find /usr/local/share/hermes-lite/evidence -type f -exec chmod 0444 '{}' + \
+    && python /usr/local/share/hermes-lite/verify_lite_release.py \
+    --lock /usr/local/share/hermes-lite/source-lock.json \
+    --accept-release --candidate-image "${CANDIDATE}"

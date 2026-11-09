@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+target_nofile="${DSH_NOFILE_SOFT:-65536}"
+case "${target_nofile}" in
+  ''|*[!0-9]*)
+    echo "deepseek-harness: DSH_NOFILE_SOFT must be a positive integer" >&2
+    exit 2
+    ;;
+esac
+if [ "${target_nofile}" -lt 1024 ]; then
+  echo "deepseek-harness: DSH_NOFILE_SOFT must be at least 1024" >&2
+  exit 2
+fi
+
+soft_nofile="$(ulimit -Sn)"
+hard_nofile="$(ulimit -Hn)"
+desired_nofile="${target_nofile}"
+if [ "${hard_nofile}" != "unlimited" ] && [ "${desired_nofile}" -gt "${hard_nofile}" ]; then
+  desired_nofile="${hard_nofile}"
+fi
+
+if [ "${soft_nofile}" != "unlimited" ] && [ "${soft_nofile}" -lt "${desired_nofile}" ]; then
+  if ! ulimit -Sn "${desired_nofile}"; then
+    echo "deepseek-harness: unable to raise soft nofile from ${soft_nofile} to ${desired_nofile} (hard=${hard_nofile})" >&2
+    exit 1
+  fi
+fi
+
+effective_nofile="$(ulimit -Sn)"
+echo "deepseek-harness: nofile soft=${effective_nofile} hard=${hard_nofile} requested=${target_nofile}"
+
+inotify_instances_file=/proc/sys/fs/inotify/max_user_instances
+inotify_watches_file=/proc/sys/fs/inotify/max_user_watches
+if [ -r "${inotify_instances_file}" ] && [ -r "${inotify_watches_file}" ]; then
+  inotify_instances="$(cat "${inotify_instances_file}")"
+  inotify_watches="$(cat "${inotify_watches_file}")"
+  echo "deepseek-harness: host inotify max_user_instances=${inotify_instances} max_user_watches=${inotify_watches}"
+  if [ "${inotify_instances}" -lt 1024 ] || [ "${inotify_watches}" -lt 524288 ]; then
+    echo "deepseek-harness: warning: host inotify limits are below the recommended 1024/524288; configure every eligible Kubernetes node via /etc/sysctl.d/99-clawmanager-inotify.conf" >&2
+  fi
+fi

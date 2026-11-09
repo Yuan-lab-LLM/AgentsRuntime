@@ -1,7 +1,6 @@
 {
     "meta": {
-      "lastTouchedVersion": "2026.3.23-1",
-      "lastTouchedAt": "2026-03-25T01:00:37.398Z"
+      "lastTouchedVersion": "2026.8.1"
     },
     "wizard": {
       "lastRunAt": "2026-03-16T03:25:45.587Z",
@@ -54,20 +53,15 @@
         "model": {
           "primary": "auto/model-id"
         },
-        "models": {
-          "auto/model-id": {}
+        "modelPolicy": {
+          "allow": [
+            "auto/model-id"
+          ]
         },
         "workspace": "/config/.openclaw/workspace",
-        "memorySearch": {
-          "enabled": true,
-          "provider": "none"
-        },
         "compaction": {
           "mode": "default",
-          "reserveTokens": 32768,
-          "reserveTokensFloor": 20000,
           "keepRecentTokens": 30000,
-          "maxHistoryShare": 0.65,
           "notifyUser": true,
           "memoryFlush": {
             "enabled": true
@@ -77,6 +71,12 @@
         "subagents": {
           "maxConcurrent": 8
         }
+      }
+    },
+    "memory": {
+      "search": {
+        "enabled": true,
+        "provider": "none"
       }
     },
     "hooks": {
@@ -101,23 +101,20 @@
       }
     },
     "tools": {
-      "profile": "full"
+      "profile": "full",
+      "swarm": {
+        "enabled": false
+      }
     },
     "commands": {
       "native": "auto",
       "nativeSkills": "auto",
-      "restart": true,
-      "ownerDisplay": "raw"
+      "restart": true
     },
     "channels": {},
     "cron": {
       "enabled": true,
-      "maxConcurrentRuns": 2,
-      "sessionRetention": "24h",
-      "runLog": {
-          "maxBytes": "2mb",
-          "keepLines": 2000
-      }
+      "sessionRetention": "24h"
     },
     "gateway": {
       "port": 18789,
@@ -134,19 +131,20 @@
         "token": "032d4976ab4def9dca229e5862ffe4d00e7076cd49b73ee629172bca10ce0abe"
       },
       "tailscale": {
-        "mode": "off",
-        "resetOnExit": false
+        "mode": "off"
       },
       "nodes": {
-        "denyCommands": [
-          "camera.snap",
-          "camera.clip",
-          "screen.record",
-          "contacts.add",
-          "calendar.add",
-          "reminders.add",
-          "sms.send"
-        ]
+        "commands": {
+          "deny": [
+            "camera.snap",
+            "camera.clip",
+            "screen.record",
+            "contacts.add",
+            "calendar.add",
+            "reminders.add",
+            "sms.send"
+          ]
+        }
       }
     },
     "plugins": {
@@ -154,14 +152,8 @@
         "bonjour": {
           "enabled": false
         },
-        "acpx": {
-          "enabled": false
-        },
         "browser": {
           "enabled": true
-        },
-        "phone-control": {
-          "enabled": false
         },
         "talk-voice": {
           "enabled": false
@@ -176,6 +168,12 @@
           "enabled": false
         },
         "redis-team": {
+          "enabled": false
+        },
+        "a2a": {
+          "enabled": false
+        },
+        "workboard": {
           "enabled": false
         },
         "memory-core": {

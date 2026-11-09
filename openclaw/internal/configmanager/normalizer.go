@@ -8,6 +8,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	appconfig "github.com/iamlovingit/clawmanager-openclaw-image/internal/config"
@@ -73,6 +74,7 @@ func normalizeConfigMap(content []byte, cfg appconfig.Config) ([]byte, bool, err
 		normalizeLLMConfigContent(parsed, llm)
 	}
 	normalizeProviderAuthContracts(parsed)
+	normalizeOpenClawVersionContracts(parsed, os.Getenv("CLAWMANAGER_OPENCLAW_VERSION"))
 
 	channelOpts := readChannelOverridesFromEnv(cfg)
 	if err := applyChannelOverrides(parsed, channelOpts); err != nil {
@@ -84,6 +86,182 @@ func normalizeConfigMap(content []byte, cfg appconfig.Config) ([]byte, bool, err
 		return nil, false, err
 	}
 	return normalized, !bytes.Equal(content, normalized), nil
+}
+
+func normalizeOpenClawVersionContracts(cfg map[string]any, version string) {
+	if !isOpenClaw81OrNewer(version) {
+		return
+	}
+
+	cron := ensureObject(cfg, "cron")
+	delete(cron, "maxConcurrentRuns")
+	delete(cron, "runLog")
+	if _, ok := cron["enabled"]; !ok {
+		cron["enabled"] = true
+	}
+	if _, ok := cron["sessionRetention"]; !ok {
+		cron["sessionRetention"] = "24h"
+	}
+
+	gatewayConfig := ensureObject(cfg, "gateway")
+	controlUI := ensureObject(gatewayConfig, "controlUi")
+	delete(controlUI, "dangerouslyDisableDeviceAuth")
+	nodes := ensureObject(gatewayConfig, "nodes")
+	commands := ensureObject(nodes, "commands")
+	commands["deny"] = mergeStringLists(commands["deny"], nodes["denyCommands"])
+	delete(nodes, "denyCommands")
+	delete(gatewayConfig, "roles")
+	delete(cfg, "cloudWorkers")
+
+	tools := ensureObject(cfg, "tools")
+	ensureObject(tools, "swarm")["enabled"] = false
+	entries := ensureObject(ensureObject(cfg, "plugins"), "entries")
+	ensureObject(entries, "a2a")["enabled"] = false
+	ensureObject(entries, "workboard")["enabled"] = false
+	if channels, ok := cfg["channels"].(map[string]any); ok {
+		delete(channels, "a2a")
+	}
+
+	normalizeOpenClaw81RetiredConfig(cfg)
+}
+
+func normalizeOpenClaw81RetiredConfig(cfg map[string]any) {
+	if meta, ok := cfg["meta"].(map[string]any); ok {
+		delete(meta, "lastTouchedAt")
+	}
+
+	rootSearch := ensureObject(ensureObject(cfg, "memory"), "search")
+	mergeMissingMapValues(rootSearch, mapValue(cfg["memorySearch"]))
+	delete(cfg, "memorySearch")
+
+	agents := ensureObject(cfg, "agents")
+	defaults := ensureObject(agents, "defaults")
+	mergeMissingMapValues(rootSearch, mapValue(defaults["memorySearch"]))
+	delete(defaults, "memorySearch")
+	if compaction, ok := defaults["compaction"].(map[string]any); ok {
+		delete(compaction, "reserveTokens")
+		delete(compaction, "reserveTokensFloor")
+		delete(compaction, "maxHistoryShare")
+	}
+	migrateLegacyModelAllowlist(defaults)
+	if list, ok := agents["list"].([]any); ok {
+		for _, value := range list {
+			agent, ok := value.(map[string]any)
+			if !ok {
+				continue
+			}
+			legacy := mapValue(agent["memorySearch"])
+			if legacy != nil {
+				mergeMissingMapValues(ensureObject(ensureObject(agent, "memory"), "search"), legacy)
+				delete(agent, "memorySearch")
+			}
+			if compaction, ok := agent["compaction"].(map[string]any); ok {
+				delete(compaction, "reserveTokens")
+				delete(compaction, "reserveTokensFloor")
+				delete(compaction, "maxHistoryShare")
+			}
+		}
+	}
+
+	commands := ensureObject(cfg, "commands")
+	delete(commands, "ownerDisplay")
+	delete(commands, "ownerDisplaySecret")
+	if tailscale, ok := ensureObject(cfg, "gateway")["tailscale"].(map[string]any); ok {
+		delete(tailscale, "resetOnExit")
+	}
+	if browser, ok := cfg["browser"].(map[string]any); ok {
+		delete(browser, "color")
+		if profiles, ok := browser["profiles"].(map[string]any); ok {
+			for _, value := range profiles {
+				if profile, ok := value.(map[string]any); ok {
+					delete(profile, "color")
+				}
+			}
+		}
+	}
+}
+
+func migrateLegacyModelAllowlist(defaults map[string]any) {
+	legacy, ok := defaults["models"].(map[string]any)
+	if !ok {
+		return
+	}
+	refs := make([]string, 0, len(legacy))
+	for ref := range legacy {
+		if strings.TrimSpace(ref) != "" {
+			refs = append(refs, ref)
+		}
+	}
+	sort.Strings(refs)
+	policy := ensureObject(defaults, "modelPolicy")
+	legacyRefs := make([]any, 0, len(refs))
+	for _, ref := range refs {
+		legacyRefs = append(legacyRefs, ref)
+	}
+	policy["allow"] = mergeStringLists(policy["allow"], legacyRefs)
+	delete(defaults, "models")
+}
+
+func mapValue(value any) map[string]any {
+	object, _ := value.(map[string]any)
+	return object
+}
+
+func mergeMissingMapValues(target, source map[string]any) {
+	for key, value := range source {
+		if _, exists := target[key]; !exists {
+			target[key] = value
+		}
+	}
+}
+
+func isOpenClaw81OrNewer(version string) bool {
+	version = strings.TrimSpace(strings.TrimPrefix(strings.ToLower(version), "v"))
+	var year, month, patch int
+	if _, err := fmt.Sscanf(version, "%d.%d.%d", &year, &month, &patch); err != nil {
+		return false
+	}
+	if year != 2026 {
+		return year > 2026
+	}
+	if month != 8 {
+		return month > 8
+	}
+	return patch >= 1
+}
+
+func mergeStringLists(values ...any) []any {
+	seen := map[string]struct{}{}
+	merged := []any{}
+	for _, value := range values {
+		switch items := value.(type) {
+		case []any:
+			for _, item := range items {
+				text := strings.TrimSpace(stringValue(item))
+				if text == "" {
+					continue
+				}
+				if _, ok := seen[text]; ok {
+					continue
+				}
+				seen[text] = struct{}{}
+				merged = append(merged, text)
+			}
+		case []string:
+			for _, item := range items {
+				text := strings.TrimSpace(item)
+				if text == "" {
+					continue
+				}
+				if _, ok := seen[text]; ok {
+					continue
+				}
+				seen[text] = struct{}{}
+				merged = append(merged, text)
+			}
+		}
+	}
+	return merged
 }
 
 func normalizePluginInstallRegistry(cfg appconfig.Config) error {
@@ -172,6 +350,7 @@ type llmOverrides struct {
 	APIKey    string
 	APIKeySet bool
 	ModelIDs  []string
+	Vision    map[string]bool
 }
 
 func readLLMOverridesFromEnv() (llmOverrides, bool, error) {
@@ -185,6 +364,19 @@ func readLLMOverridesFromEnv() (llmOverrides, bool, error) {
 		overrides.ModelIDs = modelIDs
 	}
 
+	if raw := strings.TrimSpace(os.Getenv("CLAWMANAGER_LLM_VISION")); raw != "" {
+		var values map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(raw), &values); err != nil || values == nil {
+			return llmOverrides{}, false, fmt.Errorf("invalid CLAWMANAGER_LLM_VISION")
+		}
+		overrides.Vision = map[string]bool{}
+		for id, v := range values {
+			if string(v) != "true" && string(v) != "false" {
+				return llmOverrides{}, false, fmt.Errorf("invalid vision capability")
+			}
+			overrides.Vision[id] = string(v) == "true"
+		}
+	}
 	overrides.BaseURL = firstNonEmptyEnv("CLAWMANAGER_LLM_BASE_URL")
 	overrides.APIKey, overrides.APIKeySet = firstLookupEnv("CLAWMANAGER_LLM_API_KEY")
 
@@ -270,6 +462,26 @@ func normalizeLLMConfigContent(cfg map[string]any, overrides llmOverrides) {
 	}
 	if len(overrides.ModelIDs) > 0 {
 		provider["models"] = buildProviderModels(provider["models"], overrides.ModelIDs)
+		for _, entry := range provider["models"].([]any) {
+			model := entry.(map[string]any)
+			if enabled, ok := overrides.Vision[stringValue(model["id"])]; ok {
+				input := []any{}
+				if previous, ok := model["input"].([]any); ok {
+					for _, value := range previous {
+						if s, ok := value.(string); ok && !strings.HasPrefix(s, "image") {
+							input = append(input, s)
+						}
+					}
+				}
+				if len(input) == 0 {
+					input = append(input, "text")
+				}
+				if enabled {
+					input = append(input, "image")
+				}
+				model["input"] = input
+			}
+		}
 
 		agents := ensureObject(cfg, "agents")
 		defaults := ensureObject(agents, "defaults")
