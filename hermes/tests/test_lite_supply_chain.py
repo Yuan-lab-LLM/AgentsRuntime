@@ -56,13 +56,51 @@ class ReleaseTests(unittest.TestCase):
             path = Path(temporary) / "pyproject.toml"
             path.write_text("modified")
             lock = verify.load_lock(ROOT / "hermes-lite.lock.json")
+            lock["source_sha256"] = {"pyproject.toml": lock["source_sha256"]["pyproject.toml"]}
             with self.assertRaisesRegex(ValueError, "checksum mismatch"):
                 verify.verify_source(lock, temporary)
+
+    def test_semver_identity_cannot_drift_from_the_release_tag(self):
+        source = verify.load_lock(ROOT / "hermes-lite.lock.json")
+        self.assertEqual("v0.22.5", source["tag"])
+        self.assertEqual("0.0.0", source["source_package_version"])
+        for changes in ({"tag": "v0.22.6"}, {"tag": "v0.22.5-rc1"}, {"python_version": "3.13"}):
+            with self.subTest(changes=changes), tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "lock.json"
+                path.write_text(json.dumps(dict(source, **changes)))
+                with self.assertRaises(ValueError):
+                    verify.load_lock(path)
 
     def test_runtime_version_mismatch_is_rejected(self):
         lock = verify.load_lock(ROOT / "hermes-lite.lock.json")
         with patch.object(verify.subprocess, "check_output", return_value="Hermes v0.16.0"), self.assertRaises(ValueError):
             verify.verify_runtime(lock, "hermes", "node")
+
+    def test_install_stamp_binds_release_commit_and_external_updates(self):
+        lock = verify.load_lock(ROOT / "hermes-lite.lock.json")
+        stamp = {"schemaVersion": 2, "commit": lock["commit"], "baseVersion": lock["package_version"],
+                 "distance": 0, "source": "docker", "distribution": "docker", "updateMechanism": "external"}
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "install-stamp.json"
+            stamp["pmRuntime"] = str(Path(temporary) / "pm-runtime")
+            path.write_text(json.dumps(stamp))
+            verify.verify_install_stamp(lock, temporary)
+            for key, value in (("commit", "a" * 40), ("baseVersion", "0.21.0"), ("updateMechanism", "self"), ("distance", False)):
+                path.write_text(json.dumps(dict(stamp, **{key: value})))
+                with self.subTest(key=key), self.assertRaisesRegex(ValueError, "install stamp mismatch"):
+                    verify.verify_install_stamp(lock, temporary)
+
+    def test_corrupt_cached_archive_is_rejected_without_using_network(self):
+        lock = verify.load_lock(ROOT / "hermes-lite.lock.json")
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary) / "cache"
+            cache.mkdir()
+            (cache / (lock["archive_sha256"] + ".tar.gz")).write_bytes(b"corrupted archive")
+            destination = Path(temporary) / "source"
+            with patch.object(verify.urllib.request, "urlopen", side_effect=AssertionError("unexpected network")):
+                with self.assertRaisesRegex(ValueError, "archive checksum mismatch"):
+                    verify.download_source(lock, destination, cache)
+            self.assertFalse(destination.exists())
 
     def test_reviewed_patch_and_test_inputs_cannot_be_omitted_or_changed(self):
         lock = verify.load_lock(ROOT / "hermes-lite.lock.json")

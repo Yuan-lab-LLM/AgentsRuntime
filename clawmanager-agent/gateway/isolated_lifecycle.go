@@ -15,9 +15,14 @@ import (
 type isolatedProcessLog struct {
 	once                   sync.Once
 	instanceID, generation int
+	timingMu               sync.Mutex
+	timingLine             []byte
+	timingOverflow         bool
+	timingSeen             map[string]bool
 }
 
 func (w *isolatedProcessLog) Write(data []byte) (int, error) {
+	w.startupTimings(data)
 	w.once.Do(func() {
 		log.Printf("runtime-agent backend output received: instance_id=%d generation=%d category=backend_output_redacted", w.instanceID, w.generation)
 	})
@@ -267,6 +272,7 @@ func (m *GatewayManager) runIsolatedGateway(ctx context.Context, record *gateway
 		failure = fmt.Errorf("network execution preparation unavailable")
 		return
 	}
+	stageStarted := time.Now()
 	workspace := record.state.WorkspacePath
 	if m.cfg.SandboxProfile == "nfs-rootless-v1" {
 		preparer, ok := m.starter.(interface {
@@ -307,6 +313,7 @@ func (m *GatewayManager) runIsolatedGateway(ctx context.Context, record *gateway
 		}
 	}
 
+	logStartupStage(m.cfg.RuntimeType, req, "storage_prepare", stageStarted)
 	spec := GatewayStartSpec{GatewayID: record.state.GatewayID, RuntimeType: m.cfg.RuntimeType,
 		InstanceID: req.InstanceID, UserID: req.UserID, WorkspacePath: workspace, Port: record.state.Port,
 		UID: req.UID, GID: req.GID, Generation: req.Generation, CPUCores: req.CPUCores, MemoryMB: req.MemoryMB, DiskQuotaMB: req.DiskQuotaMB,
@@ -315,7 +322,9 @@ func (m *GatewayManager) runIsolatedGateway(ctx context.Context, record *gateway
 		spec.Command = append([]string(nil), m.cfg.GatewayCommand...)
 	}
 	for {
+		stageStarted = time.Now()
 		process, failure = m.starter.StartGateway(ctx, spec)
+		logStartupStage(m.cfg.RuntimeType, req, "process_spawn", stageStarted)
 		m.mu.Lock()
 		record.process, record.state.PID = process, process.PID
 		record.startSpec, record.request = spec, req
@@ -389,6 +398,7 @@ func (m *GatewayManager) runIsolatedGateway(ctx context.Context, record *gateway
 func (m *GatewayManager) monitorIsolatedGateway(ctx context.Context, record *gatewayRecord, req CreateGatewayRequest, spec GatewayStartSpec, process ManagedProcess) (failure error) {
 	healthCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	stageStarted := time.Now()
 	ready := make(chan error, 1)
 	go func() { ready <- m.waitGatewayReady(healthCtx, spec, process) }()
 	select {
@@ -402,6 +412,8 @@ func (m *GatewayManager) monitorIsolatedGateway(ctx context.Context, record *gat
 			return failure
 		}
 	}
+	logStartupStage(m.cfg.RuntimeType, req, "backend_ready_wait", stageStarted)
+	stageStarted = time.Now()
 	select {
 	case <-process.Done:
 		failure = fmt.Errorf("gateway_process_exited")
@@ -426,6 +438,7 @@ func (m *GatewayManager) monitorIsolatedGateway(ctx context.Context, record *gat
 	if failure = m.Health(); failure != nil {
 		return failure
 	}
+	logStartupStage(m.cfg.RuntimeType, req, "final_health", stageStarted)
 	m.mu.Lock()
 	m.ports.Commit(req.InstanceID, req.Generation, spec.Port)
 	record.state.State, record.state.HealthAt, record.state.UpdatedAt = "running", time.Now().UTC(), time.Now().UTC()

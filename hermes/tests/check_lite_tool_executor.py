@@ -49,9 +49,8 @@ def check_native_executor(agent):
             assert len(results) == len(policy.NATIVE_TOOLS), "concurrent native calls did not all complete"
             assert all(json.loads(result["content"]) == {"error": "unsupported_native_desktop_tool"} for result in results)
 
-            # Locked Hermes keeps native GUI/core tools out of deferred aliases.
-            # Exercise real parsing and execution; an alias cannot reach a native
-            # branch even when an old warm dispatch table still offers its name.
+            # v0.22.5 can defer GUI tools. Exercise the real parser and executor:
+            # both known aliases and removed legacy names must remain blocked.
             from tools import tool_search
             alias_checks = 0
             agent.valid_tool_names.add(tool_search.TOOL_CALL_NAME)
@@ -61,16 +60,24 @@ def check_native_executor(agent):
                 agent._tool_guardrails.reset_for_turn()
                 args = {"name": name, "arguments": {"action": "capture"} if name == "computer_use" else {}}
                 underlying, _, error = tool_search.resolve_underlying_call(args)
-                assert underlying is None and "not a deferrable tool" in error, "native tool unexpectedly became deferrable"
+                assert underlying == name or (underlying is None and error), "unexpected native alias resolution"
                 message = SimpleNamespace(tool_calls=[SimpleNamespace(
                     id="alias-native-" + name,
                     function=SimpleNamespace(name=tool_search.TOOL_CALL_NAME, arguments=json.dumps(args)),
                 )])
                 results = []
                 tool_executor.execute_tool_calls_sequential(agent, message, results, "executor-fixture", finalize=False)
-                assert len(results) == 1 and "not a deferrable tool" in str(json.loads(results[0]["content"]).get("error", "")), "native alias escaped the real parser"
+                assert len(results) == 1 and json.loads(results[0]["content"]) == {"error": "unsupported_native_desktop_tool"}, "native alias escaped the real parser"
                 alias_checks += 1
             assert alias_checks == len(policy.NATIVE_TOOLS)
+            concurrent_aliases = SimpleNamespace(tool_calls=[SimpleNamespace(
+                id="concurrent-alias-" + name,
+                function=SimpleNamespace(name=tool_search.TOOL_CALL_NAME, arguments=json.dumps({"name": name, "arguments": {}})),
+            ) for name in sorted(policy.NATIVE_TOOLS)])
+            results = []
+            tool_executor.execute_tool_calls_concurrent(agent, concurrent_aliases, results, "executor-fixture", finalize=False)
+            assert len(results) == len(policy.NATIVE_TOOLS), "concurrent native aliases did not complete"
+            assert all(json.loads(result["content"]) == {"error": "unsupported_native_desktop_tool"} for result in results)
         finally:
             agent.valid_tool_names = old_names
 
