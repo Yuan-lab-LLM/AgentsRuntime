@@ -416,6 +416,17 @@ class BackgroundTurnLifecycleTests(unittest.TestCase):
         self.assertNotIn("s", self.ns["_sessions"])
 
 
+    def test_queued_turn_survives_the_completion_to_dispatch_handoff(self):
+        self.ns["_close_sessions_for_transport"](self.transport)
+        self.session["running"] = False
+        for key in ("queued_prompt", "queued_prompts"):
+            with self.subTest(key=key):
+                self.session[key] = {"text": "accepted next turn"} if key == "queued_prompt" else [{"text": "accepted next turn"}]
+                self.timers[-1].callback()
+                self.assertIs(self.session, self.ns["_sessions"].get("s"))
+                self.assertEqual([], self.closed)
+                self.session.pop(key)
+
     def test_non_lite_disconnect_policy_remains_unchanged(self):
         self.ns["_close_sessions_for_transport"](self.transport)
         with patch.object(policy, "ENABLED", False):

@@ -59,7 +59,8 @@ def patched_sources(root):
     server = replace_once(server,
                           '            if _session_has_active_delegations(sid, current):\n',
                           '            if (_session_has_active_delegations(sid, current)\n'
-                          '                    or (_lite_non_native.ENABLED and current.get("running"))):\n')
+                          '                    or (_lite_non_native.ENABLED and (current.get("running")\n'
+                          '                        or current.get("queued_prompt") or current.get("queued_prompts")))):\n')
     # Explicit close, disconnect, supersession and orphan reaping already claim
     # under the resume lock. Bring the idle/LRU/shutdown convenience funnel into
     # that same lifecycle order; keep slow finalization outside both locks.
