@@ -84,7 +84,7 @@ def check():
                 "HERMES_IGNORE_RULES": "true", "HERMES_QUIET": "1",
                 "HERMES_TUI_WS_ORPHAN_REAP_GRACE_S": "0",
             })
-            import yaml
+            import hermes_yaml as yaml
             config = {
                 "model": {"provider": "clawmanager", "default": "fixture-model", "base_url": endpoint},
                 "providers": {"clawmanager": {"name": "clawmanager", "base_url": endpoint, "key_env": "OPENAI_API_KEY", "enabled": True, "api_mode": "chat_completions"}},

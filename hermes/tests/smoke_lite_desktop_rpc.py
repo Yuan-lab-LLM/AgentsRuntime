@@ -26,7 +26,7 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import InvalidStatus
 
 ORIGIN = "http://clawmanager-gateway.smoke.svc:9001"
-NATIVE_NAMES = {"read_terminal", "close_terminal", "desktop_preview", "drive_preview", "annotate_preview", "read_window_below", "focus_pane", "react_to_message", "setup_mcp", "tour", "tip", "desktop_project", "computer_use"}
+from hermes_cli.lite_non_native import NATIVE_TOOLS as NATIVE_NAMES
 
 
 def require(condition, message):
@@ -162,6 +162,7 @@ class RPC:
         self.socket = socket
         self.pending = {}
         self.events = []
+        self.requests = []
         self.sequence = 0
         self.changed = asyncio.Condition()
         self.reader = asyncio.create_task(self.read())
@@ -182,6 +183,10 @@ class RPC:
                     elif packet.get("method") == "event":
                         async with self.changed:
                             self.events.append(packet.get("params", {}))
+                            self.changed.notify_all()
+                    elif "id" in packet and packet.get("method") in {"clarify", "approval"}:
+                        async with self.changed:
+                            self.requests.append(packet)
                             self.changed.notify_all()
         except Exception as error:
             for future in self.pending.values():
@@ -216,6 +221,19 @@ class RPC:
         self.reader.cancel()
         await asyncio.gather(self.reader, return_exceptions=True)
 
+    async def server_request(self, method, sid, after=0):
+        async def find():
+            async with self.changed:
+                while True:
+                    for packet in self.requests[after:]:
+                        if packet["method"] == method and packet.get("params", {}).get("session_id") == sid:
+                            return packet
+                    await self.changed.wait()
+        return await asyncio.wait_for(find(), 60)
+
+    async def reply(self, request, result):
+        await self.socket.send(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}))
+
 
 class Fixture:
     def __init__(self, root, instance_id=77):
@@ -229,7 +247,7 @@ class Fixture:
         self.stub = ModelStub(self.workspace, self.secrets[1])
         self.port = 19940 + instance_id
         self.base = "http://127.0.0.1:" + str(self.port)
-        import yaml
+        import hermes_yaml as yaml
         config = {"model": {"provider": "clawmanager", "default": "smoke-model"}, "providers": {"clawmanager": {"name": "clawmanager", "base_url": self.stub.url, "key_env": "OPENAI_API_KEY", "enabled": True, "api_mode": "chat_completions"}}, "approvals": {"mode": "manual"}, "agent": {"max_turns": 8}, "memory": {"memory_enabled": False, "user_profile_enabled": False}}
         (self.state / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
         (self.state / "gateway.json").write_text("{}", encoding="utf-8")
@@ -299,7 +317,9 @@ class Fixture:
     async def connect(self, ticket=None):
         socket = await connect(self.base.replace("http:", "ws:") + "/api/ws", origin=ORIGIN, subprotocols=["hermes-gateway-v1", "hermes-gateway-ticket." + (ticket or self.ticket())], open_timeout=15, max_size=8 << 20, proxy=None)
         require(socket.subprotocol == "hermes-gateway-v1", "secret subprotocol selected or public protocol missing")
-        return RPC(socket)
+        rpc = RPC(socket)
+        await rpc.call("client.capabilities", {"server_requests": True})
+        return rpc
 
     def stop(self):
         if self.process and self.process.poll() is None:
@@ -420,22 +440,20 @@ async def exercise(fixture, cases):
 
         for marker, event_name, method, choice in (("SMOKE_CLARIFY", "clarify.request", "clarify.respond", "alpha"), ("SMOKE_ONCE", "approval.request", "approval.respond", "once"), ("SMOKE_DENY", "approval.request", "approval.respond", "deny")):
             offset = len(rpc.events)
+            request_offset = len(rpc.requests)
             await rpc.call("prompt.submit", {"session_id": sid, "text": marker})
-            event = await rpc.event(event_name, sid, offset)
-            payload = event.get("payload", {})
-            params = {"session_id": sid, "request_id": payload["request_id"]}
+            request = await rpc.server_request("clarify" if method == "clarify.respond" else "approval", sid, request_offset)
+            payload = request["params"]
             if method == "clarify.respond":
-                params["answer"] = choice
-                if payload.get("questions"):
-                    params["question_id"] = payload["questions"][0]["qid"]
+                answer = {"answers": {question["qid"]: choice for question in payload["questions"]}, "outcome": "submitted"}
             else:
-                params["choice"] = choice
                 pending = await rpc.call("approval.pending", {"session_id": sid})
                 require(any(row.get("request_id") == payload["request_id"] for row in pending.get("approvals", [])), "pending approval replay missing")
-                require(all(set(row.get("choices", [])) <= {"once", "deny"} for row in pending["approvals"]), "standing approval escaped replay")
+                require({"once", "deny"} <= set(payload.get("choices", [])), "approval request omitted explicit allow/deny")
                 acknowledged = await rpc.call("approval.received", {"session_id": sid, "request_id": payload["request_id"]})
                 require(acknowledged.get("acknowledged") is True, "pending approval acknowledgement failed")
-            await rpc.call(method, params)
+                answer = {"choice": choice}
+            await rpc.reply(request, answer)
             await rpc.event("message.complete", sid, offset)
             if marker == "SMOKE_ONCE":
                 require(not (fixture.workspace / "allow-fixture").exists(), "once approval did not execute disposable fixture command")
@@ -444,9 +462,11 @@ async def exercise(fixture, cases):
             passed(marker.lower() + "_real_tool_roundtrip")
 
         offset = len(rpc.events)
+        native_request_offset = len(rpc.requests)
         await rpc.call("prompt.submit", {"session_id": sid, "text": "SMOKE_NATIVE"})
         await rpc.event("message.complete", sid, offset)
         require(not any(event.get("type") in {"terminal.read.request", "window.read.request", "preview.read.request"} for event in rpc.events[offset:]), "native request escaped to absent Electron client")
+        require(not any(packet.get("method") in {"terminal.read", "window.read", "preview.read", "preview.act"} for packet in rpc.requests[native_request_offset:]), "native server request escaped to absent Electron client")
         passed("model_requested_native_tool_rejected_without_renderer_wait")
 
         offset = len(rpc.events)

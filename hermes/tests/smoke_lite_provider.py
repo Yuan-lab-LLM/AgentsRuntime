@@ -18,7 +18,7 @@ def main():
         managed = ("clawmanager", "clawmanager-auto", "clawmanager-deepseek")
         names = (*managed, "legacy-user")
         endpoint = "http://clawmanager-backend.smoke.svc:3000/v1"
-        import yaml
+        import hermes_yaml as yaml
         config = {
             "model": {"provider": "clawmanager", "default": "auto"},
             "providers": {name: {"name": name, "base_url": endpoint,

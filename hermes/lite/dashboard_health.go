@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net"
 	"net/http"
@@ -26,7 +27,7 @@ const (
 	dashboardProbeTimeout     = 5 * time.Second
 	dashboardProbeInterval    = 500 * time.Millisecond
 	dashboardMaxResponseBytes = 64 << 10
-	dashboardPackageVersion   = "0.21.0"
+	dashboardPackageVersion   = "0.22.5"
 	dashboardWSProtocol       = "hermes-gateway-v1"
 )
 
@@ -51,6 +52,7 @@ type dashboardProbe struct {
 	password      string
 	cookies       []*http.Cookie
 	loginAttempts int
+	startupStage  func(string)
 }
 
 func (h *healthChecker) waitDashboardReady(ctx context.Context, spec gateway.GatewayStartSpec) error {
@@ -65,6 +67,14 @@ func (h *healthChecker) waitDashboardReady(ctx context.Context, spec gateway.Gat
 		return err
 	}
 	defer probe.client.CloseIdleConnections()
+	started := time.Now()
+	seen := make(map[string]bool)
+	probe.startupStage = func(phase string) {
+		if !seen[phase] {
+			seen[phase] = true
+			log.Printf("runtime-agent startup timing: instance_id=%d generation=%d phase=%s elapsed_ms=%d", spec.InstanceID, spec.Generation, phase, time.Since(started).Milliseconds())
+		}
+	}
 	var lastErr error
 	for {
 		if readyCtx.Err() != nil {
@@ -202,6 +212,9 @@ func (p *dashboardProbe) check(ctx context.Context, spec gateway.GatewayStartSpe
 	if !health.AuthRequired {
 		return dashboardError("dashboard_auth_failed", "dashboard authentication is not enabled")
 	}
+	if p.startupStage != nil {
+		p.startupStage("http_ready_cumulative")
+	}
 	if len(p.cookies) == 0 {
 		if err := p.login(probeCtx); err != nil {
 			return err
@@ -224,13 +237,20 @@ func (p *dashboardProbe) check(ctx context.Context, spec gateway.GatewayStartSpe
 		Ticket string `json:"ticket"`
 		TTL    int    `json:"ttl_seconds"`
 	}
+	if p.startupStage != nil {
+		p.startupStage("auth_ready_cumulative")
+	}
 	if err := p.requestJSON(probeCtx, http.MethodPost, "/api/auth/ws-ticket", nil, &ticket, true); err != nil {
 		return err
 	}
 	if ticket.TTL <= 0 || !safeTicket(ticket.Ticket) {
 		return dashboardError("unsupported_hermes_protocol", "dashboard websocket ticket response is invalid")
 	}
-	return p.probeWebSocket(probeCtx, spec, ticket.Ticket)
+	err := p.probeWebSocket(probeCtx, spec, ticket.Ticket)
+	if err == nil && p.startupStage != nil {
+		p.startupStage("ws_ready_cumulative")
+	}
+	return err
 }
 
 func (p *dashboardProbe) login(ctx context.Context) error {
