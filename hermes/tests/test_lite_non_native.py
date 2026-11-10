@@ -344,6 +344,86 @@ class HydrationLifecycleTests(unittest.TestCase):
         self.assertTrue(popped.is_set(), "failed hydration did not release its record after config")
 
 
+class BackgroundTurnLifecycleTests(unittest.TestCase):
+    """Execute the real patched orphan lifecycle without model/network dependencies."""
+    def setUp(self):
+        source = Path(os.environ.get("HERMES_LITE_TEST_PATCHED_ROOT", "/opt/hermes-agent")) / "tui_gateway/server.py"
+        if not source.is_file():
+            self.skipTest("requires the pinned patched Hermes source")
+        names = {"_ws_session_is_detached", "_schedule_ws_orphan_reap", "_cancel_ws_orphan_reap",
+                 "_close_sessions_for_transport", "_live_session_payload"}
+        functions = [n for n in ast.parse(source.read_text()).body if isinstance(n, ast.FunctionDef) and n.name in names]
+        self.assertEqual(names, {n.name for n in functions})
+        timers = self.timers = []
+        class Timer:
+            def __init__(self, delay, callback):
+                self.delay, self.callback, self.cancelled = delay, callback, False
+                timers.append(self)
+            def start(self):
+                pass
+            def cancel(self):
+                self.cancelled = True
+        self.transport = object()
+        self.agent = policy.seal_agent(agent())
+        self.session = {"agent": self.agent, "transport": self.transport, "running": True,
+                        "history_lock": threading.RLock(), "history": [{"role": "user", "content": "work"}],
+                        "inflight_turn": {"started_at": 1.0}, "session_key": "stored", "source": "web"}
+        self.interrupted, self.closed = [], []
+        sessions = {"s": self.session}
+        self.ns = {"threading": SimpleNamespace(Timer=Timer), "time": __import__("time"), "Transport": object,
+                   "_lite_non_native": policy, "_sessions": sessions, "_sessions_lock": threading.RLock(),
+                   "_session_resume_lock": threading.Lock(), "_detached_ws_transport": object(),
+                   "_WS_ORPHAN_REAP_GRACE_S": 20, "_WS_ORPHAN_INTERRUPT_REAP_POLL_S": 1,
+                   "_WS_ORPHAN_INTERRUPT_REAP_MAX_POLLS": 60, "_pending_ws_reaps": {},
+                   "_session_has_active_delegations": lambda *_: False,
+                   "_pop_session_by_id": lambda sid: sessions.pop(sid, None),
+                   "_interrupt_session_turn": lambda *args, **kw: self.interrupted.append(args),
+                   "_teardown_popped_session": lambda session, **kw: self.closed.append(session),
+                   "_transport_is_dead": lambda _: False,
+                   "logger": SimpleNamespace(info=lambda *_: None, error=lambda *_: None, exception=lambda *_: None),
+                   "_inflight_snapshot": lambda _: {"assistant": "partial progress"},
+                   "_queued_prompt_snapshot": lambda _: None, "_fallback_session_info": lambda _: {},
+                   "_session_lookup_key": lambda session, **kw: session["session_key"],
+                   "_session_live_status": lambda *_: "running", "_pending_approval_request_payload": lambda _: None,
+                   "_pending_clarify_request_payload": lambda _: None, "_attach_todo_state": lambda payload, _: payload}
+        exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), self.ns)
+
+    def test_leaving_keeps_turn_alive_then_reentry_restores_progress(self):
+        self.assertEqual((0, 1), self.ns["_close_sessions_for_transport"](self.transport))
+        for _ in range(65):  # Also exceed the former forced-interrupt polling budget.
+            self.timers[-1].callback()
+        self.assertEqual([], self.interrupted, "navigation must not act as a user interrupt")
+        self.assertEqual([], self.closed)
+        self.assertIs(self.session, self.ns["_sessions"]["s"])
+        pending = self.timers[-1]
+        replacement = object()
+        payload = self.ns["_live_session_payload"]("s", self.session, transport=replacement, omit_messages=True)
+        self.assertTrue(pending.cancelled)
+        self.assertIs(self.agent, self.session["agent"])
+        self.assertIs(replacement, self.session["transport"])
+        self.assertTrue(payload["running"])
+        self.assertEqual({"assistant": "partial progress"}, payload["inflight"])
+        self.assertEqual(1, payload["message_count"])
+
+    def test_detached_completed_turn_is_still_reaped(self):
+        self.ns["_close_sessions_for_transport"](self.transport)
+        self.timers[-1].callback()
+        self.assertEqual([], self.interrupted)
+        self.session["running"] = False  # Normal model/turn finalization owns completion.
+        self.timers[-1].callback()
+        self.assertEqual([], self.interrupted)
+        self.assertEqual([self.session], self.closed)
+        self.assertNotIn("s", self.ns["_sessions"])
+
+
+    def test_non_lite_disconnect_policy_remains_unchanged(self):
+        self.ns["_close_sessions_for_transport"](self.transport)
+        with patch.object(policy, "ENABLED", False):
+            self.timers[-1].callback()
+        self.assertEqual(1, len(self.interrupted))
+
+
+
 class PatchIntegrityTests(unittest.TestCase):
     def test_sha_mismatch_is_rejected_before_writing(self):
         with tempfile.TemporaryDirectory() as tmp:

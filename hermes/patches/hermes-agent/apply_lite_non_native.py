@@ -53,6 +53,13 @@ def patched_sources(root):
                           "    finally:\n        _current_rpc_method.reset(token)")
     server = replace_once(server, '@method("config.set")\n@_profile_scoped\ndef _(rid, params: dict) -> dict:',
                           '@method("config.set")\n@_profile_scoped\n@_lite_non_native.session_config\ndef _(rid, params: dict) -> dict:')
+    # A CM page/socket is only a viewer. Retain accepted work until its normal
+    # turn finalization; the existing timer still reclaims completed orphans.
+    # Explicit interrupt/close and model/security deadlines keep their authority.
+    server = replace_once(server,
+                          '            if _session_has_active_delegations(sid, current):\n',
+                          '            if (_session_has_active_delegations(sid, current)\n'
+                          '                    or (_lite_non_native.ENABLED and current.get("running"))):\n')
     # Explicit close, disconnect, supersession and orphan reaping already claim
     # under the resume lock. Bring the idle/LRU/shutdown convenience funnel into
     # that same lifecycle order; keep slow finalization outside both locks.
