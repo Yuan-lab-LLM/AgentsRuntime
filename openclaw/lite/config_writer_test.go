@@ -10,10 +10,108 @@ import (
 	"testing"
 
 	"github.com/iamlovingit/clawmanager-agent/gateway"
+	"github.com/iamlovingit/clawmanager-agent/openclawcompat"
 )
 
 type Config = gateway.Config
 type CreateGatewayRequest = gateway.CreateGatewayRequest
+
+func TestMergeOpenClawLLMConfigRepairsManagedProviderAndPolicy(t *testing.T) {
+	var config map[string]any
+	if err := json.Unmarshal([]byte(`{
+		"models":{"providers":{
+			"flash (epai)":{"baseUrl":"http://managed/gateway/llm","apiKey":"old-token","models":[{"id":"flash (epai)"}]},
+			"custom":{"baseUrl":"https://custom.example/v1","models":[{"id":"custom-model"}]}
+		}},
+		"agents":{"defaults":{
+			"models":{"flash (epai)/flash (epai)":{},"custom/custom-model":{"alias":"keep"}},
+			"modelPolicy":{"allow":["flash (epai)/flash (epai)","clawmanager/removed","custom/custom-model"]}
+		}}
+	}`), &config); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{LLMBaseURL: "http://managed/gateway/llm", LLMAPIKey: "new-token", LLMAPIKeySet: true, LLMModelIDs: []string{"auto/auto", "clawmanager/org/flash"}, LLMModelsQualified: true}
+	var repaired string
+	for range 2 {
+		mergeOpenClawLLMConfig(config, cfg)
+		openclawcompat.Normalize81(config)
+		providers := objectAt(t, objectAt(t, config, "models"), "providers")
+		if _, stale := providers["flash (epai)"]; stale {
+			t.Fatalf("stale managed provider survived: %#v", providers)
+		}
+		if _, preserved := providers["custom"]; !preserved {
+			t.Fatal("custom provider removed")
+		}
+		managed := objectAt(t, providers, "clawmanager")
+		if ids := modelIDSet(managed["models"].([]any)); len(ids) != 1 || !ids["org/flash"] {
+			t.Fatalf("managed model lost its namespace: %#v", managed)
+		}
+		defaults := objectAt(t, objectAt(t, config, "agents"), "defaults")
+		allow := appendUniqueStringArray(objectAt(t, defaults, "modelPolicy")["allow"])
+		if len(allow) != 3 || strings.Join(allow, ",") != "custom/custom-model,auto/auto,clawmanager/org/flash" {
+			t.Fatalf("managed policy not authoritatively repaired: %v", allow)
+		}
+		raw, err := json.Marshal(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if repaired != "" && string(raw) != repaired {
+			t.Fatal("managed repair is not idempotent")
+		}
+		repaired = string(raw)
+	}
+}
+
+func TestMergeOpenClawLLMConfigClearsObsoleteManagedModelOverrides(t *testing.T) {
+	var config map[string]any
+	if err := json.Unmarshal([]byte(`{
+		"models":{"providers":{"old display":{"baseUrl":"http://managed/gateway/llm","models":[{"id":"old display"}]},"custom":{"baseUrl":"https://custom.example/v1"}}},
+		"agents":{"defaults":{
+			"model":{"primary":"old display/old display","fallbacks":["old display/old display","custom/fallback","clawmanager/real"]},
+			"imageModel":{"primary":"old display/old display","fallbacks":["custom/image"],"customSetting":"keep"}
+		},"list":[
+			{"id":"stale-string","model":"old display/old display"},
+			{"id":"stale-object","model":{"primary":"old display/old display","fallbacks":["old display/old display","custom/agent"],"customSetting":"keep"}},
+			{"id":"custom","model":"custom/agent"},
+			{"id":"canonical","model":"clawmanager/real"},
+			{"id":"custom-empty","model":{}}
+		]}
+	}`), &config); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{LLMBaseURL: "http://managed/gateway/llm", LLMModelIDs: []string{"auto/auto", "clawmanager/real"}, LLMModelsQualified: true}
+	for range 2 {
+		mergeOpenClawLLMConfig(config, cfg)
+		defaults := objectAt(t, objectAt(t, config, "agents"), "defaults")
+		if got := strings.Join(appendUniqueStringArray(objectAt(t, defaults, "model")["fallbacks"]), ","); got != "custom/fallback,clawmanager/real" {
+			t.Fatalf("managed fallback survived or custom fallback changed: %s", got)
+		}
+		image := objectAt(t, defaults, "imageModel")
+		if image["primary"] != "auto/auto" {
+			t.Fatalf("obsolete image model survived: %#v", image)
+		}
+		if image["customSetting"] != "keep" || strings.Join(appendUniqueStringArray(image["fallbacks"]), ",") != "custom/image" {
+			t.Fatalf("custom image settings changed: %#v", image)
+		}
+		list := objectAt(t, config, "agents")["list"].([]any)
+		if _, exists := list[0].(map[string]any)["model"]; exists {
+			t.Fatalf("obsolete string override survived: %#v", list[0])
+		}
+		override := objectAt(t, list[1].(map[string]any), "model")
+		if _, exists := override["primary"]; exists {
+			t.Fatalf("obsolete agent primary survived: %#v", override)
+		}
+		if override["customSetting"] != "keep" || strings.Join(appendUniqueStringArray(override["fallbacks"]), ",") != "custom/agent" {
+			t.Fatalf("custom agent settings changed: %#v", override)
+		}
+		if list[2].(map[string]any)["model"] != "custom/agent" || list[3].(map[string]any)["model"] != "clawmanager/real" {
+			t.Fatal("custom or canonical agent override changed")
+		}
+		if _, exists := list[4].(map[string]any)["model"]; !exists {
+			t.Fatal("unrelated custom model object removed")
+		}
+	}
+}
 
 func TestWriteOpenClawGatewayConfigMergesControlUIWithoutOverwritingExistingConfig(t *testing.T) {
 	workspace := filepath.Join(t.TempDir(), "openclaw", "user-45", "instance-63")
