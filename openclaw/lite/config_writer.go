@@ -965,6 +965,74 @@ func mergeOpenClawLLMConfig(config map[string]any, cfg gateway.Config) {
 	providerGroups := llmconfig.GroupModelRefs(modelRefs)
 
 	if len(modelRefs) > 0 {
+		// The incoming catalog owns every provider connected to the managed
+		// gateway, including legacy providers whose IDs were display labels.
+		managedProviders := map[string]bool{"auto": true, "clawmanager": true}
+		for id, raw := range providers {
+			provider, _ := raw.(map[string]any)
+			baseURL := strings.TrimRight(configStringValue(provider["baseUrl"]), "/")
+			if baseURL != "" && (baseURL == strings.TrimRight(cfg.LLMBaseURL, "/") || baseURL == strings.TrimRight(managedconfig.ModelURL, "/")) {
+				managedProviders[id] = true
+			}
+		}
+		for _, group := range providerGroups {
+			managedProviders[group.ProviderID] = true
+		}
+		incomingProviders := make(map[string]bool, len(providerGroups))
+		for _, group := range providerGroups {
+			incomingProviders[group.ProviderID] = true
+		}
+		for id := range managedProviders {
+			if !incomingProviders[id] {
+				delete(providers, id)
+			}
+		}
+		defaults := ensureObject(ensureObject(config, "agents"), "defaults")
+		isManagedRef := func(ref string) bool {
+			for id := range managedProviders {
+				if strings.HasPrefix(ref, id+"/") {
+					return true
+				}
+			}
+			return false
+		}
+		incomingRefs := make(map[string]bool, len(modelRefs))
+		for _, ref := range modelRefs {
+			incomingRefs[ref.Qualified] = true
+		}
+		isObsoleteRef := func(ref string) bool {
+			return isManagedRef(ref) && !incomingRefs[ref]
+		}
+		if image, ok := defaults["imageModel"].(map[string]any); ok && isObsoleteRef(configStringValue(image["primary"])) {
+			image["primary"] = modelRefs[0].Qualified
+		}
+		for _, field := range []string{"model", "imageModel"} {
+			removeObsoleteOpenClawModelRefs(defaults, field, isObsoleteRef)
+		}
+		if agents, ok := ensureObject(config, "agents")["list"].([]any); ok {
+			for _, raw := range agents {
+				if agent, ok := raw.(map[string]any); ok {
+					removeObsoleteOpenClawModelRefs(agent, "model", isObsoleteRef)
+				}
+			}
+		}
+		if policy, ok := defaults["modelPolicy"].(map[string]any); ok {
+			allow := []string{}
+			for _, ref := range appendUniqueStringArray(policy["allow"]) {
+				if !isManagedRef(ref) {
+					allow = append(allow, ref)
+				}
+			}
+			policy["allow"] = allow
+		}
+		customModels := map[string]any{}
+		if current, ok := defaults["models"].(map[string]any); ok {
+			for ref, value := range current {
+				if !isManagedRef(ref) {
+					customModels[ref] = value
+				}
+			}
+		}
 		providerReasoning := make(map[string]map[string]bool)
 		providerReasoningControl := make(map[string]map[string]string)
 		for _, ref := range modelRefs {
@@ -998,12 +1066,13 @@ func mergeOpenClawLLMConfig(config map[string]any, cfg gateway.Config) {
 			}
 		}
 
-		agents := ensureObject(config, "agents")
-		defaults := ensureObject(agents, "defaults")
 		model := ensureObject(defaults, "model")
 		primaryModel := modelRefs[0].Qualified
 		model["primary"] = primaryModel
 		defaults["models"] = buildOpenClawAgentModelsFromRefs(defaults["models"], modelRefs)
+		for ref, value := range customModels {
+			defaults["models"].(map[string]any)[ref] = value
+		}
 		// OpenClaw 2026.7.1 auto-discovers a built-in OpenAI image fallback when
 		// imageModel is unset. ClawManager also exports OPENAI_* compatibility
 		// aliases, so that fallback can look configured even though the user did
@@ -1016,6 +1085,43 @@ func mergeOpenClawLLMConfig(config map[string]any, cfg gateway.Config) {
 		mergeOpenClawProviderConnection(providers, openClawAutoProviderName, cfg)
 	}
 	normalizeOpenClawProviderAuthContracts(config)
+}
+
+func removeObsoleteOpenClawModelRefs(parent map[string]any, key string, obsolete func(string) bool) {
+	if ref, ok := parent[key].(string); ok && obsolete(ref) {
+		delete(parent, key)
+		return
+	}
+	spec, ok := parent[key].(map[string]any)
+	if !ok {
+		return
+	}
+	removedPrimary := false
+	if obsolete(configStringValue(spec["primary"])) {
+		delete(spec, "primary")
+		removedPrimary = true
+	}
+	var fallbacks []any
+	switch raw := spec["fallbacks"].(type) {
+	case []any:
+		fallbacks = raw
+	case []string:
+		for _, ref := range raw {
+			fallbacks = append(fallbacks, ref)
+		}
+	}
+	if fallbacks != nil {
+		kept := make([]any, 0, len(fallbacks))
+		for _, raw := range fallbacks {
+			if ref, ok := raw.(string); !ok || !obsolete(ref) {
+				kept = append(kept, raw)
+			}
+		}
+		spec["fallbacks"] = kept
+	}
+	if removedPrimary && len(spec) == 0 {
+		delete(parent, key)
+	}
 }
 
 func mergeOpenClawProviderConnection(providers map[string]any, providerID string, cfg gateway.Config) map[string]any {
