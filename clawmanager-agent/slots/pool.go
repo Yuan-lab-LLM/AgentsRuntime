@@ -34,6 +34,8 @@ type Assignment struct {
 }
 
 type Snapshot struct {
+	PodUID                 string                     `json:"pod_uid,omitempty"`
+	IdleConfirmed          bool                       `json:"idle_confirmed"`
 	MaintenanceOperationID string                     `json:"maintenance_operation_id,omitempty"`
 	WorkerEpoch            string                     `json:"worker_epoch,omitempty"`
 	Digest                 string                     `json:"digest,omitempty"`
@@ -49,20 +51,28 @@ type Pool struct {
 	cfg           gateway.Config
 	count         int
 	call          Call
+	stream        func(int) http.RoundTripper
 	metadata      *gateway.GatewayManager
 	mu            sync.RWMutex
 	proxyMu       sync.Mutex
 	draining      bool
 }
 
-func NewPool(cfg gateway.Config, count int, call Call) (*Pool, error) {
+func NewPool(cfg gateway.Config, count int, call Call, stream ...func(int) http.RoundTripper) (*Pool, error) {
 	if count < 1 || count > 256 || cfg.ControlToken == "" || call == nil {
 		return nil, errors.New("slot pool requires a token, transport and 1..256 slots")
 	}
 	if cfg.GatewayPortBlockSize < 1 || cfg.GatewayPortStart < 1 || cfg.GatewayPortStart+count*cfg.GatewayPortBlockSize-1 > cfg.GatewayPortEnd || cfg.GatewayPortEnd > 65535 {
 		return nil, errors.New("slot pool port range is insufficient")
 	}
-	return &Pool{cfg: cfg, count: count, call: call, metadata: gateway.NewGatewayManager(cfg, nil, nil)}, nil
+	p := &Pool{cfg: cfg, count: count, call: call, metadata: gateway.NewGatewayManager(cfg, nil, nil)}
+	if len(stream) > 1 {
+		return nil, errors.New("one stream transport factory required")
+	}
+	if len(stream) == 1 {
+		p.stream = stream[0]
+	}
+	return p, nil
 }
 
 func (p *Pool) snapshots(ctx context.Context) ([]Snapshot, int) {
@@ -113,6 +123,18 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if subtle.ConstantTimeCompare([]byte(r.Header.Get(gateway.ControlTokenHeader)), []byte(p.cfg.ControlToken)) != 1 {
 		http.Error(w, "unauthorized", 401)
+		return
+	}
+	if r.URL.Path == "/v1/source-writer/stopped-proof" {
+		p.serveSourceStoppedWriterProof(w, r)
+		return
+	}
+	if r.URL.Path == "/v1/workbench/preview" {
+		p.serveWorkbenchPreview(w, r)
+		return
+	}
+	if r.URL.Path == "/v1/workbench" {
+		p.serveWorkbench(w, r)
 		return
 	}
 	if p.serveNativeUpgrades(w, r) {

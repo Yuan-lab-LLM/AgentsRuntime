@@ -63,6 +63,7 @@ func (t *Tracker) VerifyListeners(ctx context.Context, first, count int) error {
 	if err != nil {
 		return err
 	}
+	var descriptorErr error
 	for _, entry := range entries {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -95,7 +96,11 @@ func (t *Tracker) VerifyListeners(ctx context.Context, first, count int) error {
 			continue
 		}
 		if err != nil {
-			return fmt.Errorf("inspect sandbox listener descriptors: %w", err)
+			// A non-dumpable descendant may be unreadable without owning a
+			// listener. Only positive namespace attribution can clear an inode;
+			// retain this error in case any inode remains unproven below.
+			descriptorErr = fmt.Errorf("inspect sandbox listener descriptors: %w", err)
+			continue
 		}
 		owned := map[string]bool{}
 		for _, target := range descriptors {
@@ -119,6 +124,9 @@ func (t *Tracker) VerifyListeners(ctx context.Context, first, count int) error {
 	}
 	for _, owned := range listeners {
 		if !owned {
+			if descriptorErr != nil {
+				return descriptorErr
+			}
 			return fmt.Errorf("business listener does not belong to the recorded sandbox namespace")
 		}
 	}

@@ -3,6 +3,8 @@ package gateway
 import (
 	"context"
 	"errors"
+	"github.com/iamlovingit/clawmanager-agent/workbench"
+	"os"
 	"time"
 )
 
@@ -198,10 +200,24 @@ type GatewayStartSpec struct {
 	Command       []string
 	Env           []string
 	// Stdin carries bounded native-operation payloads without exposing them in argv.
-	Stdin []byte
+	Stdin       []byte
+	OutputLimit int
+	WorkingDir  string
+	Terminal    *GatewayTerminalIO
+}
+
+type GatewayTerminalIO struct {
+	Master     *os.File
+	ReadyToken string
+	Slave      *os.File
+	Started    func(error)
 }
 
 type ManagedProcess struct {
+	// StartTerminal is bound to this exact admitted execution, never a client PID.
+	StartTerminal        func(context.Context, workbench.TerminalOptions) (workbench.Terminal, error)
+	WorkbenchProcesses   func(context.Context) ([]workbench.Process, error)
+	WorkbenchStopProcess func(context.Context, string) (workbench.Process, error)
 	// PrepareReset joins only the primary application shutdown. It never proves
 	// detached descendants ended and cannot authorize writer release.
 	PrepareReset    func(context.Context, bool) error

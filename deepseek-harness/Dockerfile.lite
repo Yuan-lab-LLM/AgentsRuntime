@@ -65,6 +65,14 @@ COPY deepseek-harness/scripts/patch-persistent-tmp.py /usr/local/share/deepseek-
 RUN python3 /usr/local/share/deepseek-harness/patch-persistent-tmp.py \
     /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-sandbox-local/lib/index.js
 
+# Remote managed browsers use the instance-authenticated settings mirror. Preserve
+# the native connection's loopback/host-ownership checks for other capabilities.
+COPY deepseek-harness/scripts/patch-managed-settings.py tests/lite/test_deepseek_settings.mjs /usr/local/share/deepseek-harness/
+RUN python3 /usr/local/share/deepseek-harness/patch-managed-settings.py \
+    /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-ui-settings/lib/client.js \
+    && node /usr/local/share/deepseek-harness/test_deepseek_settings.mjs \
+    /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-ui-settings/lib/client.js
+
 COPY --from=agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent
 COPY --from=agent-builder /out/clawmanager-agent /usr/local/libexec/clawmanager-agent-image
 COPY deepseek-harness/config/managed.cordis.patch.yml /usr/local/share/deepseek-harness/managed.cordis.patch.yml

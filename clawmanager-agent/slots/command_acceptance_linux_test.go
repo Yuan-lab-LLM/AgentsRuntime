@@ -194,3 +194,62 @@ while :;do sleep 0.05;done
 		})
 	}
 }
+
+// Cancel after spawn but before bubblewrap publishes its namespace identity.
+// The request may end, but the supervisor must still capture teardown evidence.
+func TestLinuxSlotCommandCancellationDuringStartup(t *testing.T) {
+	if os.Getenv("CM_SLOT_COMMAND_ACCEPTANCE") != "1" {
+		t.Skip("requires Linux slot supervisor security context")
+	}
+	realBwrap, err := exec.LookPath("bwrap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.MkdirTemp("/", "cm-command-startup-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+	os.Chmod(root, 0755)
+	workspace := filepath.Join(root, "openclaw", "user-1", "instance-2")
+	if err = os.MkdirAll(workspace, 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.Chown(workspace, 200002, 200002)
+	marker := filepath.Join(workspace, "spawned")
+	wrapper := "#!/bin/sh\nprintf ready > " + marker + "\nsleep 0.3\nexec " + realBwrap + " \"$@\"\n"
+	if err = os.WriteFile(filepath.Join(root, "bwrap"), []byte(wrapper), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", root+":"+os.Getenv("PATH"))
+	cfg := gateway.Config{RuntimeType: "openclaw", WorkspaceRoot: root, IsolatedLifecycle: true, GatewayBaseEnv: []string{"PATH=/usr/bin:/bin"}, ProcessStopTimeout: time.Second}
+	spec := gateway.GatewayStartSpec{InstanceID: 2, UserID: 1, Generation: 1, UID: 200002, GID: 200002, WorkspacePath: workspace, Command: []string{"/bin/sleep", "30"}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, err := (sandboxStarter{cfg: cfg}).RunGatewayCommand(ctx, spec); done <- err }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err = os.Stat(marker); err == nil {
+			break
+		}
+		select {
+		case err = <-done:
+			t.Fatalf("command failed before spawn barrier: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("command did not reach spawn barrier")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	select {
+	case err = <-done:
+		if !errors.Is(err, context.Canceled) || errors.Is(err, gateway.ErrGatewayStopFailed) {
+			t.Fatalf("canceled startup poisoned the writer fence: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("canceled startup did not join")
+	}
+}

@@ -18,6 +18,7 @@ import (
 type Config struct {
 	Broker       string `json:"broker"`
 	IngressPorts []int  `json:"ingress_ports,omitempty"`
+	Preview      bool   `json:"preview,omitempty"`
 }
 
 func validAddress(addr string) bool {
@@ -53,7 +54,7 @@ func Run(ctx context.Context, cfg Config, transparent net.Listener, ingress []ne
 	return serve(ctx, cfg, transparent, ingress, originalDestination)
 }
 
-func serve(ctx context.Context, cfg Config, transparent net.Listener, ingress []net.Listener, destination func(net.Conn) (string, error)) error {
+func serve(ctx context.Context, cfg Config, transparent net.Listener, ingress []net.Listener, destination func(net.Conn) (string, error), preview ...net.Listener) error {
 	if err := cfg.validate(); err != nil {
 		return err
 	}
@@ -65,9 +66,17 @@ func serve(ctx context.Context, cfg Config, transparent net.Listener, ingress []
 			return errors.New("netrelay: ingress must be a private Unix listener")
 		}
 	}
+	listeners := append([]net.Listener{transparent}, ingress...)
+	if cfg.Preview {
+		if len(preview) != 1 || preview[0] == nil || preview[0].Addr().Network() != "unix" {
+			return errors.New("netrelay: private preview listener required")
+		}
+		listeners = append(listeners, preview[0])
+	} else if len(preview) != 0 {
+		return errors.New("netrelay: unexpected preview listener")
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	listeners := append([]net.Listener{transparent}, ingress...)
 	var mu sync.Mutex
 	active := map[net.Conn]bool{}
 	stop := context.AfterFunc(ctx, func() {
@@ -127,6 +136,8 @@ func serve(ctx context.Context, cfg Config, transparent net.Listener, ingress []
 						}
 						defer up.Close()
 						bridge(ctx, c, up, r)
+					} else if index == len(ingress)+1 {
+						servePreview(ctx, c, cfg.IngressPorts)
 					} else {
 						port := strconv.Itoa(cfg.IngressPorts[index-1])
 						d := net.Dialer{Timeout: 5 * time.Second}

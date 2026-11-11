@@ -24,6 +24,7 @@ type networkSession struct {
 	port                       int
 	digest                     [32]byte
 	hosts, resolver            string
+	previewSocket              string
 	wrap                       func(*exec.Cmd, int, int, []uint32) error
 	release                    func(context.Context) error
 	fenceIngress               func()

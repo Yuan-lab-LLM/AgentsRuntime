@@ -461,6 +461,12 @@ func (m *GatewayManager) monitorIsolatedGateway(ctx context.Context, record *gat
 		}(automationDone)
 	}
 	defer func() {
+		m.mu.Lock()
+		record.state.State = "stopping"
+		m.mu.Unlock()
+		if err := m.closeWorkbench(record); err != nil {
+			failure = err
+		}
 		cancelAutomation()
 		if automationDone != nil {
 			if err := <-automationDone; errors.Is(err, ErrGatewayStopFailed) {

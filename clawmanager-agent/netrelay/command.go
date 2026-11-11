@@ -43,7 +43,11 @@ func RunCommand(ctx context.Context, args []string, input io.Reader, ready io.Wr
 			l.Close()
 		}
 	}()
-	for index := range cfg.IngressPorts {
+	count := len(cfg.IngressPorts)
+	if cfg.Preview {
+		count++
+	}
+	for index := 0; index < count; index++ {
 		f := os.NewFile(uintptr(3+index), "private-ingress")
 		if f == nil {
 			return true, errors.New("netrelay: inherited listener unavailable")
@@ -65,6 +69,9 @@ func RunCommand(ctx context.Context, args []string, input io.Reader, ready io.Wr
 	defer l.Close()
 	if _, err = io.WriteString(ready, "{\"ready\":true}\n"); err != nil {
 		return true, err
+	}
+	if cfg.Preview {
+		return true, RunWithPreview(ctx, cfg, l, ingress[:len(cfg.IngressPorts)], ingress[len(cfg.IngressPorts)])
 	}
 	return true, Run(ctx, cfg, l, ingress)
 }

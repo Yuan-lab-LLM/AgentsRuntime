@@ -158,7 +158,12 @@ func runPool(ctx context.Context, cfg gateway.Config) error {
 		}
 		return resp.StatusCode, data, err
 	}
-	pool, err := NewPool(cfg, count, call)
+	pool, err := NewPool(cfg, count, call, func(index int) http.RoundTripper {
+		if index < 0 || index >= len(clients) {
+			return nil
+		}
+		return clients[index].Transport
+	})
 	if err != nil {
 		return err
 	}
@@ -174,7 +179,7 @@ func runPool(ctx context.Context, cfg gateway.Config) error {
 }
 
 func serve(ctx context.Context, listener net.Listener, handler http.Handler, cleanup func(context.Context) error, stopTimeout time.Duration) error {
-	server := &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second}
+	server := &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second, BaseContext: func(net.Listener) context.Context { return ctx }}
 	stopped := make(chan error, 1)
 	go func() { stopped <- server.Serve(listener) }()
 	select {

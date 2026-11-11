@@ -14,6 +14,7 @@ import (
 
 	"github.com/iamlovingit/clawmanager-agent/gateway"
 	"github.com/iamlovingit/clawmanager-agent/llmconfig"
+	"github.com/iamlovingit/clawmanager-agent/managedconfig"
 	"github.com/iamlovingit/clawmanager-agent/openclawcompat"
 )
 
@@ -214,6 +215,7 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 	if len(cfg.TrustedProxies) > 0 {
 		gatewayConfig["trustedProxies"] = appendUniqueStringArray(gatewayConfig["trustedProxies"], cfg.TrustedProxies...)
 	}
+	cfg.OpenClawVersion = openClawVersion
 	mergeOpenClawLLMConfig(config, cfg)
 	if IsOpenClawAtLeast(openClawVersion, OpenClaw81Version) {
 		openclawcompat.Normalize81(config)
@@ -1020,6 +1022,11 @@ func mergeOpenClawProviderConnection(providers map[string]any, providerID string
 	provider := ensureObject(providers, providerID)
 	if cfg.LLMBaseURL != "" {
 		provider["baseUrl"] = cfg.LLMBaseURL
+	}
+	// Native 10.2 blocks the link-local address of the protected model broker.
+	// Grant only this managed endpoint inside an isolated instance network.
+	if cfg.NetworkSecurityProfile == "isolated-network-v1" && cfg.LLMBaseURL == managedconfig.ModelURL && IsOpenClawAtLeast(cfg.OpenClawVersion, "2026.10.2") {
+		ensureObject(provider, "request")["allowPrivateNetwork"] = true
 	}
 	if cfg.LLMAPIKeySet {
 		provider["apiKey"] = cfg.LLMAPIKey

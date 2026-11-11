@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -27,6 +28,7 @@ import (
 	"github.com/iamlovingit/clawmanager-agent/netguard"
 	"github.com/iamlovingit/clawmanager-agent/netrelay"
 	"github.com/iamlovingit/clawmanager-agent/runtime/generic"
+	"github.com/iamlovingit/clawmanager-agent/workbench"
 )
 
 const slotProbeControl = "cm-only-fake-control-sentinel-acceptance"
@@ -37,6 +39,19 @@ const slotProbeOffline = "--cm-slot-network-offline"
 // Only the explicitly env-gated Linux acceptance test launches these modes.
 // They let the real worker execute this static test binary inside its sandbox.
 func TestMain(m *testing.M) {
+	if handled, err := workbench.RunTerminalHelper(os.Args[1:], os.Stdin, os.Stdout); handled {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "terminal helper:", err)
+			os.Exit(2)
+		}
+		return
+	}
+	if handled, err := workbench.RunGitHelper(context.Background(), os.Args[1:], os.Stdin, os.Stdout); handled {
+		if err != nil {
+			os.Exit(2)
+		}
+		return
+	}
 	if handled, err := gateway.RunNativeStorageHelper(slotNetworkProbeProfile{generic.NewProfile("opencode")}, os.Args[1:], os.Stdin, os.Stdout); handled {
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -58,6 +73,7 @@ func TestMain(m *testing.M) {
 		case netrelay.Command:
 			_, err := netrelay.RunCommand(context.Background(), os.Args[1:], os.Stdin, os.Stdout)
 			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
 				os.Exit(2)
 			}
 			return
@@ -113,6 +129,23 @@ func serveSlotNetworkProbe() error {
 		defer secondary.Close()
 		go http.Serve(secondary, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "secondary-ok") }))
 	}
+
+	// Explicit user service fixture, separate from the fixed native port block.
+	preview, err := net.Listen("tcp", "127.0.0.1:3000")
+	if err != nil {
+		return err
+	}
+	defer preview.Close()
+	go http.Serve(preview, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		namespace, _ := os.Readlink("/proc/self/ns/net")
+		for key := range r.Header {
+			if strings.HasPrefix(strings.ToLower(key), "x-clawmanager-") {
+				http.Error(w, "credential leak", 500)
+				return
+			}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"namespace": namespace, "uri": r.URL.RequestURI(), "instance": os.Getenv("CLAWMANAGER_INSTANCE_ID")})
+	}))
 	return http.Serve(listener, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/probe" {
 			_, _ = io.WriteString(w, "ok")
@@ -209,7 +242,9 @@ func serveSlotNetworkProbe() error {
 
 // Run only in a disposable userns Pod with the reviewed trusted-slot caps,
 // iproute2/nftables/bwrap, no business PVC/Secret/SA or host namespace mounts.
-func TestProtectedSlotLinuxAcceptance(t *testing.T) {
+func TestProtectedSlotLinuxAcceptance(t *testing.T)    { protectedSlotLinuxAcceptance(t, true) }
+func TestProtectedPreviewLinuxAcceptance(t *testing.T) { protectedSlotLinuxAcceptance(t, false) }
+func protectedSlotLinuxAcceptance(t *testing.T, checkExpiry bool) {
 	if os.Getenv("TEST_PROTECTED_SLOT_DISPOSABLE") != "1" {
 		t.Skip("requires disposable Linux namespace acceptance Pod")
 	}
@@ -315,6 +350,14 @@ func TestProtectedSlotLinuxAcceptance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	worker.network.build = func(ctx context.Context, cfg gateway.Config, req gateway.CreateGatewayRequest, port int) (*networkSession, error) {
+		session, err := prepareNetworkSession(ctx, cfg, req, port)
+		if err != nil {
+			t.Logf("network fixture preparation: %v", err)
+		}
+		return session, err
+	}
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -358,6 +401,39 @@ func TestProtectedSlotLinuxAcceptance(t *testing.T) {
 		req := gateway.CreateGatewayRequest{InstanceID: id, UserID: 1, Generation: 1, AgentType: "opencode", PodUID: cfg.PodUID, SecurityProfile: cfg.NetworkSecurityProfile, UID: 200000 + id, GID: 200000 + id, GatewayPort: 28080, WorkspacePath: filepath.Join(base, "opencode", "user-1", fmt.Sprintf("instance-%d", id)), Environment: map[string]string{"CLAWMANAGER_INSTANCE_TOKEN": "ui1_" + strings.Repeat(strconv.Itoa(id), 16)}}
 		call("POST", "/v1/gateways", req)
 		result := getProbe()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			state, _ := worker.manager.GatewayState(fmt.Sprintf("gw-%d-1", id))
+			if state.State == "running" {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("preview admission never became ready: %+v", state)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		assertProtectedTerminalSharesGateway(t, worker, id, result.Namespace)
+		// Pin the old namespace until both assignments have been compared. Inode
+		// numbers may otherwise be reused immediately after complete teardown.
+		running, _ := worker.manager.GatewayState(fmt.Sprintf("gw-%d-1", id))
+		namespacePin, err := os.Open(fmt.Sprintf("/proc/%d/ns/net", running.PID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer namespacePin.Close()
+		route := workbench.PreviewRoute{InstanceID: id, UserID: 1, Generation: 1, GatewayID: fmt.Sprintf("gw-%d-1", id), Scheme: "http", Host: "localhost", Port: 3000, Path: "/root/asset", RawPath: "/root%2Fasset", RawQuery: "q=a%2Fb"}
+		encoded, _ := json.Marshal(route)
+		previewRequest := httptest.NewRequest("GET", workbench.PreviewPath, nil)
+		previewRequest.Header.Set(gateway.ControlTokenHeader, slotProbeControl)
+		previewRequest.Header.Set(workbench.PreviewHeader, base64.RawURLEncoding.EncodeToString(encoded))
+		previewResponse := httptest.NewRecorder()
+		worker.ServeHTTP(previewResponse, previewRequest)
+		var previewResult map[string]string
+		if previewResponse.Code != 200 || json.Unmarshal(previewResponse.Body.Bytes(), &previewResult) != nil || previewResult["namespace"] != result.Namespace || previewResult["instance"] != strconv.Itoa(id) || previewResult["uri"] != "/root%2Fasset?q=a%2Fb" {
+			t.Fatalf("private preview crossed scope: %d %s", previewResponse.Code, previewResponse.Body.String())
+		}
+
 		if privateDenials.Load() <= beforePrivate || directHits.Load() != 0 {
 			t.Fatal("private target denial lacked proxy evidence or hit reachable outer target")
 		}
@@ -395,10 +471,21 @@ func TestProtectedSlotLinuxAcceptance(t *testing.T) {
 			t.Fatalf("network ownership not fully cleaned: %v %v", entries, e)
 		}
 	}
+	if !checkExpiry {
+		return
+	}
 	expiring.Store(true)
 	fault := gateway.CreateGatewayRequest{InstanceID: 103, UserID: 1, Generation: 1, AgentType: "opencode", PodUID: cfg.PodUID, SecurityProfile: cfg.NetworkSecurityProfile, UID: 200103, GID: 200103, GatewayPort: 28080, WorkspacePath: filepath.Join(base, "opencode", "user-1", "instance-103"), Environment: map[string]string{"CLAWMANAGER_INSTANCE_TOKEN": "ui1_" + strings.Repeat("fault", 10)}}
 	call("POST", "/v1/gateways", fault)
 	_ = getProbe()
+	// Hold an admitted auxiliary until the fence has been observed. Otherwise a
+	// fully confirmed cleanup can clear the transient network quarantine between
+	// two snapshots, making this assertion race teardown rather than verify it.
+	_, finishAux, err := worker.network.join(gateway.GatewayStartSpec{InstanceID: fault.InstanceID, UserID: fault.UserID, Generation: fault.Generation, UID: fault.UID, GID: fault.GID, WorkspacePath: fault.WorkspacePath, RuntimeType: fault.AgentType, Port: 28080})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer finishAux(nil)
 	deadline := time.Now().Add(9 * time.Second)
 	quarantined := false
 	for time.Now().Before(deadline) {
@@ -425,6 +512,7 @@ func TestProtectedSlotLinuxAcceptance(t *testing.T) {
 	if denied.Code != http.StatusConflict {
 		t.Fatalf("failed execution reused without stop proof: %d", denied.Code)
 	}
+	finishAux(nil)
 	call("DELETE", "/v1/gateways/gw-103-1", nil)
 	t.Log("actual multiport slot primary+auxiliary, local model/services/RESP, transparent TCP, private/localhost/abstract isolation, fresh A-to-B tmp/network, lease-expiry quarantine and confirmed cleanup passed")
 }

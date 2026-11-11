@@ -73,11 +73,11 @@ func NewWorker(cfg gateway.Config) (*Worker, error) {
 		slot = "0"
 	}
 	worker := &Worker{cfg: cfg, network: network, manager: manager, book: b, slotName: "slot-" + slot, metrics: newMetricsSampler()}
+	worker.workerEpoch, err = newExecutionToken()
+	if err != nil {
+		return nil, err
+	}
 	if cfg.SandboxProfile == "nfs-rootless-v1" {
-		worker.workerEpoch, err = newExecutionToken()
-		if err != nil {
-			return nil, err
-		}
 		worker.reset = make(chan struct{})
 	}
 	worker.handler = control.NewControlHandler(cfg, manager, discardReporter{})
@@ -95,6 +95,14 @@ func (w *Worker) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		http.Error(out, "unauthorized", 401)
 		return
 	}
+	if r.URL.Path == "/v1/workbench/preview" {
+		w.serveWorkbenchPreview(out, r)
+		return
+	}
+	if r.URL.Path == "/v1/workbench" {
+		w.serveWorkbench(out, r)
+		return
+	}
 	if r.URL.Path == "/v1/slot-skills" && r.Method == http.MethodGet {
 		writeJSON(out, 200, gateway.BuildSkillReportPayload(w.cfg, w.manager, 0, "full"))
 		return
@@ -110,7 +118,7 @@ func (w *Worker) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/v1/slot-state" && r.Method == http.MethodGet {
 		w.mu.Lock()
 		defer w.mu.Unlock()
-		snapshot := Snapshot{WorkerEpoch: w.workerEpoch, Digest: w.book.Digest, Gateways: w.manager.GatewayStates(), Assignment: w.book.Assignment, Quarantined: w.book.quarantined || w.book.StopIntent != nil && w.book.Assignment != nil && w.book.Assignment.State != "stopped" || w.manager.Health() != nil || w.network.unavailable()}
+		snapshot := Snapshot{PodUID: w.cfg.PodUID, IdleConfirmed: w.idleConfirmed(), WorkerEpoch: w.workerEpoch, Digest: w.book.Digest, Gateways: w.manager.GatewayStates(), Assignment: w.book.Assignment, Quarantined: w.book.quarantined || w.book.StopIntent != nil && w.book.Assignment != nil && w.book.Assignment.State != "stopped" || w.manager.Health() != nil || w.network.unavailable()}
 		if w.book.Maintenance != nil {
 			snapshot.MaintenanceOperationID = w.book.Maintenance.OperationID
 		}

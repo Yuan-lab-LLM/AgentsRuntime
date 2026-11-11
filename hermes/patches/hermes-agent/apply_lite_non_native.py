@@ -80,6 +80,14 @@ def patched_sources(root):
          "        return _err(rid, 4033, \"incompatible_lite_live_session\")\n")
     edit("tui_gateway/session_registry.py", "            return sid, session\n",
          "            _lite_non_native.require_compatible_session(session)\n            return sid, session\n")
+    edit("tui_gateway/session_registry.py",
+         '    with _session_resume_lock:\n        live = _find_live_session_by_key(session_key, profile_home)',
+         '    with _session_resume_lock:\n'
+         '        with _sessions_lock:\n'
+         '            _lite_non_native.require_compatible_runtimes(\n'
+         '                [(key, value) for key, value in _sessions.items()\n'
+         '                 if _live_profile_matches(value, profile_home)], session_key)\n'
+         '        live = _find_live_session_by_key(session_key, profile_home)')
     edit("tui_gateway/session_registry.py", "    transport: Transport | None = None, omit_messages: bool = False, inline_images: bool = True) -> dict:\n",
          "    transport: Transport | None = None, omit_messages: bool = False, inline_images: bool = True) -> dict:\n"
          "    _lite_non_native.require_compatible_session(session)\n")
@@ -89,6 +97,13 @@ def patched_sources(root):
     edit("tui_gateway/session_lifecycle.py",
          '    with _sessions_lock:  # RLock: predicate + claim in one critical section\n        current = _sessions.get(sid)\n        if predicate is not None and (current is None or not predicate(current)):\n            return False\n        session = _pop_session_by_id(sid)',
          '    with _session_resume_lock:\n        with _sessions_lock:  # Predicate + ownership claim remain atomic\n            current = _sessions.get(sid)\n            if predicate is not None and (current is None or not predicate(current)):\n                return False\n            session = _pop_session_by_id(sid)')
+    # The socket is a viewer: accepted Lite work survives even without recent
+    # activity, including the idle-looking completion-to-queued-dispatch handoff.
+    # Explicit interrupt/close and normal idle cleanup keep upstream semantics.
+    edit("tui_gateway/session_lifecycle.py",
+         '            if _session_has_active_delegations(sid, current) or (\n',
+         '            if (_lite_non_native.ENABLED and (current.get("running")\n'
+         '                    or current.get("queued_prompt") or current.get("queued_prompts"))) or _session_has_active_delegations(sid, current) or (\n')
     edit("tui_gateway/methods_session.py", "    if (refusal := _reattach_refusal(ctx.rid, sid, session)) is not None:",
          "    _lite_non_native.require_compatible_session(session)\n    if (refusal := _reattach_refusal(ctx.rid, sid, session)) is not None:")
     edit("tui_gateway/session_notifications.py", "    global _desktop_ui_wired\n",

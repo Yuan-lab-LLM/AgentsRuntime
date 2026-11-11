@@ -24,6 +24,9 @@ type Mount struct {
 // and data mounts. Never populate Env with os.Environ(): controller credentials
 // belong outside the sandbox. UID and GID must be nonzero.
 type Spec struct {
+	// Set only by a supervisor which pinned the primary's namespace descriptors.
+	joinExecution  bool
+	joinNamespaces bool
 	// ContainerLifecycle uses the slot container as the final PID cleanup boundary.
 	ContainerLifecycle bool
 	// TmpSource is an explicit grant for one supervisor-prepared instance tmp.
@@ -95,12 +98,20 @@ func buildCommand(spec Spec, binary string, image []Mount) ([]string, error) {
 	if err := validate(spec); err != nil {
 		return nil, err
 	}
-	args := []string{binary,
-		"--unshare-user", "--unshare-ipc", "--unshare-uts",
-		"--die-with-parent", "--new-session", "--cap-drop", "ALL",
-		"--uid", strconv.Itoa(spec.UID), "--gid", strconv.Itoa(spec.GID), "--clearenv",
+	args := []string{binary}
+	if spec.joinExecution && !spec.ContainerLifecycle {
+		args = append(args, "--userns", "6", "--userns2", "7", "--pidns", "8")
+	} else {
+		args = append(args, "--unshare-user")
 	}
-	if !spec.ContainerLifecycle {
+	if !spec.joinNamespaces {
+		args = append(args, "--unshare-ipc", "--unshare-uts")
+	}
+	if !spec.joinExecution {
+		args = append(args, "--new-session")
+	}
+	args = append(args, "--die-with-parent", "--cap-drop", "ALL", "--uid", strconv.Itoa(spec.UID), "--gid", strconv.Itoa(spec.GID), "--clearenv")
+	if !spec.ContainerLifecycle && !spec.joinExecution {
 		args = append(args, "--disable-userns", "--unshare-pid")
 	}
 	if spec.OfflineNetwork {

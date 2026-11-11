@@ -2,6 +2,7 @@
 import ast
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -9,6 +10,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 
+SOURCE = Path(os.environ.get("HERMES_LITE_TEST_PATCHED_ROOT", "/opt/hermes-agent"))
 PATCHES = Path(__file__).resolve().parents[1] / "patches/hermes-agent"
 sys.path.insert(0, str(PATCHES))
 from apply_lite_team_completion_stop import BLOCK
@@ -41,9 +43,9 @@ class GitHubAdapters(unittest.TestCase):
                 self.assertEqual([] if removed else ["skill"],st.external_conflicts)
                 self.assertTrue(real.exists())
 
-    @unittest.skipUnless(Path("/opt/hermes-agent/agent/turn_tool_round.py").exists(), "requires patched v0.22.5 source image")
+    @unittest.skipUnless((SOURCE / "agent/turn_tool_round.py").exists(), "requires patched v0.22.5 source image")
     def test_actual_round_keeps_persistence_failure_ahead_of_completion(self):
-        text=Path("/opt/hermes-agent/agent/turn_tool_round.py").read_text()
+        text=(SOURCE / "agent/turn_tool_round.py").read_text()
         self.assertLess(text.index('if getattr(agent, "_incremental_persistence_failed"'),text.index('# clawmanager-team-completion-stop-v1'))
         self.assertLess(text.index('# clawmanager-team-completion-stop-v1'),text.index('if agent._tool_guardrail_halt_decision'))
         compile(text,"turn_tool_round.py","exec")

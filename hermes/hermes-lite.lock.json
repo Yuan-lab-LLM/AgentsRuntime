@@ -65,7 +65,7 @@
   "desktop_web_accepted": false,
   "patch_sha256": {
     "apply_lite_gateway_boundary.py": "b8ecc0069b419a897dd8d0ebe4aae586a053f4bb35e08db75e9542ae22fe2beb",
-    "apply_lite_non_native.py": "3cb00cb39c2101767ab413c65a7afa37d6e51efe16dfa0734f1255023d7e80d8",
+    "apply_lite_non_native.py": "b74d6edb1bf3135577857376f97e69ea2e0017857b6f3ca9ebf4eb1c40b6d83b",
     "apply_lite_tool_executor.py": "a3a69c245c3c586210ce8402b2a77dcd1beae9cad0c25d57677f0f5e4a4a1b5d",
     "lite_environment.py": "b65f4a3adb0a24ccf763d12202952bde3ff05daa37a101ec25d84ccc66bf4748",
     "lite_gateway_boundary.py": "57b668f38f1ef2782f0f313d18fd65482bc0b5fc44673c92af3856c06867e7b1",
