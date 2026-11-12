@@ -60,4 +60,7 @@ fi
 # `opencode web` also calls xdg-open, which creates a normal Chromium window.
 # Pro launches its own app-mode Chromium from start-opencode-terminal, so use
 # the headless server command here to keep exactly one desktop window.
+if [ "${CLAWMANAGER_TEAM_ENABLED:-false}" = "true" ]; then
+  exec /usr/local/bin/node /usr/local/share/clawmanager/opencode-team/main.mjs --hostname "${host}" --port "${port}"
+fi
 exec /usr/local/bin/opencode serve --hostname "${host}" --port "${port}"

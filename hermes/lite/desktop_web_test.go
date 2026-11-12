@@ -79,6 +79,7 @@ func TestDesktopWebTeamUsesExistingTeamContractAlongsideDashboard(t *testing.T) 
 	req.Environment["CLAWMANAGER_TEAM_ROLE"] = "leader"
 	req.Environment["CLAWMANAGER_TEAM_REDIS_URL"] = "redis://redis.example:6379/0"
 	req.Environment["CLAWMANAGER_TEAM_SHARED_DIR"] = "/team"
+	req.Environment["CLAWMANAGER_TEAM_SHARED_GID"] = "300001"
 	req.Environment["CLAWMANAGER_TEAM_TOKEN"] = "team-secret"
 	cfg := gateway.Config{WorkspaceRoot: root, RuntimeType: "hermes", GatewayPortStart: 20000, GatewayPortEnd: 20299}
 	if err := NewProfile("hermes").PrepareWorkspace(cfg, req, req.WorkspacePath); err != nil {
@@ -90,6 +91,7 @@ func TestDesktopWebTeamUsesExistingTeamContractAlongsideDashboard(t *testing.T) 
 		"CLAWMANAGER_TEAM_MEMBER_ID": "leader", "CLAWMANAGER_TEAM_ROLE": "leader",
 		"CLAWMANAGER_TEAM_REDIS_URL": "redis://redis.example:6379/0", "CLAWMANAGER_TEAM_TOKEN": "team-secret",
 		"CLAWMANAGER_TEAM_SHARED_DIR":            filepath.Join(req.WorkspacePath, "team"),
+		"CLAWMANAGER_TEAM_SHARED_GID":            "300001",
 		"HERMES_TEAM_WORKER_HOME":                filepath.Join(req.WorkspacePath, "home", ".clawmanager-team-worker"),
 		"CLAWMANAGER_HERMES_DESKTOP_WEB_ENABLED": "true", "HERMES_ACCEPT_HOOKS": "1",
 	} {

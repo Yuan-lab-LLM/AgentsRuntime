@@ -18,6 +18,7 @@ func (Profile) MigrateManagedCredentials(ctx context.Context, cfg gateway.Config
 	if err != nil {
 		return err
 	}
+	allowRelay := IsOpenClawAtLeast(resolveOpenClawVersion(cfg, req), "2026.10.2")
 	for key, want := range map[string]string{"OPENCLAW_STATE_DIR": filepath.Join(workspace, "home", ".openclaw"), "OPENCLAW_CONFIG_PATH": filepath.Join(workspace, "home", ".openclaw", "openclaw.json")} {
 		if value, exists := gateway.RequestEnvValue(req, key); exists && value != "" && filepath.Clean(value) != want {
 			return managedconfig.ErrUnsafe
@@ -38,7 +39,7 @@ func (Profile) MigrateManagedCredentials(ctx context.Context, cfg gateway.Config
 		}
 		if providers, err := managedconfig.ObjectPath(config, "models", "providers"); err != nil {
 			return nil, err
-		} else if err = migrateOpenClawModelProviders(providers); err != nil {
+		} else if err = migrateOpenClawModelProviders(providers, allowRelay); err != nil {
 			return nil, err
 		}
 		if native, ok := config["gateway"].(map[string]any); ok {
@@ -112,7 +113,7 @@ func (Profile) MigrateManagedCredentials(ctx context.Context, cfg gateway.Config
 		if err != nil {
 			return nil, err
 		}
-		if err = migrateOpenClawModelProviders(providers); err != nil {
+		if err = migrateOpenClawModelProviders(providers, allowRelay); err != nil {
 			return nil, err
 		}
 		return managedconfig.EncodeJSON(config)
@@ -128,7 +129,7 @@ func (Profile) MigrateManagedCredentials(ctx context.Context, cfg gateway.Config
 	return managedconfig.Rewrite(ctx, cfg.WorkspaceRoot, workspace, directories)
 }
 
-func migrateOpenClawModelProviders(providers map[string]any) error {
+func migrateOpenClawModelProviders(providers map[string]any, allowRelay bool) error {
 	for id, raw := range providers {
 		provider, ok := raw.(map[string]any)
 		if !ok {
@@ -142,11 +143,29 @@ func migrateOpenClawModelProviders(providers map[string]any) error {
 			}
 		}
 		if managedconfig.ManagedModelEndpoint(base) || ((id == "auto" || id == "clawmanager") && base == "") {
+			if raw, exists := provider["request"]; exists {
+				if _, ok := raw.(map[string]any); !ok {
+					return managedconfig.ErrUnsafe
+				}
+			}
 			provider["baseUrl"] = managedconfig.ModelURL
 			provider["apiKey"] = managedconfig.ModelKey
+			if allowRelay {
+				allowManagedOpenClawModelRelay(provider)
+			}
 		}
 	}
 	return nil
+}
+
+// OpenClaw 10.2 applies provider SSRF policy before reaching the isolated local
+// relay. This allowance is only for the rewritten, operator-owned model route;
+// the native relay still pins the authorized backend and permitted API path.
+// Third-party providers, browser/tool policy and non-isolated instances retain
+// their own policy. Legacy cores must not receive an unsupported request field.
+func allowManagedOpenClawModelRelay(provider map[string]any) {
+	request := ensureObject(provider, "request")
+	request["allowPrivateNetwork"] = true
 }
 func openClawModelStateDirectories(ctx context.Context, cfg gateway.Config, req gateway.CreateGatewayRequest, workspace string) ([]string, error) {
 	names, err := managedconfig.Subdirectories(ctx, cfg.WorkspaceRoot, workspace, "home/.openclaw/agents")

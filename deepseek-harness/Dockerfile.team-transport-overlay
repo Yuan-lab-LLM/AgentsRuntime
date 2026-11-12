@@ -1,0 +1,6 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG VCS_REF
+COPY --from=team-protocol /dsh-protocol.mjs /opt/clawmanager-dsh/adapter/deepseek-harness/team/protocol.mjs
+COPY plugins/openclaw-redis-team/dist/index.js /opt/clawmanager-dsh/adapter/plugins/openclaw-redis-team/dist/index.js
+LABEL org.opencontainers.image.revision=$VCS_REF

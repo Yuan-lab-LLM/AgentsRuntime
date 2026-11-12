@@ -178,7 +178,11 @@ func (m *GatewayManager) runIsolatedGateway(ctx context.Context, record *gateway
 			stopCtx, cancel := context.WithTimeout(context.Background(), m.stopTimeout()+5*time.Second)
 			if err := stop(stopCtx); err != nil {
 				if process.PrepareReset == nil || failure == nil {
-					failure = fmt.Errorf("gateway_stop_failed")
+					if process.PrepareReset != nil && onlyContainerResetRequired(err) {
+						failure = fmt.Errorf("container_reset_required")
+					} else {
+						failure = fmt.Errorf("gateway_stop_failed")
+					}
 				}
 				stopFailed = true
 			}
@@ -373,7 +377,11 @@ func (m *GatewayManager) runIsolatedGateway(ctx context.Context, record *gateway
 		stopErr := process.Stop(stopCtx)
 		stopCancel()
 		if stopErr != nil {
-			failure = fmt.Errorf("gateway_stop_failed")
+			if process.PrepareReset != nil && onlyContainerResetRequired(stopErr) {
+				failure = fmt.Errorf("container_reset_required")
+			} else {
+				failure = fmt.Errorf("gateway_stop_failed")
+			}
 			return
 		}
 		process = ManagedProcess{}
@@ -526,7 +534,7 @@ func safeGatewayError(err error) string {
 	if strings.HasPrefix(err.Error(), "clock_reference_unavailable") {
 		return "clock_reference_unavailable"
 	}
-	for _, code := range []string{"missing_llm_credentials", "dashboard_auth_failed", "websocket_origin_rejected", "unsupported_hermes_protocol", "workspace_unavailable", "port_conflict", "invalid_gateway_identity", "gateway_process_exited", "gateway_stop_failed", "http_health_failed", "websocket_handshake_failed", "incompatible_workspace_version", "dashboard_not_ready", "dashboard_http_unavailable", "websocket_unavailable", "websocket_upgrade_rejected", "workspace_unusable", "invalid_control_ui_origin", "invalid_trusted_proxies"} {
+	for _, code := range []string{"missing_llm_credentials", "dashboard_auth_failed", "websocket_origin_rejected", "unsupported_hermes_protocol", "workspace_unavailable", "port_conflict", "invalid_gateway_identity", "gateway_process_exited", "container_reset_required", "gateway_stop_failed", "http_health_failed", "websocket_handshake_failed", "incompatible_workspace_version", "dashboard_not_ready", "dashboard_http_unavailable", "websocket_unavailable", "websocket_upgrade_rejected", "workspace_unusable", "invalid_control_ui_origin", "invalid_trusted_proxies"} {
 		if strings.HasPrefix(err.Error(), code) {
 			return code
 		}

@@ -1,9 +1,7 @@
 # ClawManager-owned DeepSeek Harness deployment overrides.
 # The runtime image is pinned, and request credentials remain environment references.
-- id: webserver
-  config:
-    host: !!js process.env.DSH_BIND_HOST ?? '127.0.0.1'
-    port: !!js ctx.webStartup.port ?? 3080
+# Listener configuration comes from the supported --host/--port CLI flags.
+# Do not replace webserver.config: that would discard upstream TLS/compression.
 
 - id: agent-default-model
   config:
@@ -24,6 +22,11 @@
       (() => {
         const config = JSON.parse(process.env.CLAWMANAGER_LLM_RESOLVED_CONFIG_JSON ?? '{}');
         const groups = Array.isArray(config.providers) ? config.providers : [];
+        const windows = JSON.parse(process.env.CLAWMANAGER_LLM_CONTEXT_WINDOWS ?? '{}');
+        // ClawManager uses 0 for unknown limits; DSH requires a positive limit.
+        const configuredWindow = Number(process.env.CLAWMANAGER_LLM_CONTEXT_WINDOW || 0);
+        if (!Number.isSafeInteger(configuredWindow) || configuredWindow < 0) throw new Error('Invalid managed context window');
+        const defaultWindow = configuredWindow || 128000;
         return Object.fromEntries(groups.map((group) => [
           group.provider_id,
           {
@@ -31,12 +34,20 @@
             apiKeyEnv: config.api_key_env ?? 'CLAWMANAGER_LLM_API_KEY',
             api: 'openai-completions',
             baseURL: config.base_url ?? process.env.CLAWMANAGER_LLM_BASE_URL,
-            models: group.model_ids.map((id) => ({ id })),
+            models: group.model_ids.map((id) => {
+              const qualified = group.provider_id + '/' + id;
+              const configuredModelWindow = windows[qualified] ?? windows[id] ?? 0;
+              if (!Number.isSafeInteger(configuredModelWindow) || configuredModelWindow < 0) throw new Error('Invalid model context window');
+              const contextWindow = configuredModelWindow || defaultWindow;
+              const vision = config.vision?.[qualified] ?? config.vision?.[id] ?? false;
+              return { id, contextWindow, input: vision ? ['text', 'image'] : ['text'] };
+            }),
           },
         ]));
       })()
 
 # The shipped web_search provider calls DeepSeek's public API directly. Managed
 # runtimes intentionally expose no direct-provider credential or bypass route.
+# prepare-managed-config.mjs also disables the copies inside composed presets.
 - id: tool-web
   disabled: true

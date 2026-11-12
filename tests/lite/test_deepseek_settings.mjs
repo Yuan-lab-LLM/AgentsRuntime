@@ -24,6 +24,7 @@ vm.runInNewContext(source, {
   }); } } },
 });
 const view = { writable: false, namespaces: [{ ns: 'llm-pi-ai', value: { providers: { auto: { models: [{ id: 'auto' }] } } } }] };
+const settings = ctx => ctx.settingsScope ?? ctx.configForms;
 for (const isLoopback of [false, true]) {
   let reads = 0;
   const ctx = {
@@ -31,7 +32,7 @@ for (const isLoopback of [false, true]) {
     on: () => () => {}, effect: callback => callback(),
   };
   plugin.apply(ctx);
-  const mirror = ctx.settingsScope.describe();
+  const mirror = settings(ctx).describe();
   await mirror.ensure();
   assert.equal(reads, 1, `settings must reach the authenticated host when isLoopback=${isLoopback}`);
   assert.equal(mirror.getSnapshot().view, view);
@@ -42,9 +43,9 @@ const denied = {
   on: () => () => {}, effect: callback => callback(),
 };
 plugin.apply(denied);
-await denied.settingsScope.describe().ensure();
-assert.equal(denied.settingsScope.describe().getSnapshot().error, 'unauthorized');
-assert.equal(denied.settingsScope.describe().getSnapshot().view, undefined);
+await settings(denied).describe().ensure();
+assert.equal(settings(denied).describe().getSnapshot().error, 'unauthorized');
+assert.equal(settings(denied).describe().getSnapshot().view, undefined);
 let writes = 0;
 const writeDenied = {
   remote: { $host: { isLoopback: false }, $on: () => () => {}, settings: {
@@ -54,12 +55,14 @@ const writeDenied = {
   on: () => () => {}, effect: callback => callback(),
 };
 plugin.apply(writeDenied);
-await writeDenied.settingsScope.describe().ensure();
-const scope = writeDenied.settingsScope.bind({ namespace: 'llm-pi-ai', decode: value => value });
+await settings(writeDenied).describe().ensure();
+const scope = writeDenied.settingsScope
+  ? writeDenied.settingsScope.bind({ namespace: 'llm-pi-ai', decode: value => value })
+  : writeDenied.configForms.get('llm-pi-ai');
 await scope.set('providers', { injected: {} });
 assert.equal(writes, 1, 'settings writes must go through the host RPC');
-assert.equal(writeDenied.settingsScope.describe().getSnapshot().view, view, 'denied write must not change the mirror');
+assert.equal(settings(writeDenied).describe().getSnapshot().view, view, 'denied write must not change the mirror');
 assert.equal(scope.getSnapshot().writable, false, 'provider write policy must remain authoritative');
-assert.equal(scope.getSnapshot().value.providers.auto.models[0].id, 'auto');
+assert.equal(settings(writeDenied).describe().getSnapshot().view.namespaces[0].value.providers.auto.models[0].id, 'auto');
 assert.equal(writeDenied.remote.$host.isLoopback, false);
 console.log('PASS: host settings mirror, denied reads/writes, provider policy, and unchanged host ownership');

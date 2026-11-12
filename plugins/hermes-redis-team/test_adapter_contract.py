@@ -374,7 +374,7 @@ class HermesRedisTeamContractTests(unittest.TestCase):
         adapter.register(context)
         self.assertEqual(
             set(context.hooks),
-            {"pre_api_request", "post_api_request", "pre_tool_call", "post_tool_call"},
+            {"pre_api_request", "post_api_request", "api_request_error", "pre_tool_call", "post_tool_call"},
         )
 
     def test_team_tool_schema_failure_is_retained_by_post_tool_hook(self):
@@ -1414,6 +1414,27 @@ class HermesRedisTeamContractTests(unittest.TestCase):
             self.assertTrue(any(event.get("event") == "late_assignment_ignored" for event in events))
             self.assertFalse(any(event.get("event") in {"task_received", "task_started"} for event in events))
 
+    def test_terminal_root_context_does_not_enter_a_new_execution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.settings(Path(tmp))
+            envelope = {"messageId": "old-result", "taskId": "team-42-task-7",
+                        "rootTaskId": "team-42-task-7", "from": "chief", "to": "developer",
+                        "text": "An old accepted result", "requiresCompletion": False,
+                        "intent": "member_result_confirmed"}
+
+            async def run_test():
+                with mock.patch.object(adapter, "load_settings", return_value=settings):
+                    instance = adapter.RedisTeamAdapter(types.SimpleNamespace(extra={}))
+                instance._redis = mock.Mock()
+                instance._accept_active_context = mock.AsyncMock(return_value=True)
+                with mock.patch.object(adapter, "_root_task_is_terminal", new=mock.AsyncMock(return_value=True)):
+                    await instance._dispatch_envelope(envelope, context_only=True)
+                instance._accept_active_context.assert_not_awaited()
+                with mock.patch.object(adapter, "_root_task_is_terminal", new=mock.AsyncMock(return_value=False)):
+                    await instance._dispatch_envelope(envelope, context_only=True)
+                instance._accept_active_context.assert_awaited_once_with(envelope)
+            asyncio.run(run_test())
+
     def test_root_terminal_race_after_receive_clears_busy_assignment(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = self.settings(Path(tmp))
@@ -2032,6 +2053,122 @@ class HermesRedisTeamContractTests(unittest.TestCase):
                     if payload.get("eventKind") == "assignment_check_result":
                         monitor_events.append(payload)
             self.assertEqual(len(monitor_events), 0, "a non-terminal Monitor must reach the model instead of being answered mechanically")
+
+class ActiveContextDeliveryTests(unittest.TestCase):
+    def test_restart_presence_does_not_inherit_old_offline_marker(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            settings=adapter.RedisTeamSettings(enabled=True,redis_url="redis://example.invalid",team_id="42",member_id="worker",role="worker",shared_dir=directory,generation=2)
+            adapter.write_local_status(settings,{"liveness":"offline","generation":1,"availability":"busy","currentTaskId":"root"})
+            status=adapter._write_online_status(settings)
+            self.assertEqual(status["liveness"],"online")
+            self.assertEqual(status["generation"],2)
+            self.assertEqual(status["availability"],"busy")
+            self.assertEqual(status["currentTaskId"],"root")
+
+    def test_runtime_fault_is_classified_without_copying_provider_body(self):
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as directory:
+            settings=adapter.RedisTeamSettings(enabled=True,redis_url="redis://example.invalid",team_id="42",member_id="worker",role="worker",shared_dir=directory)
+            adapter._atomic_write_json(adapter._turn_observation_path(settings),{"rootTaskId":"root","turnState":"running"})
+            with mock.patch.object(adapter,"load_settings",return_value=settings):
+                adapter._hook_api_request_error(task_id="root",status_code=503,error_type="ProviderError",error_message="private-provider-body",api_request_id="request")
+            value=adapter._read_json(adapter._turn_observation_path(settings))
+            self.assertEqual(value["lastRuntimeFault"]["category"],"provider_server")
+            self.assertEqual(value["turnState"],"running")
+            self.assertNotIn("private-provider-body",json.dumps(value))
+
+    def test_active_context_enters_same_execution_once_and_is_confirmed_by_request(self):
+        import asyncio
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as directory:
+            settings = adapter.RedisTeamSettings(enabled=True,redis_url="redis://example.invalid",team_id="42",member_id="worker",role="worker",shared_dir=directory)
+            active={"taskId":"team-42-task-7","rootTaskId":"team-42-task-7","assignmentId":"work-1","revision":1,"messageId":"original","from":"chief","conversationId":"team-42-task-7"}
+            adapter._persist_active_envelope(settings,active)
+            envelope={"taskId":active["taskId"],"messageId":"notice-1","from":"chief","to":"worker","text":"Check current progress; retain the original deliverable","requiresCompletion":False,"intent":"question"}
+            instance=adapter.RedisTeamAdapter(None)
+            instance.settings=settings
+            native=types.SimpleNamespace(steer=mock.Mock(return_value=True))
+            instance.set_clawmanager_team_agent_reader(lambda source: native)
+            instance.handle_message=mock.AsyncMock()
+            async def run():
+                await instance._dispatch_envelope(envelope,context_only=True)
+                await instance._dispatch_envelope(envelope,context_only=True)
+                native.steer.assert_called_once()
+                instance.handle_message.assert_not_awaited()
+                journal=adapter._read_json(adapter._context_notice_path(settings))
+                self.assertEqual(journal["notice-1"]["state"],"submitted")
+                self.assertEqual(adapter._load_active_envelope(settings),active)
+                adapter._record_context_request(settings,{"request_messages":[{"role":"tool","content":native.steer.call_args.args[0]}],"api_request_id":"api-1","session_id":"native-session"})
+                journal=adapter._read_json(adapter._context_notice_path(settings))
+                self.assertEqual(journal["notice-1"]["state"],"request_included")
+                self.assertEqual(journal["notice-1"]["apiRequestId"],"api-1")
+                # A new process/native agent cannot replay a request already observed.
+                replacement=types.SimpleNamespace(steer=mock.Mock(return_value=True))
+                instance.set_clawmanager_team_agent_reader(lambda source:replacement)
+                await instance._flush_context_notices()
+                replacement.steer.assert_not_called()
+                for name,extra in [("old-work",{"assignmentId":"old-work"}),("old-version",{"revision":2}),("wrong-root",{"taskId":"old-root"})]:
+                    await instance._dispatch_envelope({**envelope,"messageId":name,**extra},context_only=True)
+                    self.assertEqual(adapter._read_json(adapter._context_notice_path(settings))[name]["state"],"ignored")
+                replacement.steer.assert_not_called()
+                active["terminal"]=True
+                adapter._persist_active_envelope(settings,active)
+                await instance._dispatch_envelope({**envelope,"messageId":"late","from":"clawmanager-monitor"},context_only=True)
+                replacement.steer.assert_not_called()
+            asyncio.run(run())
+
+    def test_pending_context_waits_for_original_agent_without_starting_another_turn(self):
+        import asyncio
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as directory:
+            settings=adapter.RedisTeamSettings(enabled=True,redis_url="redis://example.invalid",team_id="42",member_id="worker",role="worker",shared_dir=directory)
+            active={"taskId":"root","assignmentId":"work","messageId":"original","revision":1,"from":"chief"}
+            adapter._persist_active_envelope(settings,active)
+            instance=adapter.RedisTeamAdapter(None); instance.settings=settings
+            instance.set_clawmanager_team_agent_reader(lambda source:object())
+            instance.handle_message=mock.AsyncMock()
+            notice={"taskId":"root","messageId":"notice","from":"clawmanager-monitor","text":"Report actual progress","requiresCompletion":False}
+            async def run():
+                await instance._dispatch_envelope(notice,context_only=True)
+                self.assertEqual(adapter._read_json(adapter._context_notice_path(settings))["notice"]["state"],"queued")
+                native=types.SimpleNamespace(steer=mock.Mock(return_value=True))
+                instance.set_clawmanager_team_agent_reader(lambda source:native)
+                await instance._flush_context_notices()
+                await instance._flush_context_notices()
+                native.steer.assert_called_once()
+                instance.handle_message.assert_not_awaited()
+            asyncio.run(run())
+
+    def test_idle_recovery_and_peer_context_keep_the_original_dispatch(self):
+        import asyncio
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as directory:
+            settings=adapter.RedisTeamSettings(enabled=True,redis_url="redis://example.invalid",team_id="42",member_id="worker",role="worker",shared_dir=directory)
+            active={"taskId":"root","assignmentId":"work","messageId":"original","revision":1,"from":"chief"}
+            adapter._persist_active_envelope(settings,active)
+            instance=adapter.RedisTeamAdapter(None);instance.settings=settings
+            native=types.SimpleNamespace(steer=mock.Mock(return_value=True))
+            instance.handle_message=mock.AsyncMock()
+            async def run():
+                notice={"taskId":"root","messageId":"idle-recovery","from":"clawmanager-monitor","text":"Submit the existing result","requiresCompletion":False}
+                instance.set_clawmanager_team_agent_reader(lambda source:None)
+                await instance._dispatch_envelope(notice,context_only=True)
+                instance.handle_message.assert_awaited_once()
+                instance.set_clawmanager_team_agent_reader(lambda source:native)
+                await instance._dispatch_envelope({**notice,"messageId":"peer-context","from":"peer"},context_only=True)
+                self.assertEqual(instance.handle_message.await_count,2)
+                active["terminal"]=True;adapter._persist_active_envelope(settings,active)
+                await instance._dispatch_envelope({**notice,"messageId":"clarification","from":"chief"},context_only=True)
+                self.assertEqual(instance.handle_message.await_count,3)
+                native.steer.assert_not_called()
+                self.assertEqual(adapter._load_active_envelope(settings),active)
+            asyncio.run(run())
+
 
 if __name__ == "__main__":
     unittest.main()

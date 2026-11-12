@@ -27,6 +27,9 @@ var (
 )
 
 type Config struct {
+	// NativeTeamGrant is supplied only by the management-side storage helper.
+	// It pins the authorized directory across a user namespace's GID mapping.
+	NativeTeamGrant *NativeTeamGrant
 	// WorkspaceHealthCheck performs fixed private-file validation under the active instance identity.
 	WorkspaceHealthCheck   func(context.Context, GatewayStartSpec) error
 	SandboxProfile         string
@@ -75,6 +78,8 @@ type Config struct {
 	LLMAPIKeySet          bool
 	LLMAPIKeyEnvName      string
 	LLMModelIDs           []string
+	LLMContextWindow      int
+	LLMContextWindows     map[string]int
 	LLMVision             map[string]bool
 	LLMModelsQualified    bool
 	LLMReasoning          map[string]bool
@@ -310,6 +315,7 @@ type RegisterResponse struct {
 }
 
 type HeartbeatPayload struct {
+	Capacity       int       `json:"capacity"`
 	PodID          int       `json:"pod_id,omitempty"`
 	Namespace      string    `json:"namespace"`
 	PodName        string    `json:"pod_name"`

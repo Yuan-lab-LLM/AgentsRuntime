@@ -2,8 +2,35 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
+
+	"github.com/iamlovingit/clawmanager-agent/sandbox"
 )
+
+// A required slot reset is a continuation, not proof of failed teardown. A
+// joined real error must remain a failure even when it includes this sentinel.
+func onlyContainerResetRequired(err error) bool {
+	if err == sandbox.ErrContainerResetRequired {
+		return true
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		children := joined.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if !onlyContainerResetRequired(child) {
+				return false
+			}
+		}
+		return true
+	}
+	if wrapped := errors.Unwrap(err); wrapped != nil {
+		return onlyContainerResetRequired(wrapped)
+	}
+	return false
+}
 
 // PrepareContainerReset fences admission, joins application/automation work and
 // closes execution resources held outside the business process. It deliberately

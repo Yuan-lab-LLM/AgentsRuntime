@@ -22,7 +22,7 @@ def main():
 
     def docker(*command, check=True):
         return subprocess.run(["docker", *command], capture_output=True, text=True,
-                              timeout=25, check=check)
+                              encoding="utf-8", errors="replace", timeout=25, check=check)
 
     def ready():
         return docker("exec", name, "curl", "--silent", "--fail", "--max-time", "3",
@@ -32,6 +32,7 @@ def main():
     created = False
     try:
         command = ["run", "-d", "--name", name, "--network", "none", "--cap-drop", "ALL",
+                   "--ulimit", "nofile=1024:65536",
                    "--security-opt", "no-new-privileges", "--user", "200099:200099",
                    "--memory", "1g", "--pids-limit", "256", "--tmpfs", "/tmp:rw,mode=1777"]
         for setting in ("HOME=/tmp/dsh-test", "CLAWMANAGER_GATEWAY_PORT=21000",
@@ -52,6 +53,15 @@ def main():
             time.sleep(1)
         else:
             raise AssertionError("DSH startup deadline exceeded")
+        # The preparation script must raise the actual child's limit, not only
+        # a disposable shell's value. PID1 is the managed proxy in this fixture.
+        actual = docker("exec", name, "python3", "-c",
+                        "from pathlib import Path; "
+                        "p=sorted({pid for task in Path('/proc/1/task').glob('*/children') for pid in task.read_text().split()}); "
+                        "assert p; "
+                        "line=next(x for x in Path('/proc/'+p[0]+'/limits').read_text().splitlines() if x.startswith('Max open files')); "
+                        "assert int(line.split()[3]) == 65536, line; print('native nofile=65536')")
+        report["native_nofile"] = 65536
         # Observe plugin activation AND disposal after real watched edits.
         plugin = ("import fs from 'node:fs'; export default (ctx) => { "
                   "fs.writeFileSync('/tmp/dsh-test/hmr-applied', 'yes'); "

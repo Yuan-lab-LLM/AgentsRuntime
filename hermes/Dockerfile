@@ -115,10 +115,13 @@ RUN set -eux; \
     hermes --help >/dev/null
 
 COPY hermes/patches/hermes-agent/apply_team_completion_stop.py /tmp/apply_team_completion_stop.py
+COPY hermes/patches/hermes-agent/apply_team_context_reader.py /tmp/apply_team_context_reader.py
 
 RUN set -eux; \
     /usr/local/lib/hermes-agent/venv/bin/python /tmp/apply_team_completion_stop.py \
         /usr/local/lib/hermes-agent/agent/conversation_loop.py; \
+    /usr/local/lib/hermes-agent/venv/bin/python /tmp/apply_team_context_reader.py \
+        /usr/local/lib/hermes-agent/gateway/run.py; \
     cd /usr/local/lib/hermes-agent; \
     hermes desktop --build-only; \
     test -d /usr/local/lib/hermes-agent/apps/desktop/release; \

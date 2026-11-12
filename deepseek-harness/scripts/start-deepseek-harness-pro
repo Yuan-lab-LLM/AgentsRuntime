@@ -4,6 +4,7 @@ set -euo pipefail
 export DSH_HOME="${DSH_HOME:-/config/.dsh}"
 export DSH_BIND_HOST="127.0.0.1"
 export DSH_TELEMETRY_DISABLED="${DSH_TELEMETRY_DISABLED:-1}"
+export NARB_DISABLE_NATIVE_CACHE=1
 mkdir -p "${DSH_HOME}" "${DSH_HOME}/skills" /config/workspace
 cd /config/workspace
 
@@ -15,8 +16,17 @@ resolved_llm_config="$(
 )"
 export CLAWMANAGER_LLM_RESOLVED_CONFIG_JSON="${resolved_llm_config}"
 
-/usr/local/bin/prepare-deepseek-harness-resources
+source /usr/local/bin/prepare-deepseek-harness-resources
+managed_presets="$(node /usr/local/share/deepseek-harness/prepare-managed-config.mjs /usr/local/share/deepseek-harness/managed.cordis.patch.yml)"
 
-exec dsh web \
+unset RUNTIME_AGENT_CONTROL_TOKEN RUNTIME_AGENT_REPORT_TOKEN
+unset CLAWMANAGER_AGENT_CONTROL_TOKEN CLAWMANAGER_AGENT_REPORT_TOKEN
+
+# The desktop and supervisor use one stable loopback endpoint. The proxy owns
+# the authenticated DSH session; no launch token is sent to logs or browsers.
+exec /usr/local/libexec/clawmanager-agent-image dsh-web-proxy \
+  --desktop --listen-host 127.0.0.1 --port 3080 -- \
+  dsh web \
   --patch /usr/local/share/deepseek-harness/managed.cordis.patch.yml \
-  --port 3080
+  --patch "${managed_presets}" \
+  --host 127.0.0.1 --port 0 --no-open

@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 var errBroker = errors.New("netbroker: upstream unavailable")
@@ -182,7 +183,7 @@ func reject(w http.ResponseWriter, r *http.Request, message string, status int) 
 func proxyError(w http.ResponseWriter, r *http.Request, _ error) {
 	reject(w, r, "upstream unavailable", 502)
 }
-func (b *Broker) forward(w http.ResponseWriter, r *http.Request, ctx context.Context, lease Lease, model bool) {
+func (b *Broker) forward(w http.ResponseWriter, r *http.Request, ctx context.Context, lease Lease, model bool, taskHeaders http.Header) {
 	transport := b.egressTransport
 	if model {
 		transport = b.modelTransport
@@ -190,6 +191,9 @@ func (b *Broker) forward(w http.ResponseWriter, r *http.Request, ctx context.Con
 	proxy := httputil.ReverseProxy{Transport: transport, FlushInterval: -1, ErrorHandler: proxyError,
 		Rewrite: func(p *httputil.ProxyRequest) {
 			stripHeaders(p.Out.Header, model)
+			for name, values := range taskHeaders {
+				p.Out.Header[name] = append([]string(nil), values...)
+			}
 			if model {
 				p.Out.URL.Scheme = b.backend.Scheme
 				p.Out.URL.Host = b.backend.Host
@@ -228,15 +232,56 @@ func (b *Broker) model(w http.ResponseWriter, r *http.Request) {
 		reject(w, r, "broker unavailable", 503)
 		return
 	}
+	taskHeaders, err := modelTaskHeaders(r.Header, lease.Generation)
+	if err != nil {
+		reject(w, r, "invalid model task identity", http.StatusBadRequest)
+		return
+	}
 	if r.Header.Get("Upgrade") != "" {
 		if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 			reject(w, r, "unsupported upgrade", 400)
 			return
 		}
-		b.modelUpgrade(w, r, ctx, lease.ModelToken)
+		b.modelUpgrade(w, r, ctx, lease.ModelToken, taskHeaders)
 		return
 	}
-	b.forward(w, r, ctx, lease, true)
+	b.forward(w, r, ctx, lease, true, taskHeaders)
+}
+
+// These are task coordinates, not authority. Only the fixed model audience may
+// receive them; its credential still determines the instance and user, and the
+// backend rechecks ownership, generation and revocation. All other managed
+// headers, service requests, public egress and responses keep the strict filter.
+func modelTaskHeaders(headers http.Header, generation int) (http.Header, error) {
+	names := []string{"X-ClawManager-Session-ID", "X-ClawManager-Task-ID", "X-ClawManager-Runtime-Generation"}
+	present := false
+	for _, name := range names {
+		present = present || len(headers.Values(name)) != 0
+	}
+	if !present {
+		return nil, nil // Legacy runtimes retain their existing admission contract.
+	}
+	for _, line := range headers.Values("Connection") {
+		for _, token := range strings.Split(line, ",") {
+			for _, name := range names {
+				if strings.EqualFold(strings.TrimSpace(token), name) {
+					return nil, errPolicyDenied
+				}
+			}
+		}
+	}
+	result := make(http.Header, len(names))
+	for _, name := range names {
+		values := headers.Values(name)
+		if len(values) != 1 || values[0] == "" || len(values[0]) > 191 || !utf8.ValidString(values[0]) || strings.TrimSpace(values[0]) != values[0] || strings.ContainsAny(values[0], "\r\n\x00") {
+			return nil, errPolicyDenied
+		}
+		result.Set(name, values[0])
+	}
+	if generation <= 0 || result.Get(names[2]) != strconv.Itoa(generation) {
+		return nil, errPolicyDenied
+	}
+	return result, nil
 }
 func validTarget(target string) bool {
 	host, port, err := net.SplitHostPort(target)
@@ -276,7 +321,7 @@ func (b *Broker) egress(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	b.forward(w, r, ctx, lease, false)
+	b.forward(w, r, ctx, lease, false, nil)
 }
 
 // boundedHeader switches to unlimited reads after parsing, retaining bytes that
@@ -403,11 +448,14 @@ func bridge(ctx context.Context, client, upstream net.Conn, fromClient, fromUpst
 
 // Handle upgrades explicitly: the installed ReverseProxy drops the client's
 // hijacked buffered reader, and may return before both copy workers finish.
-func (b *Broker) modelUpgrade(w http.ResponseWriter, r *http.Request, ctx context.Context, token string) {
+func (b *Broker) modelUpgrade(w http.ResponseWriter, r *http.Request, ctx context.Context, token string, taskHeaders http.Header) {
 	request := r.Clone(ctx)
 	request.RequestURI = ""
 	request.URL.Scheme, request.URL.Host, request.Host = b.backend.Scheme, b.backend.Host, b.backend.Host
 	stripHeaders(request.Header, true)
+	for name, values := range taskHeaders {
+		request.Header[name] = append([]string(nil), values...)
+	}
 	request.Header.Del("X-Api-Key")
 	request.Header.Del("X-Goog-Api-Key")
 	request.Header.Set("Authorization", "Bearer "+token)

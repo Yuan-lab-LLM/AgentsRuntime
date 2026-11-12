@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/iamlovingit/clawmanager-agent/gateway"
@@ -23,11 +24,14 @@ var (
 )
 
 type ResolveOptions struct {
-	APIKeyEnvNames    []string
-	LegacyModelPrefix []string
+	PreferLegacyModels bool
+	APIKeyEnvNames     []string
+	LegacyModelPrefix  []string
 }
 
 type Settings struct {
+	ContextWindow    int
+	ContextWindows   map[string]int
 	Vision           map[string]bool
 	BaseURL          string
 	APIKey           string
@@ -52,6 +56,8 @@ type ProviderModels struct {
 }
 
 type Canonical struct {
+	ContextWindow    int               `json:"context_window,omitempty"`
+	ContextWindows   map[string]int    `json:"context_windows,omitempty"`
 	Vision           map[string]bool   `json:"vision,omitempty"`
 	BaseURL          string            `json:"base_url,omitempty"`
 	APIKeySet        bool              `json:"api_key_set"`
@@ -76,6 +82,8 @@ func FromGatewayConfig(cfg gateway.Config) Settings {
 		APIKeySet:        cfg.LLMAPIKeySet,
 		APIKeySource:     cfg.LLMAPIKeyEnvName,
 		ModelIDs:         append([]string(nil), cfg.LLMModelIDs...),
+		ContextWindow:    cfg.LLMContextWindow,
+		ContextWindows:   cloneIntMap(cfg.LLMContextWindows),
 		ModelsQualified:  cfg.LLMModelsQualified,
 		Vision:           cloneBoolMap(cfg.LLMVision),
 		Reasoning:        cloneBoolMap(cfg.LLMReasoning),
@@ -89,6 +97,8 @@ func (settings Settings) ApplyTo(cfg gateway.Config) gateway.Config {
 	cfg.LLMAPIKeySet = settings.APIKeySet
 	cfg.LLMAPIKeyEnvName = settings.APIKeySource
 	cfg.LLMModelIDs = append([]string(nil), settings.ModelIDs...)
+	cfg.LLMContextWindow = settings.ContextWindow
+	cfg.LLMContextWindows = cloneIntMap(settings.ContextWindows)
 	cfg.LLMModelsQualified = settings.ModelsQualified
 	cfg.LLMVision = cloneBoolMap(settings.Vision)
 	cfg.LLMReasoning = cloneBoolMap(settings.Reasoning)
@@ -137,7 +147,18 @@ func resolve(initial Settings, lookup envLookup, options ResolveOptions, emptyAP
 		resolved.APIKeySource = apiKeySource
 	}
 
-	if source, raw, ok := firstNonBlank(lookup, ProviderModelsEnv); ok {
+	providerLookup := lookup
+	if options.PreferLegacyModels {
+		if _, _, exists := firstNonBlank(lookup, legacyModelNames...); exists {
+			providerLookup = func(names ...string) (string, string, bool) {
+				if len(names) == 1 && names[0] == ProviderModelsEnv {
+					return "", "", false
+				}
+				return lookup(names...)
+			}
+		}
+	}
+	if source, raw, ok := firstNonBlank(providerLookup, ProviderModelsEnv); ok {
 		modelIDs, err := parseModelIDs(raw, source)
 		if err != nil {
 			return Settings{}, err
@@ -176,11 +197,41 @@ func resolve(initial Settings, lookup envLookup, options ResolveOptions, emptyAP
 		}
 		resolved.ReasoningControl = controls
 	}
+	if _, raw, ok := firstNonBlank(lookup, "CLAWMANAGER_LLM_CONTEXT_WINDOW"); ok {
+		window, err := strconv.Atoi(strings.TrimSpace(raw))
+		if err != nil || window < 0 {
+			return Settings{}, fmt.Errorf("invalid CLAWMANAGER_LLM_CONTEXT_WINDOW")
+		}
+		resolved.ContextWindow = window
+	}
+	if _, raw, ok := firstNonBlank(lookup, "CLAWMANAGER_LLM_CONTEXT_WINDOWS"); ok {
+		var windows map[string]int
+		if err := json.Unmarshal([]byte(raw), &windows); err != nil || windows == nil {
+			return Settings{}, fmt.Errorf("invalid CLAWMANAGER_LLM_CONTEXT_WINDOWS")
+		}
+		for _, window := range windows {
+			if window < 0 {
+				return Settings{}, fmt.Errorf("invalid model context window")
+			}
+		}
+		resolved.ContextWindows = windows
+	}
 	if !resolved.ModelsQualified && len(resolved.ModelIDs) > 0 && len(options.LegacyModelPrefix) > 0 {
 		resolved.ModelIDs = prependUnique(options.LegacyModelPrefix, resolved.ModelIDs)
 	}
 
 	return resolved, nil
+}
+
+func cloneIntMap(source map[string]int) map[string]int {
+	if source == nil {
+		return nil
+	}
+	result := make(map[string]int, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
 }
 
 func parseModelIDs(raw, source string) ([]string, error) {
@@ -276,6 +327,8 @@ func GroupModelRefs(refs []ModelRef) []ProviderModels {
 func (settings Settings) Canonical(fallbackProvider string) Canonical {
 	refs := settings.ModelRefs(fallbackProvider)
 	canonical := Canonical{
+		ContextWindow:    settings.ContextWindow,
+		ContextWindows:   cloneIntMap(settings.ContextWindows),
 		BaseURL:          settings.BaseURL,
 		APIKeySet:        settings.APIKeySet,
 		APIKeySource:     settings.APIKeySource,

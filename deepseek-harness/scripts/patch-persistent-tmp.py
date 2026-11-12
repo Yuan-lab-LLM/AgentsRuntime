@@ -9,9 +9,11 @@ import hashlib
 from pathlib import Path
 import sys
 
-UPSTREAM_SHA256 = 'f3533a38fca8e95755c69ab2e09c78e60c094e26105a0feb323e91daecb4ad1a'
+# Reviewed 0.2.1-rc.3 original, also recorded in native/source-lock.json.
+# The workspace-write mount change is the same; read-only/Landlock stay intact.
+UPSTREAM_SHA256 = 'be6e1107871cf8d94c040090b13c405bc833822e2f51ed5280e93eececf762be'
 NEEDLE = 'args.push("--tmpfs", "/tmp");'
-REPLACEMENT = 'args.push("--bind", "/tmp", "/tmp");'
+REPLACEMENT = 'args.push(...(process.env.CLAWMANAGER_DSH_PRIVATE_TMP === "1" ? ["--bind", "/tmp", "/tmp"] : ["--tmpfs", "/tmp"]));'
 
 
 def patch_text(source):

@@ -43,8 +43,20 @@ type containerTerminationMessage struct {
 
 type containerTerminationProof struct {
 	containerTerminationMessage
-	ContainerID string    `json:"container_id"`
-	FinishedAt  time.Time `json:"finished_at"`
+	ContainerID     string    `json:"container_id"`
+	FinishedAt      time.Time `json:"finished_at"`
+	ProofSource     string    `json:"proof_source,omitempty"`
+	FenceRequestUID string    `json:"fence_request_uid,omitempty"`
+}
+
+// External fencing is asserted only by the authenticated controller after an
+// immutable operator request and exact kubelet old-container termination. It
+// cannot assert graceful shutdown or native maintenance success.
+func validContainerProofSource(p containerTerminationProof) bool {
+	if p.ProofSource == "" {
+		return p.FenceRequestUID == ""
+	}
+	return p.ProofSource == "kubelet-container-fence-v1" && p.FenceRequestUID != "" && len(p.FenceRequestUID) <= 128 && !p.Graceful && p.Kind == ""
 }
 
 func newExecutionToken() (string, error) {
@@ -212,7 +224,7 @@ func (w *Worker) serveContainerReconcile(out http.ResponseWriter, r *http.Reques
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if proof.Kind != "" || !proof.CleanupConfirmed || proof.ContainerID == "" || proof.FinishedAt.IsZero() || proof.WorkerEpoch == w.workerEpoch || !w.matchesContainerIntent(proof.containerStopIntent) || w.book.StopIntent == nil || *w.book.StopIntent != proof.containerStopIntent {
+	if proof.Kind != "" || !validContainerProofSource(proof) || !proof.CleanupConfirmed || proof.ContainerID == "" || proof.FinishedAt.IsZero() || proof.WorkerEpoch == w.workerEpoch || !w.matchesContainerIntent(proof.containerStopIntent) || w.book.StopIntent == nil || *w.book.StopIntent != proof.containerStopIntent {
 		http.Error(out, "container proof does not match old execution", 409)
 		return
 	}
@@ -266,7 +278,7 @@ func (w *Worker) serveContainerReconcile(out http.ResponseWriter, r *http.Reques
 
 func (w *Worker) serveContainerRelease(out http.ResponseWriter, r *http.Request) {
 	var proof containerTerminationProof
-	if decodeContainerOperation(r, &proof) != nil || !proof.CleanupConfirmed || proof.ContainerID == "" || proof.FinishedAt.IsZero() || proof.Version != 1 || proof.InstanceID < 1 || proof.UserID < 1 || proof.Generation < 1 || proof.GatewayID != fmt.Sprintf("gw-%d-%d", proof.InstanceID, proof.Generation) || len(proof.AssignmentDigest) != 64 || !executionTokenValid(proof.OperationID) || !executionTokenValid(proof.WorkerEpoch) || proof.PodUID != w.cfg.PodUID || proof.Slot != w.slotName {
+	if decodeContainerOperation(r, &proof) != nil || !validContainerProofSource(proof) || !proof.CleanupConfirmed || proof.ContainerID == "" || proof.FinishedAt.IsZero() || proof.Version != 1 || proof.InstanceID < 1 || proof.UserID < 1 || proof.Generation < 1 || proof.GatewayID != fmt.Sprintf("gw-%d-%d", proof.InstanceID, proof.Generation) || len(proof.AssignmentDigest) != 64 || !executionTokenValid(proof.OperationID) || !executionTokenValid(proof.WorkerEpoch) || proof.PodUID != w.cfg.PodUID || proof.Slot != w.slotName {
 		http.Error(out, "invalid finalized stop proof", 400)
 		return
 	}

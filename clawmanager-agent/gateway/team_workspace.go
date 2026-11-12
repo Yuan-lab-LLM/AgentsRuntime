@@ -13,14 +13,14 @@ import (
 const teamSharedWorkspaceMode fs.FileMode = fs.ModeSetgid | 0o775
 
 func PrepareLiteTeamSharedWorkspace(workspaceRoot string, req CreateGatewayRequest, workspacePath string, aliasParents ...string) error {
-	return prepareLiteTeamSharedWorkspace(workspaceRoot, req, workspacePath, false, aliasParents...)
+	return prepareLiteTeamSharedWorkspace(workspaceRoot, req, workspacePath, false, nil, aliasParents...)
 }
 
 func PrepareLiteTeamSharedWorkspaceForConfig(cfg Config, req CreateGatewayRequest, workspacePath string, aliasParents ...string) error {
-	return prepareLiteTeamSharedWorkspace(cfg.WorkspaceRoot, req, workspacePath, cfg.SandboxProfile == "nfs-rootless-v1", aliasParents...)
+	return prepareLiteTeamSharedWorkspace(cfg.WorkspaceRoot, req, workspacePath, cfg.SandboxProfile == "nfs-rootless-v1", cfg.NativeTeamGrant, aliasParents...)
 }
 
-func prepareLiteTeamSharedWorkspace(workspaceRoot string, req CreateGatewayRequest, workspacePath string, preserve bool, aliasParents ...string) error {
+func prepareLiteTeamSharedWorkspace(workspaceRoot string, req CreateGatewayRequest, workspacePath string, preserve bool, grant *NativeTeamGrant, aliasParents ...string) error {
 	_, sharedDir, ok := LiteTeamEnvironment(req, workspacePath)
 	if !ok {
 		return nil
@@ -46,7 +46,7 @@ func prepareLiteTeamSharedWorkspace(workspaceRoot string, req CreateGatewayReque
 		if err != nil {
 			return err
 		}
-		if group != sharedGID {
+		if group != sharedGID && !nativeTeamGrantForRoot(teamRoot, sharedDir, sharedGID, grant) {
 			return fmt.Errorf("existing Team root group does not match authorization")
 		}
 	} else if err := repairLiteTeamSharedTree(teamRoot, sharedGID); err != nil {

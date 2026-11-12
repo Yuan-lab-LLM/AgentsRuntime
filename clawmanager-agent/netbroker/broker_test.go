@@ -96,6 +96,76 @@ func TestModelRejectsRouteEscapeAndWrongChild(t *testing.T) {
 		t.Fatalf("wrong source routed: status=%d calls=%d", rec.Code, calls.Load())
 	}
 }
+
+func TestModelGovernedTaskIdentitySurvivesFixedRelayOnly(t *testing.T) {
+	seen := make(chan *http.Request, 4)
+	backend := brokerBackend(t, func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.Clone(context.Background())
+		w.Header().Set("X-ClawManager-Task-ID", "private-response")
+		fmt.Fprint(w, "model-output")
+	})
+	b := brokerForTest(t, backend.URL, backend.URL)
+	identity := map[string]string{"X-ClawManager-Session-ID": "ses_task", "X-ClawManager-Task-ID": "msg_task", "X-ClawManager-Runtime-Generation": "2"}
+	request := func(route string) *http.Request {
+		r := localRequest("POST", route)
+		for name, value := range identity {
+			r.Header.Set(name, value)
+		}
+		r.Header.Set("X-ClawManager-Instance-ID", "999")
+		r.Header.Set("X-ClawManager-Control-Token", "forged")
+		return r
+	}
+	rec := httptest.NewRecorder()
+	b.Model().ServeHTTP(rec, request(modelPrefix+"/v1/chat/completions"))
+	if rec.Code != 200 || rec.Header().Get("X-ClawManager-Task-ID") != "" {
+		t.Fatalf("model relay status/response boundary: %d", rec.Code)
+	}
+	got := <-seen
+	for name, value := range identity {
+		if got.Header.Get(name) != value {
+			t.Errorf("required task coordinate stripped: %s", name)
+		}
+	}
+	if got.Header.Get("Authorization") != "Bearer v1.model" || got.Header.Get("X-ClawManager-Instance-ID") != "" || got.Header.Get("X-ClawManager-Control-Token") != "" {
+		t.Fatal("model authority boundary changed")
+	}
+	// A valid task header is still private to the model audience.
+	rec = httptest.NewRecorder()
+	b.Services().ServeHTTP(rec, request("/team/preview-sign"))
+	got = <-seen
+	for name := range identity {
+		if got.Header.Get(name) != "" {
+			t.Errorf("task coordinate reached services: %s", name)
+		}
+	}
+	r := request("http://origin.invalid/path")
+	r.Method = "GET"
+	b.Egress().ServeHTTP(httptest.NewRecorder(), r)
+	got = <-seen
+	for name := range identity {
+		if got.Header.Get(name) != "" {
+			t.Errorf("task coordinate reached public egress: %s", name)
+		}
+	}
+	for _, invalid := range []string{"wrong-generation", "duplicate", "missing", "hop-by-hop"} {
+		r := request(modelPrefix + "/v1/chat/completions")
+		switch invalid {
+		case "wrong-generation":
+			r.Header.Set("X-ClawManager-Runtime-Generation", "3")
+		case "duplicate":
+			r.Header.Add("X-ClawManager-Task-ID", "other")
+		case "missing":
+			r.Header.Del("X-ClawManager-Session-ID")
+		case "hop-by-hop":
+			r.Header.Set("Connection", "X-ClawManager-Task-ID")
+		}
+		rec := httptest.NewRecorder()
+		b.Model().ServeHTTP(rec, r)
+		if rec.Code != 400 {
+			t.Errorf("invalid coordinates forwarded (%s): %d", invalid, rec.Code)
+		}
+	}
+}
 func TestEgressHTTPOnlyFixedProxyReceivesCapability(t *testing.T) {
 	seen := make(chan *http.Request, 1)
 	proxy := leaseServer(t, func(w http.ResponseWriter, r *http.Request) {

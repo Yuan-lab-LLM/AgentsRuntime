@@ -1,0 +1,61 @@
+// Isolated Redis transport test. Native execution is controlled here; this is
+// not a model-semantic acceptance test.
+import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+import { buildProtocol } from "./build-protocol.mjs";
+import { createBridge } from "./bridge.mjs";
+import { nativeIdentity } from "./native-client.mjs";
+
+if (!process.env.REDIS_TEAM_TEST_URL) throw new Error("Disposable Redis URL required");
+const root = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-team-redis-"));
+const teamId = String(Date.now());
+const shared = path.join(root, "shared");
+const prefix = `claw:team:${teamId}`;
+Object.assign(process.env, { CLAWMANAGER_TEAM_ENABLED: "true", CLAWMANAGER_TEAM_ID: teamId, CLAWMANAGER_TEAM_MEMBER_ID: "writer", CLAWMANAGER_TEAM_ROLE: "worker", CLAWMANAGER_TEAM_REDIS_URL: process.env.REDIS_TEAM_TEST_URL, CLAWMANAGER_TEAM_SHARED_DIR: shared, CLAWMANAGER_GATEWAY_GENERATION: "2", CLAWMANAGER_DEFAULT_PROJECT_PATH: "/workspace/starter", XDG_STATE_HOME: path.join(root, "state") });
+await fs.mkdir(shared, { recursive: true });
+await fs.writeFile(path.join(shared, "team.json"), JSON.stringify({ teamId, members: [{ memberId: "lead", role: "leader", isLeader: true }, { memberId: "writer", role: "worker" }] }));
+await buildProtocol(path.join(root, "protocol.mjs"));
+const protocol = await import(pathToFileURL(path.join(root, "protocol.mjs")));
+const redis = new protocol.RedisClient(process.env.REDIS_TEAM_TEST_URL);
+let release, starts = 0;
+const native = { admit: async () => { starts++; await new Promise(resolve => { release = resolve; }); }, readLog: async () => 0, api: async resource => ({ data: resource.endsWith("/inbox") ? [] : {} }), interrupt: async () => { release?.(); } };
+const log = { info() {}, warn() {}, error() {} };
+const bridge = await createBridge({ protocol, native, log });
+const wait = async check => { const deadline = Date.now() + 22000; while (Date.now() < deadline) { const value = await check(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 100)); } throw new Error("Team Redis condition timed out"); };
+const payloads = rows => (rows || []).flatMap(row => { const fields = row[1]; const index = fields.indexOf("payload"); return index < 0 ? [] : [JSON.parse(fields[index + 1])]; });
+try {
+ await redis.connect(); await bridge.start();
+ const envelope = { v: 4, protocolVersion: 4, teamId, taskId: `team-${teamId}-task-1`, rootTaskId: `team-${teamId}-task-1`, messageId: "delivery-1", idempotencyKey: "delivery-1", assignmentId: "writing", workId: "writing", revision: 1, from: "lead", to: "writer", type: "assignment", text: "Write an actual report", createdAt: new Date().toISOString() };
+ await redis.command("XADD", `${prefix}:inbox:writer`, "*", "payload", JSON.stringify(envelope));
+ await wait(() => release);
+ const before = JSON.parse(await redis.command("HGET", `${prefix}:presence`, "writer"));
+ await wait(async () => JSON.parse(await redis.command("HGET", `${prefix}:presence`, "writer")).lastSeenAt !== before.lastSeenAt);
+ const ids = nativeIdentity({ teamId, memberId: "writer", taskId: envelope.taskId, messageId: envelope.messageId, generation: 2 });
+ const relative = `artifacts/${envelope.taskId}/members/writer/writing/report.md`;
+ const body = { name: "team_artifact_write", callID: "native-write-1", sessionID: ids.session, taskID: ids.message, generation: 2, arguments: { path: relative, content: "# Actual report\nSaved through the shared protocol." } };
+ const call = () => fetch(`http://127.0.0.1:${bridge.port}/tool`, { method: "POST", headers: { Authorization: `Bearer ${bridge.token}`, "Content-Type": "application/json" }, body: JSON.stringify(body) });
+ assert.equal((await call()).status, 200); assert.equal((await call()).status, 200);
+ assert.match(await fs.readFile(path.join(shared, relative), "utf8"), /Actual report/);
+ release();
+ await wait(async () => payloads(await redis.command("XRANGE", `${prefix}:events`, "-", "+")).some(event => event.eventKind === "turn_finished_without_completion"));
+ await redis.command("XADD", `${prefix}:inbox:writer`, "*", "payload", JSON.stringify(envelope));
+ await new Promise(resolve => setTimeout(resolve, 300));
+ assert.equal(starts, 1);
+ const events = payloads(await redis.command("XRANGE", `${prefix}:events`, "-", "+"));
+ assert.ok(!events.some(event => event.rootTaskTerminal === true || event.event === "task_completed"));
+ release = undefined;
+ const next = { ...envelope, taskId: `team-${teamId}-task-2`, rootTaskId: `team-${teamId}-task-2`, messageId: "delivery-2", idempotencyKey: "delivery-2" };
+ const untouched = { ...next, messageId: "delivery-3", idempotencyKey: "delivery-3" };
+ await redis.command("EVAL", "redis.call('XADD',KEYS[1],'*','payload',ARGV[1]);return redis.call('XADD',KEYS[1],'*','payload',ARGV[2])", 1, `${prefix}:inbox:writer`, JSON.stringify(next), JSON.stringify(untouched));
+ await wait(() => release);
+ await bridge.stop();
+ await new Promise(resolve => setTimeout(resolve, 200));
+ assert.equal(starts, 2);
+ assert.equal(await redis.command("XLEN", `${prefix}:dlq`), 0);
+ const pending = await redis.command("XPENDING", `${prefix}:inbox:writer`, "team-members");
+ assert.ok(Number(pending[0]) >= 1);
+ console.log("PASS: independent presence, authenticated artifact tool, duplicate delivery, no synthetic completion, shutdown retains pending deliveries");
+} finally { release?.(); await bridge.stop(); redis.close(); await fs.rm(root, { recursive: true, force: true }); }

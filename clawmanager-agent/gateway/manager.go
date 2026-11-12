@@ -724,6 +724,7 @@ func (m *GatewayManager) HeartbeatPayload(podID int) HeartbeatPayload {
 		availableSlots = 0
 	}
 	return HeartbeatPayload{
+		Capacity:       maxGateways,
 		PodID:          podID,
 		Namespace:      m.cfg.Namespace,
 		PodName:        m.cfg.PodName,

@@ -50,6 +50,16 @@ func (p Profile) GatewayCommand(string) []string {
 func (p Profile) GatewayEnv(base []string, cfg gateway.Config, req gateway.CreateGatewayRequest, workspacePath string, port int) []string {
 	env := append([]string(nil), base...)
 	env = gateway.ApplyRequestEnvironment(env, req)
+	// These are capabilities of the delivered image, not instance overrides.
+	// The slot starts with a reviewed environment rather than inheriting the Pod.
+	for _, key := range []string{"CLAWMANAGER_MODEL_GOVERNANCE_PROTOCOL", "CLAWMANAGER_REDIS_TEAM_PLUGIN_VERSION", "OPENCODE_RUNTIME_MAJOR"} {
+		if value, ok := os.LookupEnv(key); ok {
+			env = setEnv(env, key, value)
+		} else {
+			env = unsetEnv(env, key)
+		}
+	}
+	env = gateway.ApplyLiteTeamConfigEnvironment(env, req, workspacePath)
 	projectPath, projectRelativePath, fallbackReason := resolveOpenCodeProjectPath(req, workspacePath)
 	if fallbackReason != "" {
 		log.Printf("runtime-agent OpenCode default project fallback: instance_id=%d workspace_path=%q project_relative_path=%q reason=%s", req.InstanceID, workspacePath, req.ProjectRelativePath, fallbackReason)
@@ -102,6 +112,10 @@ func (p Profile) GatewayEnv(base []string, cfg gateway.Config, req gateway.Creat
 	username, password := resolveOpenCodeServerAuth(cfg, req)
 	env = setEnv(env, "OPENCODE_SERVER_USERNAME", username)
 	env = setEnv(env, "OPENCODE_SERVER_PASSWORD", password)
+	if managedV2Provider() {
+		// Native v2 gives this variable precedence over the legacy name.
+		env = setEnv(env, "OPENCODE_PASSWORD", password)
+	}
 
 	env = unsetEnv(
 		env,
@@ -228,6 +242,13 @@ func (p Profile) PrepareWorkspace(cfg gateway.Config, req gateway.CreateGatewayR
 	if err := prepareOpenCodeProjectDirectory(req, workspacePath); err != nil {
 		return err
 	}
+	projectPath, _, _ := resolveOpenCodeProjectPath(req, workspacePath)
+	if err := gateway.PrepareLiteTeamSharedWorkspaceForConfig(cfg, req, workspacePath, projectPath); err != nil {
+		return fmt.Errorf("prepare OpenCode Team workspace: %w", err)
+	}
+	if err := gateway.WriteLiteTeamConfigJSONForConfig(cfg, req, workspacePath); err != nil {
+		return fmt.Errorf("prepare OpenCode Team roster: %w", err)
+	}
 	root, err := workspaceio.Open(workspacePath)
 	if err != nil {
 		return err
@@ -296,7 +317,7 @@ func (p Profile) HealthChecker(cfg gateway.Config) gateway.GatewayHealthChecker 
 
 func resolveOpenCodeServerAuth(cfg gateway.Config, req gateway.CreateGatewayRequest) (string, string) {
 	username := "opencode"
-	if value, ok := requestEnvValue(req, "OPENCODE_SERVER_USERNAME"); ok && strings.TrimSpace(value) != "" {
+	if value, ok := requestEnvValue(req, "OPENCODE_SERVER_USERNAME"); !managedV2Provider() && ok && strings.TrimSpace(value) != "" {
 		username = strings.TrimSpace(value)
 	}
 
@@ -355,4 +376,13 @@ func unsetEnv(env []string, keys ...string) []string {
 		}
 	}
 	return filtered
+}
+
+// Registration advertises the adapter only for the governed delivery image.
+func (p Profile) RegistrationMetadata(gateway.Config) gateway.RuntimeRegistrationMetadata {
+	metadata := gateway.RuntimeRegistrationMetadata{}
+	if os.Getenv("CLAWMANAGER_REDIS_TEAM_PLUGIN_VERSION") == "opencode-team-v1" {
+		metadata.TeamPluginVersion = "opencode-team-v1"
+	}
+	return metadata
 }

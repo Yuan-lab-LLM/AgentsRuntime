@@ -30,19 +30,19 @@ type pendingFile struct {
 func Rewrite(ctx context.Context, base, workspace string, directories []Directory) error {
 	admin, err := workspaceio.Open(base)
 	if err != nil {
-		return ErrUnsafe
+		return migrationError("open_base", "", err)
 	}
 	defer admin.Close()
 	rel, err := admin.Rel(workspace)
 	if err != nil {
-		return ErrUnsafe
+		return migrationError("resolve_workspace", "", err)
 	}
 	instance, err := openDirectory(admin.Root, rel)
 	if os.IsNotExist(err) {
 		return nil
 	}
 	if err != nil {
-		return ErrUnsafe
+		return migrationError("open_workspace", "", err)
 	}
 	defer instance.Close()
 	var roots []*os.Root
@@ -62,17 +62,17 @@ func Rewrite(ctx context.Context, base, workspace string, directories []Director
 			continue
 		}
 		if err != nil {
-			return ErrUnsafe
+			return migrationError("open_directory", "", err)
 		}
 		roots = append(roots, root)
 		dir, err := root.Open(".")
 		if err != nil {
-			return ErrUnsafe
+			return migrationError("open_directory", "", err)
 		}
 		names, err := dir.ReadDir(MaxEntries - entries + 1)
 		dir.Close()
 		if err != nil && err != io.EOF {
-			return ErrUnsafe
+			return migrationError("list_directory", "", err)
 		}
 		entries += len(names)
 		if entries > MaxEntries {
@@ -88,7 +88,7 @@ func Rewrite(ctx context.Context, base, workspace string, directories []Director
 			}
 			data, info, err := readFile(root, entry.Name())
 			if err != nil {
-				return ErrUnsafe
+				return migrationError("read", entry.Name(), err)
 			}
 			total += len(data)
 			if total > maxTotalBytes {
@@ -96,7 +96,7 @@ func Rewrite(ctx context.Context, base, workspace string, directories []Director
 			}
 			changed, err := transform(data)
 			if err != nil || len(changed) > MaxFileBytes {
-				return ErrUnsafe
+				return migrationError("transform", entry.Name(), err)
 			}
 			total += len(changed)
 			if total > maxTotalBytes {
@@ -114,11 +114,11 @@ func Rewrite(ctx context.Context, base, workspace string, directories []Director
 		}
 		_, current, err := readFile(file.root, file.name)
 		if err != nil || !os.SameFile(file.info, current) {
-			return ErrUnsafe
+			return migrationError("recheck", file.name, err)
 		}
 		if file.data != nil {
 			if err := replace(file); err != nil {
-				return ErrUnsafe
+				return migrationError("replace", file.name, err)
 			}
 		}
 	}

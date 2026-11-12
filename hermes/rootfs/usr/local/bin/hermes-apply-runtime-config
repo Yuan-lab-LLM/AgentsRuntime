@@ -15,9 +15,12 @@ if [ -z "${CLAWMANAGER_LLM_RESOLVED_CONFIG_JSON:-}" ]; then
     export CLAWMANAGER_LLM_RESOLVED_CONFIG_JSON="${resolved_llm_config}"
 fi
 
-python_bin="/usr/local/lib/hermes-agent/venv/bin/python"
+python_bin="/opt/hermes-agent/.venv/bin/python"
 if [ ! -x "${python_bin}" ]; then
-    python_bin="$(command -v python3 || command -v python)"
+    python_bin="/usr/local/lib/hermes-agent/venv/bin/python"
+    if [ ! -x "${python_bin}" ]; then
+        python_bin="$(command -v python3 || command -v python)"
+    fi
 fi
 
 "${python_bin}" <<'PY'
@@ -30,7 +33,12 @@ from pathlib import Path
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-import yaml
+try:
+    import hermes_yaml as yaml  # Native 0.22.5 YAML policy (ruamel, safe API).
+except ModuleNotFoundError as exc:
+    if exc.name != "hermes_yaml":
+        raise
+    import yaml  # Older pinned Hermes images use PyYAML.
 
 
 def first_env(*names):

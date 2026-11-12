@@ -195,3 +195,20 @@ four native startup/UI, Browser/CNI, Team and failure-injection evidence is
 tracked in the network-credentials implementation ledger. Earlier node12
 results above are historical and do not certify this newer profile. No claim
 of cross-node Longhorn execution on the single-node server54 canary is made.
+# HXC node compatibility follow-up (2026-11-10)
+
+The exact upstream `netguard.TestRootlessNetworkReal` passed on node1 after
+selecting a named Localhost AppArmor profile granting `userns`. Ubuntu's global
+unprivileged-userns restriction remains enabled; no outer capabilities were
+added. The node profile must be provisioned before the deployment selects it.
+
+Container termination proofs optionally identify administrator kernel fencing
+with `proof_source=kubelet-container-fence-v1` and `fence_request_uid`. Only
+non-graceful ordinary stops accept this source. The authenticated controller
+verifies an immutable administrator request and exact old ContainerID exit;
+the worker still requires matching old operation/epoch, exclusive NFS writer
+lock, persistent reconciliation and controller finalization. Native C1 messages
+are unchanged. Native maintenance, upgrades and graceful idle-stop cannot use
+this evidence source. No automatic force replacement or Worker API changes.
+Tests cover both sources, live-lock refusal, idempotency and finalization.
+Live failed-slot recovery and Team task acceptance are recorded separately.

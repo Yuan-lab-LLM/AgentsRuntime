@@ -39,6 +39,14 @@ func ApplyLiteTeamConfigEnvironment(env []string, req CreateGatewayRequest, work
 }
 
 func WriteLiteTeamConfigJSON(req CreateGatewayRequest, workspacePath string) error {
+	return writeLiteTeamConfigJSON(Config{}, req, workspacePath)
+}
+
+func WriteLiteTeamConfigJSONForConfig(cfg Config, req CreateGatewayRequest, workspacePath string) error {
+	return writeLiteTeamConfigJSON(cfg, req, workspacePath)
+}
+
+func writeLiteTeamConfigJSON(cfg Config, req CreateGatewayRequest, workspacePath string) error {
 	raw, ok := requestEnvValue(req, teamConfigJSONEnv)
 	if !ok || strings.TrimSpace(raw) == "" {
 		return nil
@@ -70,11 +78,24 @@ func WriteLiteTeamConfigJSON(req CreateGatewayRequest, workspacePath string) err
 		return err
 	}
 	defer root.Close()
+	if cfg.SandboxProfile == "nfs-rootless-v1" {
+		group, err := teamDirectoryGroup(root)
+		if err != nil {
+			return err
+		}
+		if group != liteTeamSharedGID(req) && !nativeTeamGrantForRoot(root, sharedRoot, liteTeamSharedGID(req), cfg.NativeTeamGrant) {
+			return fmt.Errorf("existing Team root group does not match authorization")
+		}
+		root.PreserveOwnership = true
+	}
 	if err := root.MkdirAll(filepath.Dir(filePath), 0750); err != nil {
 		return fmt.Errorf("create lite team config dir: %w", err)
 	}
 	if err := root.WriteFile(filePath, data, 0664); err != nil {
 		return fmt.Errorf("write lite team config: %w", err)
+	}
+	if cfg.SandboxProfile == "nfs-rootless-v1" {
+		return nil
 	}
 	sharedGID := liteTeamSharedGID(req)
 	if err := root.Chgrp(filepath.Dir(filePath), sharedGID); err != nil {
