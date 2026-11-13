@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,20 +20,21 @@ import (
 )
 
 type Worker struct {
-	workerEpoch   string
-	reset         chan struct{}
-	resetReady    bool
-	network       *networkOwner
-	cfg           gateway.Config
-	manager       *gateway.GatewayManager
-	handler       http.Handler
-	mu            sync.Mutex
-	book          *book
-	lease         *os.File
-	writerPath    string
-	writerRequest gateway.CreateGatewayRequest
-	slotName      string
-	metrics       *metricsSampler
+	workerEpoch          string
+	reset                chan struct{}
+	resetReady           bool
+	containerPreparation *containerPreparation
+	network              *networkOwner
+	cfg                  gateway.Config
+	manager              *gateway.GatewayManager
+	handler              http.Handler
+	mu                   sync.Mutex
+	book                 *book
+	lease                *os.File
+	writerPath           string
+	writerRequest        gateway.CreateGatewayRequest
+	slotName             string
+	metrics              *metricsSampler
 }
 
 func NewWorker(cfg gateway.Config) (*Worker, error) {
@@ -131,6 +133,10 @@ func (w *Worker) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	}
 	if w.cfg.SandboxProfile == "nfs-rootless-v1" && r.URL.Path == "/v1/native-maintenance/reconcile" {
 		w.serveNativeMaintenanceReconcile(out, r)
+		return
+	}
+	if w.cfg.SandboxProfile == "nfs-rootless-v1" && (r.URL.Path == "/v1/reconcile-fault-stop" || r.URL.Path == "/v1/release-fault-stop") && r.Method == http.MethodPost {
+		w.serveFaultRecovery(out, r, r.URL.Path == "/v1/release-fault-stop")
 		return
 	}
 	if w.cfg.SandboxProfile == "nfs-rootless-v1" && r.URL.Path == "/v1/reconcile-stop" && r.Method == http.MethodPost {
@@ -247,7 +253,8 @@ func (w *Worker) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 			http.Error(out, "slot cannot confirm unknown writer stop", 409)
 			return
 		}
-		if w.idleStopFenced() {
+		forceDelete := r.Method == http.MethodDelete && r.URL.Query().Get("force_delete") == "true"
+		if w.idleStopFenced() && !forceDelete {
 			http.Error(out, "idle stop requires graceful protocol retry", 409)
 			return
 		}
@@ -255,7 +262,17 @@ func (w *Worker) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 			writeJSON(out, 200, map[string]any{"gateway_id": id, "stopped": true, "confirmed": true, "unmounted": true})
 			return
 		}
-		if err := w.manager.StopGatewayConfirmed(r.Context(), id); err != nil {
+		var stopErr error
+		if forceDelete {
+			stopErr = w.manager.ForceDeleteGateway(r.Context(), id)
+		} else {
+			stopErr = w.manager.StopGatewayConfirmed(r.Context(), id)
+		}
+		if err := stopErr; err != nil {
+			if forceDelete && errors.Is(err, gateway.ErrGatewayStopUnsupported) {
+				http.Error(out, "explicit force deletion requires a dedicated kill-and-proof hook", http.StatusNotImplemented)
+				return
+			}
 			http.Error(out, "gateway stop is not confirmed", 409)
 			return
 		}
@@ -263,7 +280,12 @@ func (w *Worker) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 			http.Error(out, "failed to persist writer stop", 409)
 			return
 		}
+		previousIdleStop := w.book.Assignment.IdleStop
+		if forceDelete {
+			w.book.Assignment.IdleStop = false
+		}
 		if err := w.book.stopped(id); err != nil {
+			w.book.Assignment.IdleStop = previousIdleStop
 			http.Error(out, "failed to persist stop confirmation", 409)
 			return
 		}

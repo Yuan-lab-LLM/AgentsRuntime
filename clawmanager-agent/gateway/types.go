@@ -225,11 +225,16 @@ type ManagedProcess struct {
 	WorkbenchStopProcess func(context.Context, string) (workbench.Process, error)
 	// PrepareReset joins only the primary application shutdown. It never proves
 	// detached descendants ended and cannot authorize writer release.
-	PrepareReset    func(context.Context, bool) error
-	VerifyListeners func(context.Context) error
-	PID             int
-	Stop            func(context.Context) error
-	Done            <-chan error
+	PrepareReset func(context.Context, bool) error
+	// PrepareForceReset immediately kills the pinned primary for explicit deletion.
+	// Container termination proof remains mandatory before writer release.
+	PrepareForceReset func(context.Context) error
+	VerifyListeners   func(context.Context) error
+	PID               int
+	Stop              func(context.Context) error
+	// ForceStop immediately kills the pinned execution and proves its entire scope ended.
+	ForceStop func(context.Context) error
+	Done      <-chan error
 	// ConfirmStopped proves the entire owned scope has ended without signaling.
 	ConfirmStopped func(context.Context) error
 	// FenceIdleStop atomically persists graceful policy against asynchronous

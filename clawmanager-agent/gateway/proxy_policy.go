@@ -55,6 +55,7 @@ type ProxyPolicyUpdate struct {
 	ExpectedRevision string   `json:"expected_revision"`
 	Namespace        string   `json:"namespace"`
 	Proxies          []string `json:"proxies"`
+	ExpiresAtMS      int64    `json:"expires_at_ms,omitempty"`
 }
 
 // The file is outside all member workspaces. Request environments cannot
@@ -87,6 +88,14 @@ func (s *ProxyPolicyStore) Update(req ProxyPolicyUpdate) (ProxyPolicy, error) {
 	if req.ExpectedRevision != s.current.Revision {
 		return ProxyPolicy{}, ErrProxyPolicyConflict
 	}
+	now := time.Now().UnixMilli()
+	expiry := req.ExpiresAtMS
+	if expiry == 0 {
+		expiry = now + 60000
+	}
+	if expiry <= now || expiry > now+90000 {
+		return ProxyPolicy{}, fmt.Errorf("invalid proxy policy expiry")
+	}
 	if len(req.Proxies) == 0 || len(req.Proxies) > 128 {
 		return ProxyPolicy{}, fmt.Errorf("invalid proxy count")
 	}
@@ -107,7 +116,7 @@ func (s *ProxyPolicyStore) Update(req ProxyPolicyUpdate) (ProxyPolicy, error) {
 	if _, err := rand.Read(revision[:]); err != nil {
 		return ProxyPolicy{}, err
 	}
-	next := ProxyPolicy{Contract: 1, Namespace: s.namespace, Revision: hex.EncodeToString(revision[:]), Proxies: proxies, ExpiresAtMS: time.Now().Add(60 * time.Second).UnixMilli()}
+	next := ProxyPolicy{Contract: 1, Namespace: s.namespace, Revision: hex.EncodeToString(revision[:]), Proxies: proxies, ExpiresAtMS: expiry}
 	raw, err := json.Marshal(next)
 	if err != nil {
 		return ProxyPolicy{}, err

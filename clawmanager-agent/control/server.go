@@ -166,7 +166,17 @@ func NewControlHandler(cfg gateway.Config, manager *gateway.GatewayManager, repo
 			}
 			writeJSON(w, http.StatusOK, state)
 		case r.Method == http.MethodDelete || (r.Method == http.MethodPost && stopRequested):
-			if err := manager.StopGatewayConfirmed(r.Context(), gatewayID); err != nil {
+			var stopErr error
+			if r.Method == http.MethodDelete && r.URL.Query().Get("force_delete") == "true" {
+				stopErr = manager.ForceDeleteGateway(r.Context(), gatewayID)
+			} else {
+				stopErr = manager.StopGatewayConfirmed(r.Context(), gatewayID)
+			}
+			if err := stopErr; err != nil {
+				if errors.Is(err, gateway.ErrGatewayStopUnsupported) && r.Method == http.MethodDelete && r.URL.Query().Get("force_delete") == "true" {
+					http.Error(w, "explicit force deletion requires a dedicated kill-and-proof hook", http.StatusNotImplemented)
+					return
+				}
 				http.Error(w, err.Error(), http.StatusConflict)
 				return
 			}

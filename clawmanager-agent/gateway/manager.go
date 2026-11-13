@@ -24,6 +24,7 @@ type gatewayRecord struct {
 	stopBusy             bool
 	stopConfirmed        bool
 	deletePending        bool
+	forceDelete          bool
 	deleteBusy           bool
 	executionCleanup     func(context.Context) error
 	state                GatewayState

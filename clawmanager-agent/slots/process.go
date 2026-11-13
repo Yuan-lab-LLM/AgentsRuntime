@@ -157,6 +157,25 @@ func (s sandboxStarter) StartGateway(_ context.Context, spec gateway.GatewayStar
 				return ctx.Err()
 			}
 		}}
+	process.ForceStop = func(ctx context.Context) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		select {
+		case <-waited:
+			return confirmedStop(ctx)
+		default:
+		}
+		if err := kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-waited:
+			return confirmedStop(ctx)
+		}
+	}
 	if s.cfg.SandboxProfile == "nfs-rootless-v1" {
 		primary := newContainerPrimaryStop(&mu, tracker.Terminate, kill, waited, s.cfg.ProcessStopTimeout)
 		prepare := func(ctx context.Context, graceful bool) error {
@@ -166,6 +185,31 @@ func (s sandboxStarter) StartGateway(_ context.Context, spec gateway.GatewayStar
 			return tracker.Close()
 		}
 		process.PrepareReset = prepare
+		process.PrepareForceReset = func(ctx context.Context) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			select {
+			case <-waited:
+				return tracker.Close()
+			default:
+			}
+			// kill is bound to the original os.Process and sandbox UID. It must not
+			// wait for the mutex held by an already-running graceful preparation.
+			if err := kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+				return err
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-waited:
+				return tracker.Close()
+			}
+		}
+		process.ForceStop = func(ctx context.Context) error {
+			return errors.Join(process.PrepareForceReset(ctx), sandbox.ErrContainerResetRequired)
+		}
+
 		process.GracefulStop = func(ctx context.Context) error {
 			return errors.Join(prepare(ctx, true), sandbox.ErrContainerResetRequired)
 		}

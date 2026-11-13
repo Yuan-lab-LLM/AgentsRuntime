@@ -94,3 +94,56 @@ func (m *GatewayManager) PrepareContainerReset(ctx context.Context, id string, g
 	}
 	return nil
 }
+
+// PrepareContainerForceDelete is an explicit operation, never an escalation of
+// ordinary reset retries. It keeps every reservation until container teardown.
+func (m *GatewayManager) PrepareContainerForceDelete(ctx context.Context, id string) error {
+	if m.cfg.SandboxProfile != "nfs-rootless-v1" {
+		return ErrGatewayStopConflict
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	record := m.gateways[id]
+	if record == nil {
+		m.mu.Unlock()
+		return nil
+	}
+	record.forceDelete, record.deletePending = true, true
+	record.state.State = "stopping"
+	record.cancel()
+	process := record.process
+	m.mu.Unlock()
+	// Kill before joining the lifecycle owner: it may itself be waiting in a
+	// graceful primary shutdown with an independent timeout.
+	if process.PID != 0 {
+		if process.PrepareForceReset == nil {
+			return fmt.Errorf("explicit container force preparation is unavailable")
+		}
+		if err := process.PrepareForceReset(ctx); err != nil {
+			return err
+		}
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-record.finished:
+	}
+	m.mu.RLock()
+	current, cleanup := record.process, record.executionCleanup
+	m.mu.RUnlock()
+	// Startup can publish its process after cancellation but before finishing.
+	if current.PID != 0 && current.PID != process.PID {
+		if current.PrepareForceReset == nil {
+			return fmt.Errorf("explicit container force preparation is unavailable")
+		}
+		if err := current.PrepareForceReset(ctx); err != nil {
+			return err
+		}
+	}
+	if cleanup != nil {
+		return cleanup(ctx)
+	}
+	return nil
+}

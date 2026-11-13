@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/netip"
+	"os"
 	"slices"
 	"sort"
 	"strconv"
@@ -46,6 +47,8 @@ type Snapshot struct {
 }
 
 type Pool struct {
+	slotStateRoot string
+	slotSocketDir string
 	maintenanceMu sync.Mutex
 	maintenance   map[string]*nativeUpgradeSession
 	cfg           gateway.Config
@@ -54,6 +57,7 @@ type Pool struct {
 	stream        func(int) http.RoundTripper
 	metadata      *gateway.GatewayManager
 	mu            sync.RWMutex
+	proxyPolicy   *gateway.ProxyPolicyStore
 	proxyMu       sync.Mutex
 	draining      bool
 }
@@ -66,6 +70,16 @@ func NewPool(cfg gateway.Config, count int, call Call, stream ...func(int) http.
 		return nil, errors.New("slot pool port range is insufficient")
 	}
 	p := &Pool{cfg: cfg, count: count, call: call, metadata: gateway.NewGatewayManager(cfg, nil, nil)}
+	if cfg.SandboxProfile == "nfs-rootless-v1" {
+		if cfg.ProxyPolicyFile != "" {
+			p.proxyPolicy = gateway.NewProxyPolicyStore(cfg.ProxyPolicyFile, cfg.Namespace)
+		}
+		p.slotStateRoot = os.Getenv("RUNTIME_COORDINATOR_SLOT_STATE_ROOT")
+		p.slotSocketDir = os.Getenv("RUNTIME_SLOT_SOCKET_DIR")
+		if p.slotSocketDir == "" {
+			p.slotSocketDir = "/run/clawmanager-slots"
+		}
+	}
 	if len(stream) > 1 {
 		return nil, errors.New("one stream transport factory required")
 	}
@@ -158,10 +172,13 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.forward(w, copyReq, index, nil)
 			return
 		}
-		if (parts[1] == "reconcile-stop" || parts[1] == "release-stop") && r.Method == http.MethodPost {
-			body, err := io.ReadAll(io.LimitReader(r.Body, 4097))
-			if err != nil || len(body) > 4096 {
+		if (parts[1] == "reconcile-stop" || parts[1] == "release-stop" || parts[1] == "reconcile-fault-stop" || parts[1] == "release-fault-stop") && r.Method == http.MethodPost {
+			body, err := io.ReadAll(io.LimitReader(r.Body, 16385))
+			if err != nil || len(body) > 16384 {
 				http.Error(w, "invalid reconciliation", 400)
+				return
+			}
+			if p.serveOfflineContainerFinalization(w, r, index, parts[1], body) {
 				return
 			}
 			copyReq := r.Clone(r.Context())
@@ -218,8 +235,16 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/v1/proxy-policy" {
+		if p.cfg.SandboxProfile == "nfs-rootless-v1" && p.proxyPolicy == nil {
+			http.NotFound(w, r)
+			return
+		}
 		if r.Method == http.MethodGet {
-			p.forward(w, r, 0, body)
+			if p.proxyPolicy != nil {
+				writeJSON(w, 200, p.proxyPolicy.Snapshot())
+			} else {
+				p.forward(w, r, 0, body)
+			}
 		} else if r.Method == http.MethodPut {
 			p.updateProxyPolicy(w, r, body)
 		} else {
@@ -275,6 +300,18 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		index := offset / p.cfg.GatewayPortBlockSize
+		if p.proxyPolicy != nil {
+			// Serialize application with canonical updates so an older snapshot
+			// cannot overwrite a newer broadcast. Native creation may be slow;
+			// renewals must resume before forwarding that operation.
+			p.proxyMu.Lock()
+			err := p.syncProxyPolicy(r.Context(), index, p.proxyPolicy.Snapshot())
+			p.proxyMu.Unlock()
+			if err != nil {
+				http.Error(w, gateway.ErrProxyPolicyNotReady.Error(), 503)
+				return
+			}
+		}
 		req.PortRange = gateway.PortRange{Start: req.GatewayPort, End: req.GatewayPort + p.cfg.GatewayPortBlockSize - 1}
 		body, _ = json.Marshal(req)
 		p.forward(w, r, index, body)
@@ -369,8 +406,8 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.forward(w, r, identity.InstanceID%p.count, body)
 }
 
-// Slot revisions are independent CAS tokens. The caller compares against slot0,
-// while each peer update compares against that peer's own current revision.
+// Native callers compare the coordinator revision; legacy callers compare slot0.
+// Each worker update still compares against that worker's independent CAS token.
 func (p *Pool) updateProxyPolicy(w http.ResponseWriter, r *http.Request, body []byte) {
 	p.proxyMu.Lock()
 	defer p.proxyMu.Unlock()
@@ -401,6 +438,31 @@ func (p *Pool) updateProxyPolicy(w http.ResponseWriter, r *http.Request, body []
 	}
 	sort.Strings(desired)
 	req.Proxies = desired
+	if p.proxyPolicy != nil {
+		policy, err := p.proxyPolicy.Update(req)
+		if errors.Is(err, gateway.ErrProxyPolicyConflict) {
+			http.Error(w, err.Error(), 409)
+			return
+		}
+		if err != nil {
+			http.Error(w, "proxy policy update failed", 400)
+			return
+		}
+		// Canonical publication does not depend on any worker. Refresh peers
+		// concurrently with bounded calls; selected creation retries its own.
+		var wg sync.WaitGroup
+		for i := 0; i < p.count; i++ {
+			wg.Add(1)
+			go func(index int) { defer wg.Done(); _ = p.syncProxyPolicy(r.Context(), index, policy) }(i)
+		}
+		wg.Wait()
+		if policy.ExpiresAtMS <= time.Now().UnixMilli() {
+			http.Error(w, gateway.ErrProxyPolicyNotReady.Error(), 503)
+			return
+		}
+		writeJSON(w, 200, policy)
+		return
+	}
 	read := func(index int) (gateway.ProxyPolicy, bool) {
 		status, data, err := p.call(r.Context(), index, http.MethodGet, r.URL.RequestURI(), nil)
 		var policy gateway.ProxyPolicy
@@ -447,6 +509,29 @@ func (p *Pool) updateProxyPolicy(w http.ResponseWriter, r *http.Request, body []
 		return
 	}
 	writeJSON(w, 200, first)
+}
+
+// A worker keeps its own CAS token, but receives the coordinator's exact lease.
+// Never turn forwarding or restarting a worker into another minute of trust.
+func (p *Pool) syncProxyPolicy(ctx context.Context, index int, canonical gateway.ProxyPolicy) error {
+	now := time.Now().UnixMilli()
+	if canonical.Contract != 1 || canonical.Namespace != p.cfg.Namespace || canonical.Revision == "" || len(canonical.Proxies) == 0 || len(canonical.Proxies) > 128 || canonical.ExpiresAtMS <= now || canonical.ExpiresAtMS > now+90000 {
+		return gateway.ErrProxyPolicyNotReady
+	}
+	ctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	status, data, err := p.call(ctx, index, http.MethodGet, "/v1/proxy-policy", nil)
+	var current gateway.ProxyPolicy
+	if err != nil || status != 200 || json.Unmarshal(data, &current) != nil || current.Contract != 1 || current.Namespace != canonical.Namespace {
+		return gateway.ErrProxyPolicyNotReady
+	}
+	body, _ := json.Marshal(gateway.ProxyPolicyUpdate{ExpectedRevision: current.Revision, Namespace: canonical.Namespace, Proxies: canonical.Proxies, ExpiresAtMS: canonical.ExpiresAtMS})
+	status, data, err = p.call(ctx, index, http.MethodPut, "/v1/proxy-policy", body)
+	var ack gateway.ProxyPolicy
+	if err != nil || status != 200 || json.Unmarshal(data, &ack) != nil || ack.Contract != 1 || ack.Namespace != canonical.Namespace || ack.Revision == "" || !slices.Equal(ack.Proxies, canonical.Proxies) || ack.ExpiresAtMS != canonical.ExpiresAtMS || ack.ExpiresAtMS <= time.Now().UnixMilli() {
+		return gateway.ErrProxyPolicyNotReady
+	}
+	return nil
 }
 
 func (p *Pool) forward(w http.ResponseWriter, r *http.Request, index int, body []byte) {

@@ -58,7 +58,7 @@ func runWorker(ctx context.Context, cfg gateway.Config) error {
 		return err
 	}
 	defer guard.Close()
-	if err = lockWorkspace(guard); err != nil {
+	if err = waitForSlotOwnership(ctx, guard); err != nil {
 		return fmt.Errorf("another supervisor owns this slot")
 	}
 	worker, err := NewWorker(cfg)
@@ -112,6 +112,9 @@ func runWorker(ctx context.Context, cfg gateway.Config) error {
 }
 
 func runPool(ctx context.Context, cfg gateway.Config) error {
+	if root := os.Getenv("RUNTIME_COORDINATOR_SLOT_STATE_ROOT"); root != "" && root != "/var/lib/clawmanager-slots" {
+		return fmt.Errorf("invalid coordinator slot state root")
+	}
 	tlsConfig, err := poolTLSConfig(cfg)
 	if err != nil {
 		return err
