@@ -24,6 +24,9 @@ def check():
     workflow = (ROOT / ".github/workflows/docker-ghcr.yml").read_text()
     mappings = re.findall(r'"([^"|]+)-lite\|([^|]+)\|([^|]+)\|[^"|]+"', workflow)
     for runtime in RUNTIMES:
+        module_vendor = ROOT / runtime / "vendor"
+        require(not module_vendor.exists() or (module_vendor / "modules.txt").is_file(),
+                f"{runtime}: vendor is reserved for Go dependencies and requires vendor/modules.txt; put bootstrap assets elsewhere")
         selected = [(context, dockerfile) for name, context, dockerfile in mappings if name == runtime]
         require(bool(selected), f"{runtime}: missing Lite publish mapping")
         for context, dockerfile in selected:

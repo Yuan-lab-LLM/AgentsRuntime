@@ -104,8 +104,8 @@ RUN set -eux; \
     npm --version; \
     rm -f /tmp/node.tar.xz
 
-COPY hermes/vendor/hermes-agent/install.sh /tmp/hermes-install.sh
-COPY hermes/vendor/hermes-agent/LICENSE /usr/local/share/licenses/hermes-agent-installer/LICENSE
+COPY hermes/bootstrap/hermes-agent/install.sh /tmp/hermes-install.sh
+COPY hermes/bootstrap/hermes-agent/LICENSE /usr/local/share/licenses/hermes-agent-installer/LICENSE
 
 RUN set -eux; \
     mkdir -p "${HERMES_HOME}" "${PLAYWRIGHT_BROWSERS_PATH}"; \
