@@ -3,6 +3,7 @@ package slots
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -54,6 +55,12 @@ func TestContainerTerminationCommitmentFitsKubeletBudget(t *testing.T) {
 }
 
 func TestContainerRestartRetainsWriterUntilMatchingProofAndLock(t *testing.T) {
+	for _, external := range []bool{false, true} {
+		t.Run(fmt.Sprint(external), func(t *testing.T) { testContainerRestartRetainsWriterUntilMatchingProofAndLock(t, external) })
+	}
+}
+
+func testContainerRestartRetainsWriterUntilMatchingProofAndLock(t *testing.T, external bool) {
 	cfg := gateway.Config{SandboxProfile: "nfs-rootless-v1", WorkspaceRoot: t.TempDir(), AgentDataDir: t.TempDir(), RuntimeType: "openclaw", PodUID: "pod"}
 	b, err := openBook(cfg.AgentDataDir)
 	if err != nil {
@@ -85,6 +92,10 @@ func TestContainerRestartRetainsWriterUntilMatchingProofAndLock(t *testing.T) {
 		t.Fatal("restart silently released the old writer")
 	}
 	proof := containerTerminationProof{containerTerminationMessage: containerTerminationMessage{containerStopIntent: intent, CleanupConfirmed: true}, ContainerID: "containerd://old", FinishedAt: time.Now()}
+	if external {
+		proof.ProofSource = "kubelet-container-fence-v1"
+		proof.FenceRequestUID = "request-uid"
+	}
 	call := func(p containerTerminationProof) int {
 		data, _ := json.Marshal(p)
 		r := httptest.NewRequest(http.MethodPost, "/v1/reconcile-stop", bytes.NewReader(data))
@@ -93,6 +104,17 @@ func TestContainerRestartRetainsWriterUntilMatchingProofAndLock(t *testing.T) {
 		return out.Code
 	}
 	stale := proof
+	stale.ProofSource = "unknown-source"
+	if call(stale) != 409 {
+		t.Fatal("unknown fencing source released writer")
+	}
+	stale = proof
+	stale.ProofSource = "kubelet-container-fence-v1"
+	stale.FenceRequestUID = ""
+	if call(stale) != 409 {
+		t.Fatal("missing operator request released writer")
+	}
+	stale = proof
 	stale.OperationID = "44444444444444444444444444444444"
 	if call(stale) != 409 {
 		t.Fatal("stale stop operation released writer")

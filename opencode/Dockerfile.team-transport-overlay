@@ -1,0 +1,5 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG VCS_REF
+COPY --from=team-protocol /opencode-protocol.mjs /usr/local/share/clawmanager/opencode-team/protocol.mjs
+LABEL org.opencontainers.image.revision=$VCS_REF

@@ -1,0 +1,20 @@
+# syntax=docker/dockerfile:1.7
+# Release overlay of the accepted M1 native installation. The shared Team
+# protocol is built from current source, not copied from a deployed plugin.
+ARG DSH_BASE_IMAGE=10.130.14.23:5000/agentsruntime/deepseek-harness-lite@sha256:a356a00e15da7e9e8807cdcdf913acfa617ed5d9c17ac3f4828a9ed22b28f431
+FROM ${DSH_BASE_IMAGE}
+ARG VCS_REF
+COPY --from=agent-binaries /clawmanager-agent /usr/local/bin/clawmanager-agent
+COPY --from=agent-binaries /clawmanager-agent /usr/local/libexec/clawmanager-agent-image
+COPY plugins/openclaw-redis-team/dist/index.js /opt/clawmanager-dsh/adapter/plugins/openclaw-redis-team/dist/index.js
+COPY opencode/team/bridge.mjs opencode/team/native-client.mjs opencode/team/delivery-outbox.mjs opencode/team/build-protocol.mjs /opt/clawmanager-dsh/adapter/opencode/team/
+COPY deepseek-harness/team/host.mjs deepseek-harness/team/plugin.mjs deepseek-harness/team/build.mjs deepseek-harness/team/schema.mjs /opt/clawmanager-dsh/adapter/deepseek-harness/team/
+COPY deepseek-harness/config/team.cordis.patch.yml /usr/local/share/deepseek-harness/team.cordis.patch.yml
+COPY deepseek-harness/scripts/start-deepseek-harness-gateway /usr/local/bin/start-deepseek-harness-gateway
+COPY deepseek-harness/scripts/verify-native.mjs /opt/clawmanager-dsh/verify-native.mjs
+RUN set -eu; node /opt/clawmanager-dsh/adapter/deepseek-harness/team/build.mjs /opt/clawmanager-dsh/adapter/deepseek-harness/team/protocol.mjs; \
+    printf '{"protocol":"dsh-team-v1","native":"0.2.1-rc.3"}\n' > /opt/clawmanager-dsh/adapter/deepseek-harness/team/capability.json; \
+    chmod 755 /usr/local/bin/start-deepseek-harness-gateway /usr/local/bin/clawmanager-agent /usr/local/libexec/clawmanager-agent-image; \
+    node /opt/clawmanager-dsh/verify-native.mjs /opt/clawmanager-dsh/native-manifest.json --patched
+ENV CLAWMANAGER_REDIS_TEAM_PLUGIN_VERSION=dsh-team-v1
+LABEL org.opencontainers.image.revision=$VCS_REF io.clawmanager.team.protocol=dsh-team-v1

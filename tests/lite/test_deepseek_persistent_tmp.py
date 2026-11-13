@@ -23,11 +23,12 @@ class PersistentTmpPatch(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         patched = module.patch_text(ORIGINAL)
-        source = patched + '\nconsole.log(JSON.stringify([bwrapProfileArgs({mode:"workspace-write",workspaceRoot:"/workspace"}), bwrapProfileArgs({mode:"read-only",workspaceRoot:"/workspace"})]));'
+        source = patched + '\nprocess.env.CLAWMANAGER_DSH_PRIVATE_TMP="1"; const native=bwrapProfileArgs({mode:"workspace-write",workspaceRoot:"/workspace"}); delete process.env.CLAWMANAGER_DSH_PRIVATE_TMP; console.log(JSON.stringify([native,bwrapProfileArgs({mode:"read-only",workspaceRoot:"/workspace"}),bwrapProfileArgs({mode:"workspace-write",workspaceRoot:"/workspace"})]));'
         result = subprocess.run(['node','--input-type=commonjs'], input=source, text=True, capture_output=True, check=True)
-        write, read = json.loads(result.stdout)
+        write, read, legacy = json.loads(result.stdout)
         self.assertEqual(write, ['--ro-bind','/','/','--unshare-pid','--proc','/proc','--bind','/tmp','/tmp','--bind','/workspace','/workspace'])
         self.assertEqual(read, ['--ro-bind','/','/','--unshare-pid','--proc','/proc'])
+        self.assertEqual(legacy, ['--ro-bind','/','/','--unshare-pid','--proc','/proc','--tmpfs','/tmp','--bind','/workspace','/workspace'])
         with self.assertRaises(ValueError): module.patch_text(ORIGINAL + ORIGINAL)
         with self.assertRaises(ValueError): module.patch_text(patched)
 

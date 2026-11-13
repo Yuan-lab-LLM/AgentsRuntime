@@ -552,7 +552,7 @@ func (p *Pool) serveNativeUpgrades(out http.ResponseWriter, r *http.Request) boo
 		return true
 	}
 	var proof containerTerminationProof
-	if decodeContainerOperation(r, &proof) != nil || proof.OperationID != parts[0] {
+	if decodeContainerOperation(r, &proof) != nil || !validContainerProofSource(proof) || proof.OperationID != parts[0] {
 		http.Error(out, "invalid native proof", 400)
 		return true
 	}

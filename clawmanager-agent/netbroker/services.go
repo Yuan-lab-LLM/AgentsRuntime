@@ -57,13 +57,13 @@ func (b *Broker) services(w http.ResponseWriter, r *http.Request) {
 			reject(w, r, "unsupported upgrade", 400)
 			return
 		}
-		b.modelUpgrade(w, request, ctx, lease.ServicesToken)
+		b.modelUpgrade(w, request, ctx, lease.ServicesToken, nil)
 		return
 	}
 	// Reuse the fixed backend transport and managed-header filter, supplying
 	// only the services audience. Neither model nor control authority is added.
 	lease.ModelToken = lease.ServicesToken
-	b.forward(w, request, ctx, lease, true)
+	b.forward(w, request, ctx, lease, true, nil)
 }
 
 // ServeTeamRedis exposes one named raw RESP service to the exact business child.

@@ -1,0 +1,3 @@
+- insert:
+  - id: clawmanager-team-host
+    name: /opt/clawmanager-dsh/adapter/deepseek-harness/team/plugin.mjs

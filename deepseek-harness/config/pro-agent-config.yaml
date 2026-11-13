@@ -14,7 +14,7 @@ openclaw_command:
   - /usr/local/bin/start-deepseek-harness-pro
 openclaw_doctor_command:
   - /bin/true
-openclaw_doctor_policy: auto
+openclaw_doctor_policy: never
 startup_notification_message: DeepSeek Harness is starting
 startup_repair_notification_message: DeepSeek Harness is recovering
 # The reused supervisor validates an OpenClaw-shaped JSON file before starting

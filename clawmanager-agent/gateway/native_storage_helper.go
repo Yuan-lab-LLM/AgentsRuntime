@@ -3,15 +3,58 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/iamlovingit/clawmanager-agent/workspaceio"
 	"io"
 	"os"
+	"strings"
+	"syscall"
 )
+
+// The auxiliary process has no trusted diagnostic transport besides stderr.
+// Emit only fixed phase/errno categories, never errors containing config text.
+func NativeStorageFailureCode(err error) string {
+	phase := "helper"
+	text := strings.ToLower(err.Error())
+	for _, name := range []string{"credentials", "workspace", "config"} {
+		if strings.Contains(text, "native_storage_"+name+":") {
+			phase = name
+			break
+		}
+	}
+	code := "helper failed"
+	var diagnostic interface{ SafeDiagnosticCode() string }
+	if errors.As(err, &diagnostic) {
+		for _, stage := range []string{"open_base", "resolve_workspace", "open_workspace", "open_directory", "list_directory", "read", "transform", "recheck", "replace"} {
+			for _, kind := range []string{"generated", "yaml", "json", "env"} {
+				if diagnostic.SafeDiagnosticCode() == stage+"_"+kind {
+					return "native_storage_" + phase + ": " + stage + "_" + kind
+				}
+			}
+		}
+	}
+	switch {
+	case errors.Is(err, syscall.EACCES):
+		code = "permission denied"
+	case errors.Is(err, syscall.EPERM):
+		code = "operation not permitted"
+	case errors.Is(err, syscall.ENOENT):
+		code = "no such file"
+	case strings.Contains(text, "identity mismatch"):
+		code = "native helper identity mismatch"
+	case strings.Contains(text, "unsafe"):
+		code = "unsafe configuration"
+	case strings.Contains(text, "credential"):
+		code = "credential configuration"
+	}
+	return "native_storage_" + phase + ": " + code
+}
 
 // NativeStorageConfig contains only configuration the instance already receives
 // through its generated native files. Management credentials are not serializable.
 type NativeStorageConfig struct {
+	TeamGrant                                                          *NativeTeamGrant
 	RuntimeType, WorkspaceRoot, SandboxProfile, NetworkSecurityProfile string
 	OpenClawVersion, GatewayAuthMode, PublicOrigin, ProxyPolicyFile    string
 	GatewayPortStart, GatewayPortEnd, GatewayPortBlockSize             int
@@ -116,6 +159,7 @@ func RunNativeStorageHelper(profile RuntimeProfile, args []string, in io.Reader,
 	}
 	req := op.Request
 	cfg := op.Config.config(profile)
+	cfg.NativeTeamGrant = op.Config.TeamGrant
 	if profile == nil || cfg.SandboxProfile != "nfs-rootless-v1" || cfg.NetworkSecurityProfile != "isolated-network-v1" || req.SecurityProfile != cfg.NetworkSecurityProfile || req.AgentType != cfg.RuntimeType || req.Generation < 1 || op.Port < 1024 || op.Port > 65535 || profile.Type() != cfg.RuntimeType || req.UID < 200001 || req.GID != req.UID || os.Geteuid() != req.UID || os.Getegid() != req.GID {
 		return true, fmt.Errorf("native helper identity mismatch")
 	}
@@ -124,13 +168,16 @@ func RunNativeStorageHelper(profile RuntimeProfile, args []string, in io.Reader,
 	}
 	if migrator, ok := profile.(ManagedCredentialMigrator); ok {
 		if err := migrator.MigrateManagedCredentials(context.Background(), cfg, req, req.WorkspacePath); err != nil {
-			return true, err
+			return true, fmt.Errorf("native_storage_credentials: %w", err)
 		}
 	} else if cfg.NetworkSecurityProfile != "" {
 		return true, fmt.Errorf("native credential migrator unavailable")
 	}
 	if err := profile.PrepareWorkspace(cfg, req, req.WorkspacePath); err != nil {
-		return true, err
+		return true, fmt.Errorf("native_storage_workspace: %w", err)
 	}
-	return true, profile.WriteGatewayConfig(cfg, req, req.WorkspacePath, op.Port)
+	if err := profile.WriteGatewayConfig(cfg, req, req.WorkspacePath, op.Port); err != nil {
+		return true, fmt.Errorf("native_storage_config: %w", err)
+	}
+	return true, nil
 }

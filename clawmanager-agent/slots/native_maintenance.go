@@ -148,7 +148,7 @@ func (w *Worker) finishNativeMaintenanceReset() {
 
 func (w *Worker) serveNativeMaintenanceReconcile(out http.ResponseWriter, r *http.Request) {
 	var proof containerTerminationProof
-	if r.Method != http.MethodPost || decodeContainerOperation(r, &proof) != nil {
+	if r.Method != http.MethodPost || decodeContainerOperation(r, &proof) != nil || !validContainerProofSource(proof) {
 		http.Error(out, "invalid maintenance proof", 400)
 		return
 	}

@@ -2,6 +2,19 @@ package app
 
 import "testing"
 
+func TestSelectModeUsesInstanceAgentForDeepSeekHarness(t *testing.T) {
+	t.Setenv("RUNTIME_AGENT_CONTROL_TOKEN", "")
+	t.Setenv("RUNTIME_AGENT_REPORT_TOKEN", "")
+	t.Setenv("CLAWMANAGER_AGENT_ENABLED", "true")
+	t.Setenv("CLAWMANAGER_AGENT_INSTANCE_ID", "4")
+	t.Setenv("CLAWMANAGER_AGENT_BOOTSTRAP_TOKEN", "boot")
+	t.Setenv("CLAWMANAGER_RUNTIME_TYPE", "desktop")
+	t.Setenv("CLAWMANAGER_AGENT_RUNTIME_TYPE", "deepseek-harness")
+	if got := selectMode(); got != modeInstance {
+		t.Fatalf("selectMode() = %s, want %s", got, modeInstance)
+	}
+}
+
 func TestSelectModeUsesInstanceAgentForOpenCode(t *testing.T) {
 	t.Setenv("RUNTIME_AGENT_CONTROL_TOKEN", "")
 	t.Setenv("RUNTIME_AGENT_REPORT_TOKEN", "")

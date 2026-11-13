@@ -64,6 +64,8 @@ def check():
             while base in ancestors and base not in seen:
                 seen.add(base)
                 base = ancestors[base]
+            defaults = dict(re.findall(r"(?m)^ARG ([A-Z_]+)=(.+)$", content))
+            base = re.sub(r"\$\{([A-Z_]+)\}", lambda m: defaults.get(m[1], m[0]), base)
             require(bool(re.search(r"-slim[^\s]*@sha256:[0-9a-f]{64}$", base)),
                     f"{runtime}: final stage must descend from a digest-pinned slim image; got {base}")
         require(f"./cmd/{runtime}-lite-agent" in content,
@@ -102,10 +104,47 @@ def check():
                             "start-hermes-lite-runtime", "hermes_cli/tui_dist/entry.js"):
                 require(payload in content, f"hermes: missing runtime payload {payload}")
         elif runtime == "opencode":
-            require("ARG OPENCODE_VERSION=1.18.13" in content, "opencode: changed locked runtime version")
+            require("ARG OPENCODE_VERSION=2.0.27" in content, "opencode: changed locked runtime version")
             require("start-opencode-web" in content, "opencode: missing native Web/PTY server launcher")
+            # Both default publish entries must install the reviewed native tools;
+            # copying only the transport beside a stock CLI silently loses Team.
+            for flavor in ("Dockerfile", "Dockerfile.lite"):
+                published = (ROOT / "opencode" / flavor).read_text()
+                require("AS native-team-builder" in published and
+                        "RUN bash /governance/build-native.sh" in published and
+                        re.search(r"COPY .*--from=native-team-builder /out/opencode /usr/local/bin/opencode", published),
+                        f"opencode/{flavor}: default release omits the native Team build")
+                require("CLAWMANAGER_REDIS_TEAM_PLUGIN_VERSION=opencode-team-v1" in published and
+                        "opencode/team/" in published and "build-protocol.mjs" in published,
+                        f"opencode/{flavor}: native tools and Team bridge must ship together")
         else:
-            for payload in ("ARG DSH_VERSION=0.1.2-alpha.3", "ARG PNPM_VERSION=11.25.0",
+            # Native DSH is installed by npm ci from reviewed lockfiles, not
+            # Docker ARGs. Validate the actual version/integrity authority.
+            native = ROOT / runtime / "native"
+            manifest = json.loads((native / "package.json").read_text())
+            dependency_lock = json.loads((native / "package-lock.json").read_text())
+            source_lock = json.loads((native / "source-lock.json").read_text())
+            dependencies = manifest["dependencies"]
+            packages = dependency_lock["packages"]
+            require(packages[""]["dependencies"] == dependencies,
+                    "deepseek-harness: manifest and dependency lock disagree")
+            for name in ("@deepseek-ai/dsh", "pnpm"):
+                version = dependencies.get(name, "")
+                locked = packages.get("node_modules/" + name, {})
+                require(bool(re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", version)),
+                        f"deepseek-harness: {name} must use an exact native version")
+                require(locked.get("version") == version and bool(locked.get("integrity")),
+                        f"deepseek-harness: missing locked native dependency {name}")
+            require(dependencies.get("@deepseek-ai/dsh") == source_lock.get("dshVersion") and
+                    bool(source_lock.get("dshIntegrity")) and
+                    packages.get("node_modules/@deepseek-ai/dsh", {}).get("integrity") == source_lock.get("dshIntegrity"),
+                    "deepseek-harness: native source version/integrity drift")
+            require(source_lock.get("nodeImage", "missing-node-image") in content,
+                    "deepseek-harness: native Node image must match its source lock")
+            for payload in ("COPY deepseek-harness/native/package.json deepseek-harness/native/package-lock.json",
+                            "npm ci --prefix /opt/clawmanager-dsh --ignore-scripts",
+                            "deepseek-harness/native/source-lock.json deepseek-harness/scripts/verify-native.mjs",
+                            "node /opt/clawmanager-dsh/verify-native.mjs /opt/clawmanager-dsh/native-manifest.json",
                             "managed.cordis.patch.yml", "prepare-deepseek-harness-resources",
                             "start-deepseek-harness-gateway", "/usr/local/libexec/clawmanager-agent-image"):
                 require(payload in content, f"deepseek-harness: missing locked runtime payload {payload}")

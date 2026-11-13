@@ -30,6 +30,11 @@ replace(getter,
   'function getRuntimeConfig(options) {\n\t// CLAWMANAGER_MANAGED_PROXY_POLICY_V1\n\tconst config = loadConfig(options);\n\treturn options?.pin === false ? config : clawmanagerManagedProxyPolicy(config);\n}',
   'import { withManagedProxyPolicy as clawmanagerManagedProxyPolicy } from "./clawmanager-managed-proxy-policy.mjs";\n');
 const startup = find('server-runtime-config-', 'function resolveGatewayRuntimeConfig(params)');
+// Reload calls this security validator directly, bypassing the startup resolver.
+// Validate the same leased effective policy without persisting proxy addresses.
+replace(startup,
+  'function assertGatewayRuntimeSecurityConfig(params) {',
+  'function assertGatewayRuntimeSecurityConfig(params) {\n\t// CLAWMANAGER_MANAGED_PROXY_RELOAD_V1\n\tparams = { ...params, cfg: clawmanagerManagedStartupPolicy(params.cfg) };');
 replace(startup,
   'function resolveGatewayRuntimeConfig(params) {',
   'function resolveGatewayRuntimeConfig(params) {\n\t// CLAWMANAGER_MANAGED_PROXY_STARTUP_V1\n\tparams = { ...params, cfg: clawmanagerManagedStartupPolicy(params.cfg) };',

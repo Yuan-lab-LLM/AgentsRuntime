@@ -1,4 +1,5 @@
 import { afterAll, expect, test } from "bun:test"
+import { createHmac } from "node:crypto"
 import { Deferred, Effect, Fiber } from "effect"
 import type { Prepared } from "../src/session/model-request.js"
 
@@ -34,7 +35,18 @@ process.env.CLAWMANAGER_LLM_BASE_URL = `http://127.0.0.1:${server.port}`
 process.env.CLAWMANAGER_LLM_API_KEY = "test-key"
 process.env.CLAWMANAGER_GATEWAY_GENERATION = "4"
 // Run in a dedicated Bun test process so the adapter's environment is pinned.
-const { Governance, GovernanceError, withPrimary, withAuxiliary, headers, settleSession, projectCatalog } = await import("../src/clawmanager-governance.js")
+const { Governance, GovernanceError, withPrimary, withAuxiliary, headers, settleSession, projectCatalog, contextPrimaryID } = await import("../src/clawmanager-governance.js")
+
+test("only host-signed Team steering can retain its original business input", () => {
+  const env={CLAWMANAGER_TEAM_ENABLED:"true",CLAWMANAGER_TEAM_ID:"17",CLAWMANAGER_TEAM_MEMBER_ID:"reader",CLAWMANAGER_GATEWAY_GENERATION:"4",CLAWMANAGER_TEAM_CONTEXT_KEY:"a".repeat(64)}
+  const signature=createHmac("sha256",env.CLAWMANAGER_TEAM_CONTEXT_KEY).update(JSON.stringify(["session","context","original",4,"notice"])).digest("hex")
+  const message={type:"user",id:"context",metadata:{"clawmanager.team":"17","clawmanager.member":"reader","clawmanager.contextFor":"original","clawmanager.contextGeneration":4,"clawmanager.contextMessageId":"notice","clawmanager.contextSignature":signature}}
+  expect(contextPrimaryID("session",message,env)).toBe("original")
+  expect(contextPrimaryID("other",message,env)).toBeUndefined()
+  expect(contextPrimaryID("session",message,{...env,CLAWMANAGER_GATEWAY_GENERATION:"5"})).toBeUndefined()
+  expect(contextPrimaryID("session",{...message,metadata:{...message.metadata,"clawmanager.contextSignature":"b".repeat(64)}},env)).toBeUndefined()
+  expect(contextPrimaryID("session",message,{...env,CLAWMANAGER_TEAM_ENABLED:"false"})).toBeUndefined()
+})
 afterAll(() => { server.stop(true); keys.forEach((key, i) => { if (old[i] === undefined) delete process.env[key]; else process.env[key] = old[i] }) })
 
 test("maintenance blocks new admissions, permits accepted work and reports it until cleanup", async () => {

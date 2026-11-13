@@ -1,0 +1,15 @@
+# Repackage the Team bridge on an immutable governed 2.0.27 serving base.
+# The existing native executable, UI, Agent and workspace contract are retained.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG RUNTIME_REVISION
+ARG NATIVE_SHA256
+COPY opencode/team/ /usr/local/share/clawmanager/opencode-team/
+COPY plugins/openclaw-redis-team/dist/index.js /tmp/clawmanager-team-protocol-source.js
+RUN test -n "$NATIVE_SHA256" \
+ && printf '%s  /usr/local/bin/opencode\n' "$NATIVE_SHA256" | sha256sum -c - \
+ && node /usr/local/share/clawmanager/opencode-team/build-protocol.mjs /usr/local/share/clawmanager/opencode-team/protocol.mjs /tmp/clawmanager-team-protocol-source.js \
+ && node --check /usr/local/share/clawmanager/opencode-team/bridge.mjs \
+ && node --input-type=module -e 'const {NativeClient}=await import("/usr/local/share/clawmanager/opencode-team/native-client.mjs");if(typeof NativeClient.prototype.inspectTurn!=="function")process.exit(1)' \
+ && rm /tmp/clawmanager-team-protocol-source.js
+LABEL io.clawmanager.team-source-revision="${RUNTIME_REVISION}"

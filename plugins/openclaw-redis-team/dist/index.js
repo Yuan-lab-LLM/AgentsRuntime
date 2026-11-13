@@ -501,30 +501,48 @@ class RedisClient {
     this.closed = false;
   }
   async connect() {
+    if (this.closed) throw new Error("redis client is closed");
+    if (this.connecting) return this.connecting;
+    if (this.socket && !this.socket.destroyed && this.socket.writable) return;
+    const attempt = this.connectTransport();
+    this.connecting = attempt;
+    try { await attempt; } finally { if (this.connecting === attempt) this.connecting = null; }
+  }
+  async connectTransport() {
+    if (this.socket) {
+      this.socket.destroy();
+      this.rejectAll(new Error("redis connection closed"));
+    }
     const port = Number(this.url.port || (this.url.protocol === "rediss:" ? 6380 : 6379));
     const host = this.url.hostname || "127.0.0.1";
-    this.socket =
+    const socket =
       this.url.protocol === "rediss:"
         ? tls.connect({ host, port, servername: host })
         : net.connect({ host, port });
-    this.socket.on("data", (chunk) => {
+    this.socket = socket;
+    this.parser = new RespParser();
+    socket.on("data", (chunk) => {
+      if (this.socket !== socket) return;
       this.parser.push(chunk);
       this.drain();
     });
-    this.socket.on("error", (err) => this.rejectAll(err));
-    this.socket.on("close", () => this.rejectAll(new Error("redis connection closed")));
-    await new Promise((resolve, reject) => {
-      this.socket.once("connect", resolve);
-      this.socket.once("error", reject);
-    });
+    socket.on("error", (err) => { if (this.socket === socket) this.rejectAll(err); });
+    socket.on("close", () => { if (this.socket === socket) this.rejectAll(new Error("redis connection closed")); });
+    try {
+      await new Promise((resolve, reject) => {
+        socket.once("connect", resolve);
+        socket.once("error", reject);
+        socket.once("close", () => reject(new Error("redis connection closed")));
+      });
     const user = decodeURIComponent(this.url.username || "");
     const pass = decodeURIComponent(this.url.password || "");
     if (pass) {
-      if (user) await this.command("AUTH", user, pass);
-      else await this.command("AUTH", pass);
+      if (user) await this.connectedCommand("AUTH", user, pass);
+      else await this.connectedCommand("AUTH", pass);
     }
     const db = this.url.pathname.replace(/^\//, "");
-    if (db) await this.command("SELECT", db);
+    if (db) await this.connectedCommand("SELECT", db);
+    } catch (err) { socket.destroy(); throw err; }
   }
   drain() {
     while (this.pending.length) {
@@ -540,8 +558,15 @@ class RedisClient {
   rejectAll(err) {
     while (this.pending.length) this.pending.shift().reject(err);
   }
-  command(...args) {
+  async command(...args) {
+    await this.connect();
+    // Reconnect only before writing a NEW command. Never replay a command whose
+    // response was lost; its caller retains existing receipt/idempotency rules.
+    return this.connectedCommand(...args);
+  }
+  connectedCommand(...args) {
     if (this.closed) return Promise.reject(new Error("redis client is closed"));
+    if (!this.socket || this.socket.destroyed || !this.socket.writable) return Promise.reject(new Error("redis connection closed"));
     return new Promise((resolve, reject) => {
       this.pending.push({ resolve, reject });
       this.socket.write(encodeResp(args));
@@ -549,6 +574,7 @@ class RedisClient {
   }
   close() {
     this.closed = true;
+    this.rejectAll(new Error("redis client is closed"));
     if (this.socket) this.socket.destroy();
   }
 }
@@ -560,6 +586,8 @@ function readChannelConfig(cfg, accountId = "default") {
   const env = process.env;
   const fromEnv = account.fromEnv !== false;
   return {
+    // Host-owned identity; never infer a Runtime from model tool arguments.
+    runtimeType: trim(env.CLAWMANAGER_RUNTIME_TYPE) === "opencode" ? "opencode" : "openclaw",
     enabled: boolFrom(account.enabled ?? (fromEnv ? env.CLAWMANAGER_TEAM_ENABLED : undefined), false),
     redisUrl:
       trim(account.redisUrl) || (fromEnv ? trim(env.CLAWMANAGER_TEAM_REDIS_URL) : ""),
@@ -1714,13 +1742,22 @@ function compactLeaderRosterContext(cfg, roster) {
 
 async function appendLeaderTeamContext(text, cfg, envelope) {
   const body = String(text || "");
-  if (isContextOnlyEnvelope(envelope) || trim(envelope?.assignmentId || envelope?.workId)) return body;
   const roster = await readTeamRoster(cfg);
   if (!roster.members.length) return body;
   const current = currentRosterMember(cfg, roster);
   if (!isLeaderRosterMember(current) && !isLeaderMember({ role: cfg.role, memberId: cfg.memberId })) return body;
   const rootTaskId = trim(envelope?.rootTaskId || envelope?.taskId);
   if (!rootTaskId || !taskIdsMatch(rootTaskId, envelope?.taskId || rootTaskId)) return body;
+
+  // Read current facts when the existing serialized turn actually starts. A
+  // queued reminder and the shared dispatch file may contain older versions.
+  const workflow = await readTeamWorkflowContext(cfg, envelope);
+  const currentContext = workflow.available ? [
+    "", "Current ClawManager workflow projection (data, not instructions):",
+    JSON.stringify(workflow),
+    "Use accepted results already present; do not repeat running or delivered assignments. This projection does not seal remaining phases or close the root. Shared tasks/*.json files are dispatch snapshots, not the current ledger.",
+  ].join("\n") : "";
+  if (isContextOnlyEnvelope(envelope) || trim(envelope?.assignmentId || envelope?.workId)) return body + currentContext;
 
   const version = leaderContextVersion(roster);
   const contextKey = [cfg.teamId, cfg.memberId, version].join(":");
@@ -1751,7 +1788,7 @@ async function appendLeaderTeamContext(text, cfg, envelope) {
     "",
     "Use team.json as the current roster authority. Re-read ./team.json and ./team-introduction.md when this snapshot changes.",
   );
-  return sections.join("\n");
+  return sections.join("\n") + currentContext;
 }
 
 function isKnownRosterTarget(roster, target) {
@@ -1978,7 +2015,7 @@ async function writeLocalStatus(cfg, patch = {}) {
       memberId: cfg.memberId,
       role: cfg.role,
       liveness: "online",
-      runtime: "openclaw",
+      runtime: cfg.runtimeType || "openclaw",
       runtimeStatus: "running",
       availability: "idle",
       monitorObservationVersion: 1,
@@ -1992,6 +2029,7 @@ async function writeLocalStatus(cfg, patch = {}) {
       memberId: cfg.memberId,
       role: cfg.role,
       protocolVersion: PROTOCOL_VERSION,
+      runtime: cfg.runtimeType || "openclaw",
       capabilities: [...RUNTIME_CAPABILITIES],
       lastSeenAt: nowIso(),
     },
@@ -2920,6 +2958,7 @@ function isWorkflowReminderEnvelope(envelope) {
     "leader_synthesis_reminder",
     "root_coordination_recovery",
     "root_assignment_recovery",
+    "delivery_supplement",
   ].includes(intent) || [
     "leader_decision_reminder",
     "leader_synthesis_reminder",
@@ -3063,12 +3102,12 @@ function normalizedSessionContentType(value) {
   return trim(value).toLowerCase().replace(/[-_]/g, "");
 }
 
-async function startAssignmentActivityObserver({ cfg, envelope, startedAt, log }) {
-  if (!cfg?.redisUrl || !envelope || isContextOnlyEnvelope(envelope)) {
+async function startAssignmentActivityObserver({ cfg, envelope, startedAt, log, observe, observeContext = false }) {
+  if (!cfg?.redisUrl || !envelope || (isContextOnlyEnvelope(envelope) && !observeContext)) {
     return { stop: async () => {} };
   }
   const rootTaskId = preferredRootTaskId(envelope.rootTaskId, envelope.taskId);
-  const assignmentId = trim(envelope.assignmentId || envelope.workId);
+  const assignmentId = trim(envelope.assignmentId || envelope.workId) || "root-owner-observation";
   if (!rootTaskId || !assignmentId) {
     return { stop: async () => {} };
   }
@@ -3094,7 +3133,8 @@ async function startAssignmentActivityObserver({ cfg, envelope, startedAt, log }
 	  // OpenClaw 8.1 stores active sessions in SQLite. Activity evidence is
 	  // supplied by the official message/tool hooks; this heartbeat never reads
 	  // transcript files or private database tables.
-	  const observed = null;
+	  const observed = typeof observe === "function" ? await observe() : null;
+      if (observed && Number.isFinite(observed.mtimeMs) && observed.mtimeMs >= startedAt && observed.mtimeMs <= Date.now()) lastSession = observed;
       const sessionAgeMs = lastSession ? Math.max(0, Date.now() - lastSession.mtimeMs) : Date.now() - startedAt;
       const quietForSeconds = Math.floor(sessionAgeMs / 1000);
       const stallCandidate = sessionAgeMs >= policy.softTimeoutSec * 3 * 1000;
@@ -3570,7 +3610,16 @@ async function waitForCompletionAcknowledgement(redis, cfg, completionId, attemp
 }
 
 async function workflowReminderIsStale(cfg, envelope, log = console) {
-  if (!isWorkflowReminderEnvelope(envelope)) return false;
+  if (!isWorkflowReminderEnvelope(envelope)) {
+    // Member-result and older recovery notifications can remain unread across
+    // a stopped Team. Their exact root is already closed; waking its model can
+    // pollute the next root's session. Unknown/current roots still pass through.
+    if (isContextOnlyEnvelope(envelope) && await rootEnvelopeIsTerminal(cfg, envelope)) {
+      log?.info?.("redis-team: suppressed terminal-root context " + envelope.messageId);
+      return true;
+    }
+    return false;
+  }
   const rootTaskId = preferredRootTaskId(envelope?.rootTaskId, envelope?.taskId);
   if (!rootTaskId || !cfg?.redisUrl) return false;
   const redis = new RedisClient(cfg.redisUrl);
@@ -3642,6 +3691,55 @@ async function readCurrentRootWorkflowState(redis, cfg, rootTaskId) {
   } catch {
     return null;
   }
+}
+
+async function readTeamWorkflowContext(cfg, envelope) {
+  const rootTaskId = preferredRootTaskId(envelope?.rootTaskId, envelope?.taskId);
+  const absent = { available: false, rootTaskId, reason: "current_workflow_unavailable" };
+  if (!cfg?.redisUrl || !rootTaskId?.startsWith(`team-${cfg.teamId}-task-`) || !isClawManagerRootTaskRef(rootTaskId)) return absent;
+  const redis = new RedisClient(cfg.redisUrl);
+  try {
+    await redis.connect();
+    const state = await readCurrentRootWorkflowState(redis, cfg, rootTaskId);
+    if (!state || String(state.teamId) !== String(cfg.teamId) || state.rootTaskId !== rootTaskId) return absent;
+    const entries = Object.entries(state.assignments || {});
+    const assignments = {};
+    let resultBudget = 16000;
+    for (const [id, item] of entries.slice(0, 256)) {
+      if (!item || typeof item !== "object") continue;
+      const result = {};
+      for (const key of ["workItemId", "workId", "assignmentId", "revision", "status", "ownerMemberKey", "phaseId", "requiredForRoot", "reviewRequired", "hasAcceptedResult", "dependsOn", "validationTargetAssignmentId", "validationTargetRevision", "updatedAt"]) {
+        if (item[key] !== undefined) result[key] = item[key];
+      }
+      if (item.hasAcceptedResult === true && item.acceptedResult) {
+        const original = String(item.acceptedResult.resultMarkdown || "");
+        const text = original.slice(0, Math.min(4000, resultBudget));
+        resultBudget -= text.length;
+        result.acceptedResult = {
+          summary: String(item.acceptedResult.summary || "").slice(0, 1000),
+          resultMarkdown: text,
+          resultTruncated: item.acceptedResult.resultTruncated === true || text.length < original.length,
+          artifactRefs: Array.isArray(item.acceptedResult.artifactRefs) ? item.acceptedResult.artifactRefs.slice(0, 64) : [],
+          supplementaryText: String(item.acceptedResult.supplementaryText || "").slice(0, Math.min(4000,resultBudget)),
+          supplementTruncated: item.acceptedResult.supplementTruncated === true,
+          supplementSourceRecordId: item.acceptedResult.supplementSourceRecordId,
+
+        };
+      }
+      resultBudget -= Math.min(resultBudget, String(result.acceptedResult?.supplementaryText || "").length);
+      assignments[id] = result;
+    }
+    return {
+      available: true, advisory: true, rootTaskId,
+      status: state.status, workflowState: state.workflowState,
+      planVersion: state.planVersion, ledgerVersion: state.ledgerVersion,
+      currentPhaseId: state.currentPhaseId, terminal: state.terminal === true,
+      assignmentLedgerComplete: state.assignmentLedgerComplete === true && entries.length <= 256,
+      assignmentsTruncated: entries.length > 256, assignments, updatedAt: state.updatedAt,
+    };
+  } catch {
+    return absent; // Old App / transient Redis failures never change business state.
+  } finally { redis.close(); }
 }
 
 function rootWorkflowStateIsTerminal(state) {
@@ -3772,7 +3870,7 @@ function eventFor(cfg, event, extra = {}) {
       memberId: cfg.memberId,
       member_id: cfg.memberId,
       role: cfg.role,
-      runtime: "openclaw",
+      runtime: cfg.runtimeType || "openclaw",
       runtimeStatus: "running",
       availability: "idle",
       at: nowIso(),
@@ -5904,6 +6002,13 @@ function createRuntime(api) {
       return readStatuses(cfg, memberId);
     },
 
+    async statusContext(memberId) {
+      const cfg = readChannelConfig(runtimeApi.config || {});
+      const status = await this.status(memberId);
+      const envelope = await resolveActiveAssignmentEnvelope(cfg, {});
+      return { status, workflow: await readTeamWorkflowContext(cfg, envelope) };
+    },
+
     async artifactWrite(params) {
       const cfg = readChannelConfig(runtimeApi.config || {});
       if (!cfg.enabled || !trim(cfg.sharedDir)) throw new Error("Redis Team shared workspace is disabled");
@@ -6494,6 +6599,140 @@ function createRuntime(api) {
 }
 
 // ============ Consumer Logic ============
+function coalescedWorkflowReminders(messages) {
+  const latest = new Map();
+  const superseded = new Set();
+  for (const msg of messages) {
+    const envelope = normalizeEnvelope(msg);
+    if (!envelope || envelope.from !== "clawmanager-monitor" || !isContextOnlyEnvelope(envelope) || !isWorkflowReminderEnvelope(envelope)) continue;
+    if (!["leader_workflow_decision", "leader_decision_reminder", "leader_synthesis_reminder"].includes(envelope.intent)) continue;
+    const fingerprint = trim(envelope.metadata?.resultFingerprint);
+    if (!fingerprint || !envelope.ledgerVersion || !envelope.planVersion) continue;
+    const key = JSON.stringify([envelope.rootTaskId || envelope.taskId, envelope.intent, envelope.planVersion, envelope.ledgerVersion, fingerprint]);
+    if (latest.has(key)) superseded.add(latest.get(key));
+    latest.set(key, msg.redisId);
+  }
+  return superseded;
+}
+
+// Independent observation of trusted Monitor context. Business inbox admission
+// remains serial in startConsumer; this path never dispatches another turn.
+function activeContextMatches(cfg, active, notice) {
+  const original = active?.envelope;
+  if (!original || !notice || trim(notice.from) !== "clawmanager-monitor" || notice.businessMutation === true || !isContextOnlyEnvelope(notice)) return false;
+  if (trim(notice.teamId || cfg.teamId) !== trim(cfg.teamId) || trim(notice.to || cfg.memberId) !== trim(cfg.memberId)) return false;
+  const root = value => trim(value.rootTaskId || value.taskId);
+  const work = value => trim(value.workId || value.assignmentId);
+  if (!root(original) || root(original) !== root(notice) || work(original) !== work(notice)) return false;
+  const revision = value => Number(value.revision ?? 1);
+  if (!Number.isSafeInteger(revision(notice)) || revision(notice) !== revision(original)) return false;
+  if (notice.generation !== undefined && Number(notice.generation) !== Number(active.generation)) return false;
+  return true;
+}
+
+async function startActiveContextWatcher(cfg, { getActive, deliver, observe, intervalMs = 5000 }, log = console) {
+  const redis = new RedisClient(cfg.redisUrl);
+  const file = path.join(runtimeStateDir(cfg), "active-context-delivery.json");
+  await ensureDirs(cfg);
+  let records = {};
+  try { const saved = JSON.parse(await fs.readFile(file, "utf8")); if (saved && typeof saved === "object" && !Array.isArray(saved)) records = saved; } catch (error) { if (error.code !== "ENOENT") log.warn?.("redis-team: context journal unavailable; preserving serial delivery"); }
+  let stopped = false, busy = false, cursor = null, writes = Promise.resolve();
+  const persist = () => {
+    writes = writes.catch(() => {}).then(async () => {
+      const entries = Object.entries(records);
+      if (entries.length > 64) for (const [key] of entries.slice(0, entries.length - 64)) delete records[key];
+      await fs.writeFile(file + ".tmp", JSON.stringify(records), { mode: 0o600 });
+      await fs.rename(file + ".tmp", file);
+    });
+    return writes;
+  };
+  const emit = async record => {
+    try { await xaddJson(redis, eventsKey(cfg), taskEvent(cfg, "task_progress", record.envelope, {
+      eventKind: "runtime_context_delivery", contextDeliveryState: record.state, contextMessageId: record.envelope.messageId,
+      nativeSessionId: record.nativeSessionId, nativeMessageId: record.nativeMessageId, nativeRunId: record.nativeRunId,
+      nonAuthoritative: true, stateEffect: "none", rootTaskTerminal: false, visibleToChat: false, chatPolicy: "hidden",
+    })); return true; } catch { log.warn?.("redis-team: context evidence publication remains pending"); return false; }
+  };
+  async function transition(record, state, proof = {}) {
+    if (record.state === "request_included" && state !== "request_included") return;
+    const changed = record.state !== state;
+    if (!changed && record.reportedState === state && Object.entries(proof).every(([key, value]) => record[key] === value)) return;
+    Object.assign(record, proof, { state, updatedAt: nowIso() });
+    await persist();
+    if (changed || record.reportedState !== state) { if (await emit(record)) { record.reportedState = state; await persist(); } }
+    if (["submitted", "native_context_consumed", "request_included"].includes(state)) await redis.command("SET", processedMessageKey(cfg, record.envelope.idempotencyKey), record.envelope.messageId, "EX", 604800);
+  }
+  async function confirm(messageId, proof = {}) {
+    const record = records[trim(messageId)], active = await getActive();
+    if (!record || !activeContextMatches(cfg, active, record.envelope)) return false;
+    await transition(record, "request_included", proof);
+    return true;
+  }
+  async function tick() {
+    if (stopped || busy) return;
+    busy = true;
+    try {
+      if ((await teamMaintenanceState(redis, cfg)).enabled) return;
+      const active = await getActive();
+      const rows = cursor === null
+        ? (await redis.command("XREVRANGE", inboxKey(cfg), "+", "-", "COUNT", 64)).reverse()
+        : await redis.command("XRANGE", inboxKey(cfg), "(" + cursor, "+", "COUNT", 64);
+      for (const message of parseReadGroupResponse([[inboxKey(cfg), rows]])) {
+        cursor = message.redisId;
+        const envelope = normalizeEnvelope(message);
+        if (!activeContextMatches(cfg, active, envelope) || await redis.command("GET", processedMessageKey(cfg, envelope.idempotencyKey))) continue;
+        if (await workflowReminderIsStale(cfg, envelope, log)) continue;
+        if (!records[envelope.messageId] && Object.keys(records).length >= 64) {
+          for (const [key, old] of Object.entries(records)) {
+            if (!activeContextMatches(cfg, active, old.envelope) || old.state === "request_included") { delete records[key]; break; }
+          }
+        }
+        if (!records[envelope.messageId] && Object.keys(records).length < 64) {
+          records[envelope.messageId] = { envelope, state: "queued", receivedAt: nowIso(), generation: active.generation };
+          await persist();
+        }
+      }
+      for (const record of Object.values(records)) {
+        const current = await getActive();
+        if (!activeContextMatches(cfg, current, record.envelope) || Number(record.generation) !== Number(current.generation)) continue;
+        if (record.state !== "queued" && record.reportedState !== record.state) await transition(record, record.state);
+        if (observe && ["submitted", "unconfirmed", "submitting", "native_context_consumed"].includes(record.state)) {
+          const fact = await observe(record, current);
+          if (fact?.state) await transition(record, fact.state, fact);
+        }
+        if (record.state !== "queued") continue;
+        if (await workflowReminderIsStale(cfg, record.envelope, log)) continue;
+        const marker = "[team-context:" + createHash("sha256").update(record.envelope.messageId).digest("hex").slice(0, 24) + "]";
+        record.marker = marker;
+        record.state = "submitting";
+        await persist(); // Do not replay an uncertain external side effect.
+        try {
+          const outcome = await deliver(record.envelope, marker + "\n" + String(record.envelope.text || ""), current);
+          if (outcome?.state) await transition(record, outcome.state, outcome);
+          else { record.state = "queued"; await persist(); }
+        } catch { await transition(record, "unconfirmed"); }
+      }
+    } catch { if (!stopped) log.warn?.("redis-team: active context observation unavailable; serial delivery retained"); }
+    finally { busy = false; }
+  }
+  await redis.connect();
+  const timer = setInterval(() => void tick(), Math.max(100, intervalMs));
+  timer.unref?.();
+  return {
+    confirm,
+    async observePreparedRequest(event, proof = {}) {
+      let text;
+      try { text = JSON.stringify(event); } catch { return; }
+      if (!text || text.length > 4 * 1024 * 1024) return;
+      for (const record of Object.values(records)) {
+        if (record.marker && record.state !== "request_included" && text.includes(record.marker)) await confirm(record.envelope.messageId, proof);
+      }
+    },
+    async stop() { stopped = true; clearInterval(timer); await writes.catch(() => {}); redis.close(); },
+  };
+}
+
+
 async function startConsumer(cfg, onMessage, onProcessingFailure, log) {
   if (!cfg.enabled) {
     log.info("redis-team: disabled; skipping consumer");
@@ -6575,6 +6814,7 @@ async function startConsumer(cfg, onMessage, onProcessingFailure, log) {
           readID,
         );
         const messages = parseReadGroupResponse(response);
+        const coalesced = coalescedWorkflowReminders(messages);
 		if ((await teamMaintenanceState(redis, cfg)).enabled) {
 			// XREADGROUP may already have been blocked when the controller enabled
 			// maintenance. Leave the newly delivered entries pending and process
@@ -6594,6 +6834,7 @@ async function startConsumer(cfg, onMessage, onProcessingFailure, log) {
           }
         }
         for (const msg of messages) {
+          if (!running) break;
           if ((await teamMaintenanceState(redis, cfg)).enabled) {
             // Maintenance can start while the previous message in this batch
             // is executing. Keep the remainder pending, including after the
@@ -6606,6 +6847,11 @@ async function startConsumer(cfg, onMessage, onProcessingFailure, log) {
             const envelope = normalizeEnvelope(msg);
             if (!envelope) continue;
             const processedKey = processedMessageKey(cfg, envelope.idempotencyKey);
+            if (coalesced.has(msg.redisId)) {
+              await redis.command("SET", processedKey, envelope.messageId, "EX", 604800);
+              await redis.command("XACK", inboxKey(cfg), cfg.consumerGroup, msg.redisId);
+              continue;
+            }
             if (await redis.command("GET", processedKey)) {
               log.info("redis-team: dedup skipped " + envelope.messageId);
               await redis.command("XACK", inboxKey(cfg), cfg.consumerGroup, msg.redisId);
@@ -6633,6 +6879,10 @@ async function startConsumer(cfg, onMessage, onProcessingFailure, log) {
             await redis.command("SET", processedKey, envelope.messageId, "EX", 604800);
             await redis.command("XACK", inboxKey(cfg), cfg.consumerGroup, msg.redisId);
           } catch (err) {
+            // A supervised shutdown is not a failed business delivery. Keep
+            // pending entries for the next consumer instead of moving them to
+            // DLQ merely because its transport was intentionally closed.
+            if (!running) return;
             const error = err instanceof Error ? err.message : String(err);
             log.error("redis-team: message processing failed: " + error);
             const envelope = normalizeEnvelope(msg) || {};
@@ -6660,18 +6910,20 @@ async function startConsumer(cfg, onMessage, onProcessingFailure, log) {
   const loopPromise = loop();
 
   return {
-    async stop() {
-      running = false;
-      if (timer) clearInterval(timer);
-      redis.close();
-      try {
-        const status = await writeLocalStatus(cfg, {
-          liveness: "offline",
-        });
-        await presenceRedis.command("HSET", presenceKey(cfg), cfg.memberId, JSON.stringify(status));
-      } catch {}
-      presenceRedis.close();
-      await loopPromise.catch(() => {});
+    async stop({ waitForExecution = true } = {}) {
+      if (running) {
+        running = false;
+        if (timer) clearInterval(timer);
+        redis.close();
+        try {
+          const status = await writeLocalStatus(cfg, { liveness: "offline" });
+          await presenceRedis.command("HSET", presenceKey(cfg), cfg.memberId, JSON.stringify(status));
+        } catch {}
+        presenceRedis.close();
+      }
+      // A host that must interrupt a native execution first can stop inbox
+      // admission without waiting on the very execution it needs to interrupt.
+      if (waitForExecution) await loopPromise.catch(() => {});
       log.info("redis-team: consumer stopped");
     },
   };
@@ -6938,6 +7190,19 @@ export default definePluginEntry({
   register(api) {
     const runtime = createRuntime(api);
     const consumerHandles = new Map();
+    const activeContextWatchers = new Map();
+    let contextNativePin = null, contextControl;
+    const nativeContextControl = () => contextControl ||= import(new URL("../agent-run-control.runtime.js", import.meta.resolve("openclaw/plugin-sdk/plugin-entry"))).then(module => module.realtimeVoiceControlRuntime);
+    api.on("llm_input", async (event, ctx = {}) => {
+      const cfg = readChannelConfig(api.config || {}), envelope = runtime.currentActiveEnvelope();
+      if (!envelope || isContextOnlyEnvelope(envelope) || !trim(ctx.sessionKey).endsWith(":" + CHANNEL_ID + ":group:" + safeName(cfg.teamId))) return;
+      try {
+        const control = await nativeContextControl(), owner = control.resolveActiveEmbeddedRunOwnerByRunId(trim(event?.runId || ctx.runId));
+        if (!owner?.sessionId || owner.sessionKey !== ctx.sessionKey) return;
+        contextNativePin = { envelope, nativeRunId: owner.runId, nativeSessionId: owner.sessionId };
+        for (const watcher of activeContextWatchers.values()) await watcher.observePreparedRequest(event, { nativeSessionId: owner.sessionId, nativeRunId: owner.runId });
+      } catch { /* Older native runtimes retain their existing serial path. */ }
+    });
     const reviewerBrowserGuards = new Map();
 		const reviewerBrowserGuardKeysByCall = new Map();
 		const reviewerBrowserCalls = new Map();
@@ -7113,10 +7378,11 @@ export default definePluginEntry({
     registerBoundTeamTool({
       name: "team_status",
       label: "Team Status",
-      description: "Read team member status snapshots.",
+      description: "Read member status and the current task's accepted results and workflow version. Shared task files are dispatch snapshots. Do not repeat running or already accepted work.",
       parameters: teamStatusParameters,
       async execute(_id, params) {
-        return { content: [{ type: "text", text: JSON.stringify({ ok: true, status: await runtime.status(params?.memberId) }, null, 2) }] };
+        const context = await runtime.statusContext(params?.memberId);
+        return { content: [{ type: "text", text: JSON.stringify({ ok: true, ...context }, null, 2) }] };
       },
     });
     registerBoundTeamTool({
@@ -7437,6 +7703,7 @@ export default definePluginEntry({
 					// the supplied evidence and emit the real completion tool call if the
 					// control plane never received it.
                     const contextDispatchStartedAt = Date.now();
+                    const contextBody = await appendLeaderTeamContext(textIn, cfg, envelope);
                     let contextActiveResult = null;
                     let contextDispatchFailed = false;
                     const contextAnswer = createTurnAnswerCapture();
@@ -7457,7 +7724,7 @@ export default definePluginEntry({
                         messageId: envelope.messageId,
                         timestamp: ts,
                         commandAuthorized: false,
-                        bodyForAgent: textIn,
+                        bodyForAgent: contextBody,
                         provider: CHANNEL_ID,
                         surface: "Redis Team",
                         originatingChannel: CHANNEL_ID,
@@ -7940,6 +8207,25 @@ export default definePluginEntry({
                 return;
               }
               entry.handle = handle;
+              try {
+              const watcher = await startActiveContextWatcher(cfg, {
+                getActive: () => {
+                  const envelope = runtime.currentActiveEnvelope();
+                  return !ctx.abortSignal?.aborted && envelope && envelope === contextNativePin?.envelope && !runtime.isActiveTaskCompleted(envelope.taskId)
+                    ? { envelope, generation: Number(process.env.CLAWMANAGER_GATEWAY_GENERATION || 0), ...contextNativePin } : null;
+                },
+                deliver: async (_notice, text, current) => {
+                  const control = await nativeContextControl(), owner = control.resolveActiveEmbeddedRunOwnerByRunId(current.nativeRunId);
+                  if (!owner || owner.sessionId !== current.nativeSessionId) return;
+                  const outcome = await control.queueGuardedEmbeddedAgentMessageWithOutcomeAsync(owner.sessionId, text,
+                    { steeringMode: "all", isInboundUserMessage: false },
+                    () => !ctx.abortSignal?.aborted && runtime.currentActiveEnvelope() === current.envelope && contextNativePin?.nativeRunId === current.nativeRunId);
+                  return { state: outcome.queued ? "submitted" : "queued", reason: outcome.reason, nativeSessionId: owner.sessionId, nativeRunId: owner.runId };
+                },
+              }, ctx.log || console);
+              activeContextWatchers.set(accountId, watcher);
+              entry.handle = { ...handle, async stop(options) { activeContextWatchers.delete(accountId); await watcher.stop(); await handle.stop(options); } };
+              } catch { ctx.log?.warn?.("redis-team: active context watcher unavailable; preserving serial consumer"); }
               entry.starting = null;
 
               ctx.setStatus({

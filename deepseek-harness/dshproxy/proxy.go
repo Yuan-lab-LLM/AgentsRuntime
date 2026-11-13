@@ -29,6 +29,7 @@ type runConfig struct {
 	listenHost     string
 	port           int
 	instanceToken  string
+	desktop        bool
 	startupTimeout time.Duration
 	childCommand   []string
 	stdout         io.Writer
@@ -43,6 +44,7 @@ func RunCommand(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	flags.SetOutput(stderr)
 	listenHost := flags.String("listen-host", "0.0.0.0", "managed gateway bind host")
 	port := flags.Int("port", 0, "managed gateway port")
+	desktop := flags.Bool("desktop", false, "serve the local desktop on a loopback-only listener")
 	startupTimeout := flags.Duration("startup-timeout", 90*time.Second, "DSH startup timeout")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -54,7 +56,10 @@ func RunCommand(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		return fmt.Errorf("startup-timeout must be positive")
 	}
 	instanceToken := strings.TrimSpace(os.Getenv(instanceTokenEnv))
-	if instanceToken == "" {
+	if *desktop && !isLoopbackHost(strings.TrimSpace(*listenHost)) {
+		return fmt.Errorf("desktop proxy requires a concrete loopback listen address")
+	}
+	if instanceToken == "" && !*desktop {
 		return fmt.Errorf("%s is required", instanceTokenEnv)
 	}
 	childCommand := flags.Args()
@@ -65,6 +70,7 @@ func RunCommand(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		listenHost:     strings.TrimSpace(*listenHost),
 		port:           *port,
 		instanceToken:  instanceToken,
+		desktop:        *desktop,
 		startupTimeout: *startupTimeout,
 		childCommand:   childCommand,
 		stdout:         stdout,
@@ -100,8 +106,20 @@ func run(ctx context.Context, cfg runConfig) error {
 	}
 
 	childDone := make(chan error, 1)
+	childReaped := make(chan struct{})
 	go func() {
 		childDone <- cmd.Wait()
+		close(childReaped)
+	}()
+	defer func() {
+		cancelChild()
+		// CommandContext kills the child on cancellation. Wait for it to be
+		// reaped before the proxy exits, including startup failures and SIGTERM.
+		select {
+		case <-childReaped:
+		case <-time.After(5 * time.Second):
+			_ = cmd.Process.Kill()
+		}
 	}()
 	launchURLs := make(chan *url.URL, 1)
 	stdoutErrors := make(chan error, 1)
@@ -122,10 +140,13 @@ func run(ctx context.Context, cfg runConfig) error {
 	case launchURL = <-launchURLs:
 	}
 
-	target, sessionCookie, err := bootstrapBrowserSession(ctx, launchURL)
+	session := &browserSession{launchURL: launchURL}
+	_, err = session.cookie(ctx)
 	if err != nil {
 		return fmt.Errorf("bootstrap DSH browser session: %w", err)
 	}
+	target := *launchURL
+	target.Path, target.RawPath, target.RawQuery, target.Fragment = "", "", "", ""
 
 	listener, err := net.Listen("tcp", net.JoinHostPort(cfg.listenHost, strconv.Itoa(cfg.port)))
 	if err != nil {
@@ -134,7 +155,7 @@ func run(ctx context.Context, cfg runConfig) error {
 	defer listener.Close()
 
 	server := &http.Server{
-		Handler:           newAuthenticatedProxy(target, cfg.instanceToken, sessionCookie),
+		Handler:           newSessionProxy(&target, cfg.instanceToken, session.cookie, cfg.desktop),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       90 * time.Second,
 	}
@@ -229,12 +250,20 @@ func parseLaunchURL(line string) (*url.URL, bool, error) {
 }
 
 func bootstrapBrowserSession(ctx context.Context, launchURL *url.URL) (*url.URL, string, error) {
+	target, cookie, err := exchangeBrowserSession(ctx, launchURL)
+	if err != nil {
+		return nil, "", err
+	}
+	return target, cookie.Name + "=" + cookie.Value, nil
+}
+
+func exchangeBrowserSession(ctx context.Context, launchURL *url.URL) (*url.URL, *http.Cookie, error) {
 	if launchURL == nil {
-		return nil, "", fmt.Errorf("DSH launch URL is nil")
+		return nil, nil, fmt.Errorf("DSH launch URL is nil")
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, launchURL.String(), nil)
 	if err != nil {
-		return nil, "", err
+		return nil, nil, fmt.Errorf("invalid DSH bootstrap request")
 	}
 	client := &http.Client{
 		Timeout: 10 * time.Second,
@@ -247,22 +276,23 @@ func bootstrapBrowserSession(ctx context.Context, launchURL *url.URL) (*url.URL,
 	}
 	response, err := client.Do(request)
 	if err != nil {
-		return nil, "", err
+		// net/http errors include the URL, which contains a process credential.
+		return nil, nil, fmt.Errorf("DSH token exchange failed")
 	}
 	defer response.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
 	if response.StatusCode != http.StatusSeeOther {
-		return nil, "", fmt.Errorf("DSH token exchange returned HTTP %d", response.StatusCode)
+		return nil, nil, fmt.Errorf("DSH token exchange returned HTTP %d", response.StatusCode)
 	}
-	var sessionCookie string
+	var sessionCookie *http.Cookie
 	for _, cookie := range response.Cookies() {
 		if strings.HasPrefix(cookie.Name, dshCookiePrefix) && cookie.Value != "" {
-			sessionCookie = cookie.Name + "=" + cookie.Value
+			sessionCookie = cookie
 			break
 		}
 	}
-	if sessionCookie == "" {
-		return nil, "", fmt.Errorf("DSH token exchange did not return a browser-session cookie")
+	if sessionCookie == nil {
+		return nil, nil, fmt.Errorf("DSH token exchange did not return a browser-session cookie")
 	}
 	target := *launchURL
 	target.Path = ""
@@ -273,6 +303,12 @@ func bootstrapBrowserSession(ctx context.Context, launchURL *url.URL) (*url.URL,
 }
 
 func newAuthenticatedProxy(target *url.URL, expectedToken, sessionCookie string) http.Handler {
+	return newSessionProxy(target, expectedToken, func(context.Context) (string, error) { return sessionCookie, nil }, false)
+}
+
+type sessionCookieContextKey struct{}
+
+func newSessionProxy(target *url.URL, expectedToken string, getCookie func(context.Context) (string, error), desktop bool) http.Handler {
 	reverseProxy := httputil.NewSingleHostReverseProxy(target)
 	director := reverseProxy.Director
 	reverseProxy.Director = func(request *http.Request) {
@@ -281,7 +317,7 @@ func newAuthenticatedProxy(target *url.URL, expectedToken, sessionCookie string)
 		request.Host = target.Host
 		rewriteBrowserOrigin(request.Header, target)
 		stripManagedCredentials(request.Header)
-		attachDSHSessionCookie(request.Header, sessionCookie)
+		attachDSHSessionCookie(request.Header, request.Context().Value(sessionCookieContextKey{}).(string))
 	}
 	reverseProxy.ModifyResponse = func(response *http.Response) error {
 		cookies := response.Header.Values("Set-Cookie")
@@ -298,12 +334,22 @@ func newAuthenticatedProxy(target *url.URL, expectedToken, sessionCookie string)
 		http.Error(writer, "DSH gateway unavailable", http.StatusBadGateway)
 	}
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if !requestHasInstanceToken(request, expectedToken) {
+		authorized := expectedToken != "" && requestHasInstanceToken(request, expectedToken)
+		if desktop {
+			authorized = trustedDesktopRequest(request)
+		}
+		if !authorized {
 			writer.Header().Set("Cache-Control", "no-store")
 			http.Error(writer, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		reverseProxy.ServeHTTP(writer, request)
+		cookie, err := getCookie(request.Context())
+		if err != nil {
+			http.Error(writer, "DSH session unavailable", http.StatusBadGateway)
+			return
+		}
+		ctx := context.WithValue(request.Context(), sessionCookieContextKey{}, cookie)
+		reverseProxy.ServeHTTP(writer, request.WithContext(ctx))
 	})
 }
 

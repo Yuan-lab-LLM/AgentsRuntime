@@ -19,6 +19,9 @@ proxy_bind_host="${DSH_BIND_HOST:-0.0.0.0}"
 # neither BrowserAuth nor plugin-specific trust settings can expose its API.
 export DSH_BIND_HOST=127.0.0.1
 export DSH_TELEMETRY_DISABLED="${DSH_TELEMETRY_DISABLED:-1}"
+# Load the verified image-owned native addon directly. Its optional cache copies
+# executable bindings to /tmp, which is correctly noexec in restricted slots.
+export NARB_DISABLE_NATIVE_CACHE=1
 mkdir -p "${DSH_HOME}" "${DSH_HOME}/skills"
 
 resolved_llm_config="$(
@@ -33,7 +36,13 @@ export CLAWMANAGER_LLM_RESOLVED_CONFIG_JSON="${resolved_llm_config}"
 unset RUNTIME_AGENT_CONTROL_TOKEN RUNTIME_AGENT_REPORT_TOKEN
 unset CLAWMANAGER_AGENT_CONTROL_TOKEN CLAWMANAGER_AGENT_REPORT_TOKEN
 
-/usr/local/bin/prepare-deepseek-harness-resources
+source /usr/local/bin/prepare-deepseek-harness-resources
+managed_presets="$(node /usr/local/share/deepseek-harness/prepare-managed-config.mjs /usr/local/share/deepseek-harness/managed.cordis.patch.yml)"
+team_args=()
+if [[ "${CLAWMANAGER_TEAM_ENABLED:-false}" == "true" ]]; then
+  [[ "${CLAWMANAGER_REDIS_TEAM_PLUGIN_VERSION:-}" == "dsh-team-v1" ]] || { echo 'DSH Team capability unavailable' >&2; exit 64; }
+  team_args=(--patch /usr/local/share/deepseek-harness/team.cordis.patch.yml)
+fi
 
 # ClawManager mounts its supervisor binary over /usr/local/bin/clawmanager-agent.
 # Use the image-owned copy so this DSH-specific subcommand cannot be shadowed by
@@ -42,8 +51,10 @@ exec /usr/local/libexec/clawmanager-agent-image dsh-web-proxy \
 	--listen-host "${proxy_bind_host}" \
 	--port "${gateway_port}" \
 	-- \
-	node --expose-internals /usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js web \
+	dsh web \
   --patch /usr/local/share/deepseek-harness/managed.cordis.patch.yml \
+  --patch "${managed_presets}" \
+  "${team_args[@]}" \
 	--host 127.0.0.1 \
 	--port 0 \
 	--no-open

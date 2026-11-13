@@ -26,9 +26,9 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 		if err := writeDesktopWebConfig(cfg, req, workspacePath); err != nil {
 			return err
 		}
-		return gateway.WriteLiteTeamConfigJSON(req, workspacePath)
+		return gateway.WriteLiteTeamConfigJSONForConfig(cfg, req, workspacePath)
 	}
-	if err := gateway.WriteLiteTeamConfigJSON(req, workspacePath); err != nil {
+	if err := gateway.WriteLiteTeamConfigJSONForConfig(cfg, req, workspacePath); err != nil {
 		return err
 	}
 	root, err := workspaceio.Ensure(workspacePath, 0750)

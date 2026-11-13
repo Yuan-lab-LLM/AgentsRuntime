@@ -1,11 +1,11 @@
 // OpenCode 2.0.27 adapter. No UI, prompt logging, or provider credentials here.
-import { randomUUID } from "node:crypto"
+import { randomUUID, createHmac, timingSafeEqual } from "node:crypto"
 import { Context, Effect } from "effect"
 import { Model } from "@opencode/schema/model"
 
 export class GovernanceError extends Error {
-  constructor(readonly revoked = false) {
-    super(revoked ? "当前模型不可用，本轮任务已中止，请重新选择模型" : "模型授权检查暂时不可用，已停止当前任务，请稍后重试")
+  constructor(readonly revoked = false, readonly reason = "unavailable") {
+    super(revoked ? "当前模型不可用，本轮任务已中止，请重新选择模型" : `模型授权检查暂时不可用，已停止当前任务，请稍后重试 [${reason}]`)
   }
 }
 
@@ -84,9 +84,9 @@ async function request(path: string, body?: object): Promise<unknown> {
     method: body === undefined ? "GET" : "POST", redirect: "error",
     headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(2500),
-  }).catch(() => { throw new GovernanceError() })
+  }).catch((error) => { throw new GovernanceError(false, error?.name === "TimeoutError" ? "timeout" : "transport") })
   if (response.status === 403) throw new GovernanceError(true)
-  if (!response.ok) throw new GovernanceError()
+  if (!response.ok) throw new GovernanceError(false, response.status >= 500 ? "service_unavailable" : "protocol_rejected")
   return response.json().catch(() => { throw new GovernanceError() })
 }
 
@@ -142,15 +142,39 @@ export function guard<A, E, R>(operation: Effect.Effect<A, E, R>, task: Task) {
   return Effect.raceFirst(operation, watch).pipe(Effect.provideService(CurrentTask, task))
 }
 
-export function withPrimary<A, E, R>(sessionID: string, provider: string, messages: readonly { type: string; id: string }[], operation: Effect.Effect<A, E, R>) {
+type ContextMessage = { type: string; id: string; metadata?: unknown }
+// Only the host's signed steering input can inherit a business task. Ordinary
+// user prompts and unsigned metadata retain their existing admission identity.
+export function contextPrimaryID(sessionID: string, message: ContextMessage, env = process.env) {
+  if (env.CLAWMANAGER_TEAM_ENABLED !== "true" || !env.CLAWMANAGER_TEAM_CONTEXT_KEY || message.type !== "user") return
+  const meta = message.metadata as Record<string, unknown> | undefined
+  const parent = meta?.["clawmanager.contextFor"], notice = meta?.["clawmanager.contextMessageId"], signature = meta?.["clawmanager.contextSignature"]
+  if (typeof parent !== "string" || !parent || typeof notice !== "string" || !notice || typeof signature !== "string" || !/^[a-f0-9]{64}$/.test(signature)) return
+  if (meta?.["clawmanager.team"] !== env.CLAWMANAGER_TEAM_ID || meta["clawmanager.member"] !== env.CLAWMANAGER_TEAM_MEMBER_ID || Number(meta["clawmanager.contextGeneration"]) !== Number(env.CLAWMANAGER_GATEWAY_GENERATION)) return
+  const expected = createHmac("sha256", env.CLAWMANAGER_TEAM_CONTEXT_KEY).update(JSON.stringify([sessionID, message.id, parent, Number(env.CLAWMANAGER_GATEWAY_GENERATION), notice])).digest("hex")
+  return timingSafeEqual(Buffer.from(signature), Buffer.from(expected)) ? parent : undefined
+}
+
+async function reportPreparedContext(sessionID: string, taskID: string, messages: readonly ContextMessage[]) {
+  const port = Number(process.env.CLAWMANAGER_TEAM_BRIDGE_PORT), token = process.env.CLAWMANAGER_TEAM_BRIDGE_TOKEN
+  if (!Number.isInteger(port) || port < 1 || port > 65535 || !token) return
+  for (const message of messages.slice(-64)) {
+    if (contextPrimaryID(sessionID, message) !== taskID) continue
+    const meta = message.metadata as Record<string, unknown>
+    try { await fetch(`http://127.0.0.1:${port}/context-included`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, signal: AbortSignal.timeout(1000), body: JSON.stringify({ sessionID, taskID, generation, contextMessageId: meta["clawmanager.contextMessageId"], nativeMessageId: message.id }) }) } catch { /* Observation failure cannot stop the original task. */ }
+  }
+}
+
+export function withPrimary<A, E, R>(sessionID: string, provider: string, messages: readonly ContextMessage[], operation: Effect.Effect<A, E, R>) {
   if (!enabled || provider !== "clawmanager") return operation
   return Effect.gen(function* () {
     // The original message can leave projected context after compaction. Reuse
     // only this execution's exact identity, never prompt text or a "main" alias.
-    const taskID = messages.findLast((item) => item.type === "user")?.id ?? primary.get(sessionID)?.taskID
+    const latest = messages.findLast((item) => item.type === "user")
+    const taskID = (latest && contextPrimaryID(sessionID, latest)) ?? latest?.id ?? primary.get(sessionID)?.taskID
     if (!taskID) return yield* Effect.die(new GovernanceError())
     const task = yield* Effect.promise(() => begin(sessionID, taskID, true))
-    return yield* guard(operation, task)
+    return yield* guard(Effect.promise(() => reportPreparedContext(sessionID, taskID, messages)).pipe(Effect.andThen(operation)), task)
   })
 }
 

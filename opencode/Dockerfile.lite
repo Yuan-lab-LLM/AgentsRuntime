@@ -1,6 +1,9 @@
 # syntax=docker/dockerfile:1.7
 # Build from the AgentsRuntime repository root; the runtime composes the shared core.
-FROM --platform=$BUILDPLATFORM golang:1.26.8-bookworm@sha256:9fdc884aacc3bec89b20ffc69f4bb369c78210e3e4f600387b5128b12c199f81 AS agent-builder
+ARG GO_BUILDER_IMAGE=golang:1.26.8-bookworm@sha256:9fdc884aacc3bec89b20ffc69f4bb369c78210e3e4f600387b5128b12c199f81
+ARG NODE_BASE_IMAGE=node:22.23.2-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5
+ARG BUN_BUILD_IMAGE=oven/bun:1.4.2
+FROM --platform=$BUILDPLATFORM ${GO_BUILDER_IMAGE} AS agent-builder
 ARG TARGETOS=linux
 ARG TARGETARCH
 ARG AGENT_VERSION=dev
@@ -12,39 +15,36 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH:-amd64} \
     go build -trimpath -ldflags="-s -w -X main.version=${AGENT_VERSION}" \
     -o /out/clawmanager-agent ./cmd/opencode-lite-agent
 
+FROM ${BUN_BUILD_IMAGE} AS native-team-builder
+USER root
+ARG TARGETARCH
+RUN command -v git && command -v python3 && command -v gcc && command -v g++ && command -v make \
+ || (apt-get update && apt-get install -y --no-install-recommends git python3 build-essential ca-certificates)
+COPY opencode/model-governance/ /governance/
+RUN bash /governance/build-native.sh
+
 # Node/npm are user development and package tools, provided by pinned Debian slim.
-FROM node:22.23.2-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5
-ARG OPENCODE_VERSION=1.18.13
+FROM ${NODE_BASE_IMAGE}
+ARG OPENCODE_VERSION=2.0.27
 ARG TARGETARCH
 ARG DEBIAN_FRONTEND=noninteractive
-ENV CLAWMANAGER_RUNTIME_TYPE=opencode \
+ENV OPENCODE_RUNTIME_MAJOR=2 \
+    CLAWMANAGER_RUNTIME_TYPE=opencode \
     RUNTIME_WORKSPACE_ROOT=/workspaces \
     RUNTIME_AGENT_DATA_DIR=/var/lib/clawmanager-agent \
     SHELL=/bin/bash
 # OpenCode's native PTY serves terminals; build tools support user project tasks.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get -o Acquire::Retries=3 update && apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     bash bubblewrap build-essential ca-certificates curl git iproute2 jq nftables openssh-client \
     procps python3 python3-pip ripgrep tar tini unzip util-linux xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
-RUN set -eux; \
-    arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
-    case "${arch}" in \
-        amd64|x86_64) oc_arch="x64" ;; \
-        arm64|aarch64) oc_arch="arm64" ;; \
-        *) echo "Unsupported architecture for OpenCode: ${arch}" >&2; exit 1 ;; \
-    esac; \
-    curl -fsSL "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-${oc_arch}.tar.gz" \
-        -o /tmp/opencode.tar.gz; \
-    mkdir -p /tmp/opencode-extract; \
-    tar -xzf /tmp/opencode.tar.gz -C /tmp/opencode-extract; \
-    bin="$(find /tmp/opencode-extract -type f -name opencode | head -1)"; \
-    test -n "${bin}"; \
-    install -m 0755 "${bin}" /usr/local/bin/opencode; \
-    opencode --version || opencode --help >/dev/null; \
-    rm -rf /tmp/opencode.tar.gz /tmp/opencode-extract
 
 COPY --from=agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent
+COPY --chmod=755 --from=native-team-builder /out/opencode /usr/local/bin/opencode
+COPY --from=native-team-builder /out/governance-manifest.json /usr/local/share/clawmanager/opencode-governance-manifest.json
+RUN opencode --version | grep -Fx "opencode v${OPENCODE_VERSION}"
+ENV CLAWMANAGER_MODEL_GOVERNANCE_PROTOCOL=1 CLAWMANAGER_REDIS_TEAM_PLUGIN_VERSION=opencode-team-v1
 COPY opencode/rootfs/usr/local/bin/start-opencode-web /usr/local/bin/start-opencode-web
 COPY opencode/scripts/opencode-lite-entrypoint /usr/local/bin/opencode-lite-entrypoint
 RUN sed -i 's/\r$//' /usr/local/bin/start-opencode-web /usr/local/bin/opencode-lite-entrypoint \
@@ -52,3 +52,8 @@ RUN sed -i 's/\r$//' /usr/local/bin/start-opencode-web /usr/local/bin/opencode-l
     && mkdir -p /var/lib/clawmanager-agent /workspaces
 EXPOSE 19090 20000-20299
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/opencode-lite-entrypoint"]
+
+COPY opencode/team/ /usr/local/share/clawmanager/opencode-team/
+COPY plugins/openclaw-redis-team/dist/index.js /tmp/clawmanager-team-protocol-source.js
+RUN node /usr/local/share/clawmanager/opencode-team/build-protocol.mjs /usr/local/share/clawmanager/opencode-team/protocol.mjs /tmp/clawmanager-team-protocol-source.js \
+ && rm /tmp/clawmanager-team-protocol-source.js

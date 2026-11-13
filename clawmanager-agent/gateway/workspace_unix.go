@@ -34,3 +34,15 @@ func teamDirectoryGroup(root *workspaceio.FS) (int, error) {
 	}
 	return int(stat.Gid), nil
 }
+
+func nativeTeamDirectoryIdentity(root *workspaceio.FS) (uint64, uint64, error) {
+	info, err := root.Stat(".")
+	if err != nil {
+		return 0, 0, err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || !info.IsDir() {
+		return 0, 0, fmt.Errorf("Team directory identity unavailable")
+	}
+	return uint64(stat.Dev), uint64(stat.Ino), nil
+}

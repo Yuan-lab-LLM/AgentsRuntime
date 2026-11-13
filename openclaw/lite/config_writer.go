@@ -129,6 +129,7 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 		return fmt.Errorf("read openclaw config: %w", err)
 	}
 	openClawVersion := resolveOpenClawVersion(cfg, req)
+	cfg.OpenClawVersion = openClawVersion
 	configureManagedOpenClawBrowser(config, req, port)
 	mergeOpenClawLiteDefaults(config, openClawVersion)
 	reconcileOpenClawBrowserPlugin(config)
@@ -1129,10 +1130,8 @@ func mergeOpenClawProviderConnection(providers map[string]any, providerID string
 	if cfg.LLMBaseURL != "" {
 		provider["baseUrl"] = cfg.LLMBaseURL
 	}
-	// Native 10.2 blocks the link-local address of the protected model broker.
-	// Grant only this managed endpoint inside an isolated instance network.
 	if cfg.NetworkSecurityProfile == "isolated-network-v1" && cfg.LLMBaseURL == managedconfig.ModelURL && IsOpenClawAtLeast(cfg.OpenClawVersion, "2026.10.2") {
-		ensureObject(provider, "request")["allowPrivateNetwork"] = true
+		allowManagedOpenClawModelRelay(provider)
 	}
 	if cfg.LLMAPIKeySet {
 		provider["apiKey"] = cfg.LLMAPIKey
@@ -1351,5 +1350,5 @@ func writeTeamConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, works
 	if cfg.RuntimeType != "openclaw" {
 		return nil
 	}
-	return gateway.WriteLiteTeamConfigJSON(req, workspace)
+	return gateway.WriteLiteTeamConfigJSONForConfig(cfg, req, workspace)
 }

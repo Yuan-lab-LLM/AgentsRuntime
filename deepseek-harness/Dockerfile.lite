@@ -1,6 +1,15 @@
 # syntax=docker/dockerfile:1.7
 # Build from the AgentsRuntime repository root; the runtime composes the shared core.
-FROM --platform=$BUILDPLATFORM golang:1.26.8-bookworm@sha256:9fdc884aacc3bec89b20ffc69f4bb369c78210e3e4f600387b5128b12c199f81 AS agent-builder
+ARG GO_BUILDER_IMAGE=golang:1.26.8-bookworm@sha256:9fdc884aacc3bec89b20ffc69f4bb369c78210e3e4f600387b5128b12c199f81
+FROM node:24.21.0-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20 AS native-builder
+COPY deepseek-harness/native/package.json deepseek-harness/native/package-lock.json /opt/clawmanager-dsh/
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --prefix /opt/clawmanager-dsh --ignore-scripts --no-audit --no-fund
+COPY deepseek-harness/native/source-lock.json deepseek-harness/scripts/verify-native.mjs /opt/clawmanager-dsh/
+RUN node /opt/clawmanager-dsh/verify-native.mjs /opt/clawmanager-dsh/native-manifest.json
+
+FROM --platform=$BUILDPLATFORM ${GO_BUILDER_IMAGE} AS agent-builder
+ARG GOPROXY
 ARG TARGETOS=linux
 ARG TARGETARCH
 ARG AGENT_VERSION=dev
@@ -12,17 +21,18 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH:-amd64} \
     go build -mod=readonly -trimpath -ldflags="-s -w -X main.version=${AGENT_VERSION}" \
     -o /out/clawmanager-agent ./cmd/deepseek-harness-lite-agent
 
-FROM node:22-bookworm-slim@sha256:53ada149d435c38b14476cb57e4a7da73c15595aba79bd6971b547ceb6d018bf
+FROM node:24.21.0-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20
 
-ARG DSH_VERSION=0.1.2-alpha.3
-ARG PNPM_VERSION=11.25.0
+ARG VCS_REF=unknown
 ARG DEBIAN_FRONTEND=noninteractive
+LABEL io.clawmanager.deepseek-harness.version="0.2.1-rc.3" org.opencontainers.image.revision=$VCS_REF
 
 ENV CLAWMANAGER_RUNTIME_TYPE=deepseek-harness \
     RUNTIME_WORKSPACE_ROOT=/workspaces \
     RUNTIME_AGENT_DATA_DIR=/var/lib/clawmanager-agent \
     RUNTIME_GATEWAY_COMMAND=/usr/local/bin/start-deepseek-harness-gateway \
-    DSH_TELEMETRY_DISABLED=1
+    DSH_TELEMETRY_DISABLED=1 \
+    CLAWMANAGER_REDIS_TEAM_PLUGIN_VERSION="dsh-team-v1"
 
 RUN set -eux; \
     apt-get update; \
@@ -47,35 +57,35 @@ RUN set -eux; \
 
 # Lite gateways run as instance-specific, unprivileged UIDs. Keep pnpm in the
 # shared image so plugin installs never need to modify the system Node prefix.
+COPY --from=native-builder /opt/clawmanager-dsh/ /opt/clawmanager-dsh/
 RUN set -eux; \
-    npm install --global \
-      "@deepseek-ai/dsh@${DSH_VERSION}" \
-      "pnpm@${PNPM_VERSION}"; \
+    mkdir -p /usr/local/lib/node_modules/@deepseek-ai; \
+    ln -s /opt/clawmanager-dsh/node_modules/@deepseek-ai/dsh /usr/local/lib/node_modules/@deepseek-ai/dsh; \
+    ln -s /opt/clawmanager-dsh/node_modules/.bin/dsh /usr/local/bin/dsh; \
+    ln -s /opt/clawmanager-dsh/node_modules/.bin/pnpm /usr/local/bin/pnpm; \
     dsh --version; \
     pnpm --version; \
     npm cache clean --force
-
-COPY deepseek-harness/cordis.lock.json deepseek-harness/scripts/install-pinned-cordis.py /usr/local/share/deepseek-harness/
-RUN --mount=type=bind,source=deepseek-harness/vendor/cordis,target=/pinned/cordis \
-    python3 /usr/local/share/deepseek-harness/install-pinned-cordis.py /pinned/cordis
 
 # DSH runs inside the instance's existing namespace. Keep its nested writable
 # sandbox on that private persistent /tmp; never disable the sandbox itself.
 COPY deepseek-harness/scripts/patch-persistent-tmp.py /usr/local/share/deepseek-harness/patch-persistent-tmp.py
 RUN python3 /usr/local/share/deepseek-harness/patch-persistent-tmp.py \
-    /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-sandbox-local/lib/index.js
+    /opt/clawmanager-dsh/node_modules/@deepseek-ai/dsh-sandbox-local/lib/index.js \
+    && node /opt/clawmanager-dsh/verify-native.mjs /opt/clawmanager-dsh/native-manifest.json --patched
 
 # Remote managed browsers use the instance-authenticated settings mirror. Preserve
 # the native connection's loopback/host-ownership checks for other capabilities.
 COPY deepseek-harness/scripts/patch-managed-settings.py tests/lite/test_deepseek_settings.mjs /usr/local/share/deepseek-harness/
 RUN python3 /usr/local/share/deepseek-harness/patch-managed-settings.py \
-    /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-ui-settings/lib/client.js \
+    /opt/clawmanager-dsh/node_modules/@deepseek-ai/dsh-client-ui-settings/lib/client.js \
     && node /usr/local/share/deepseek-harness/test_deepseek_settings.mjs \
-    /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-ui-settings/lib/client.js
+    /opt/clawmanager-dsh/node_modules/@deepseek-ai/dsh-client-ui-settings/lib/client.js
 
 COPY --from=agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent
 COPY --from=agent-builder /out/clawmanager-agent /usr/local/libexec/clawmanager-agent-image
 COPY deepseek-harness/config/managed.cordis.patch.yml /usr/local/share/deepseek-harness/managed.cordis.patch.yml
+COPY deepseek-harness/scripts/prepare-managed-config.mjs /usr/local/share/deepseek-harness/prepare-managed-config.mjs
 COPY deepseek-harness/scripts/prepare-deepseek-harness-resources /usr/local/bin/prepare-deepseek-harness-resources
 COPY deepseek-harness/scripts/start-deepseek-harness-gateway /usr/local/bin/start-deepseek-harness-gateway
 COPY deepseek-harness/scripts/deepseek-harness-lite-entrypoint /usr/local/bin/deepseek-harness-lite-entrypoint
@@ -93,6 +103,14 @@ RUN set -eux; \
       /usr/local/bin/deepseek-harness-lite-entrypoint; \
     mkdir -p /var/lib/clawmanager-agent /workspaces; \
     chmod 0755 /var/lib/clawmanager-agent /workspaces
+
+COPY plugins/openclaw-redis-team/dist/index.js /opt/clawmanager-dsh/adapter/plugins/openclaw-redis-team/dist/index.js
+COPY opencode/team/bridge.mjs opencode/team/native-client.mjs opencode/team/delivery-outbox.mjs opencode/team/build-protocol.mjs /opt/clawmanager-dsh/adapter/opencode/team/
+COPY deepseek-harness/team/host.mjs deepseek-harness/team/plugin.mjs deepseek-harness/team/build.mjs deepseek-harness/team/schema.mjs /opt/clawmanager-dsh/adapter/deepseek-harness/team/
+COPY deepseek-harness/config/team.cordis.patch.yml /usr/local/share/deepseek-harness/team.cordis.patch.yml
+RUN node /opt/clawmanager-dsh/adapter/deepseek-harness/team/build.mjs /opt/clawmanager-dsh/adapter/deepseek-harness/team/protocol.mjs \
+    && printf '{"protocol":"dsh-team-v1","native":"0.2.1-rc.3"}\n' > /opt/clawmanager-dsh/adapter/deepseek-harness/team/capability.json \
+    && node /opt/clawmanager-dsh/verify-native.mjs /opt/clawmanager-dsh/native-manifest.json --patched
 
 EXPOSE 19090 20300-20399
 

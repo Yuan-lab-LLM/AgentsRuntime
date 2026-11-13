@@ -10,19 +10,20 @@ This directory owns the ClawManager runtime images for DeepSeek Harness.
 - `Dockerfile.pro` builds the dedicated Webtop Pro runtime. DeepSeek Harness
   runs on loopback port `3080` and opens automatically in the desktop browser.
 
-Both images pin `@deepseek-ai/dsh` and apply the managed Cordis provider patch
+Both images pin `@deepseek-ai/dsh` **0.2.1-rc.3** and apply the managed Cordis provider patch
 from `config/managed.cordis.patch.yml`. The Lite image also pins the `pnpm` CLI
 required by dsh-market so pooled non-root instances never need to modify the
 system Node installation at runtime. ClawManager supplies the OpenAI-compatible
 base URL, instance credential, and allowed model list at runtime.
 
-Lite also locks the Cordis core family in `cordis.lock.json`. Pinning the DSH
-CLI alone permits incompatible transitive patch releases: newer HMR packages
-remove `registerConfig`, and newer Loader packages change activation ordering.
-The small official archives in `vendor/cordis` are checked against SHA256 and
-registry SHA512 integrity before installation. DSH starts with Node's explicit
-`--expose-internals` flag, which its HMR service requires. The Lite image
-applies one SHA-pinned sandbox-local patch: workspace-write commands bind the
+The complete native dependency graph and package integrities are frozen in
+`native/package-lock.json`, including the compatible Cordis4.0.5/HMR0.2.1/Loader1.0.6
+family. Builds use `npm ci --ignore-scripts` on Node24.21.0, with the Node image
+digest and original sandbox hash in `native/source-lock.json`. The old
+`cordis.lock.json`/`vendor/cordis` archives remain historical artifacts and are
+not applied over the new native graph. No `--expose-internals` workaround is
+needed by this release. The Lite image applies one SHA-pinned sandbox-local
+patch: workspace-write commands bind the
 outer instance-private `/tmp` instead of creating another temporary filesystem.
 The read-only profile and Landlock grants retain their existing constraints.
 The Lite image also SHA-pins its settings client patch: managed remote browsers
@@ -30,6 +31,18 @@ use the instance-authenticated host settings mirror. Reads remain secret-redacte
 and writes retain the host provider policy and revision checks. Generic loopback
 detection and host ownership remain unchanged. The image build runs
 `tests/lite/test_deepseek_settings.mjs` against the installed client bundle.
+
+The managed proxy renews its private browser session before request dispatch;
+concurrent renewal is shared and a mutating request is never replayed after 401.
+The Pro proxy is loopback-only and additionally rejects cross-origin/remote
+requests. Both modes preserve significant plugin batch query strings.
+`prepare-managed-config.mjs` applies managed rules to the actually composed
+presets without replacing user profiles. Model routes retain context-window
+and vision capability metadata; unknown CM window0 uses a valid fallback.
+
+This M0/M1 release does **not** enable DSH Team membership or advertise a Team
+plugin capability. It preserves the existing Team dispatch/Worker contracts.
+See `docs/dsh-native-contract-20261105.md` for the verified future extension seam.
 
 On the cluster build node, verify a built image with
 `python3 tests/lite/test_deepseek_startup.py <image>`. It starts a fresh non-root
@@ -42,6 +55,12 @@ Build both images from the repository root:
 docker build -f deepseek-harness/Dockerfile.lite -t deepseek-harness-lite:local .
 docker build -f deepseek-harness/Dockerfile.pro -t deepseek-harness:local .
 ```
+
+For a release, resolve `WEBTOP_RUNTIME_BASE_IMAGE` to an immutable compatible
+OpenClaw/Webtop digest and pass it explicitly to the Pro build. Record that
+digest and final image digests with the source commit. The Pro image retains its
+desktop supervisor and user directories; building it does not upgrade any
+running OpenClaw pool. Both images contain `/opt/clawmanager-dsh/native-manifest.json`.
 
 ## Lite temporary files
 

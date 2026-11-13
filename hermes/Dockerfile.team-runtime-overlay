@@ -1,0 +1,17 @@
+# Reuse the fully verified, immutable native Hermes release. Replace only
+# source-built managers and the compatible Team configurator, then regenerate
+# the release inventory so health capabilities bind the actual shipped files.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG VCS_REF
+COPY --chmod=755 --from=manager-binaries /hermes-agent /usr/local/bin/clawmanager-agent
+COPY --chmod=755 --from=manager-binaries /hermes-agent /usr/local/libexec/clawmanager-agent-image
+COPY --chmod=755 hermes/rootfs/usr/local/bin/hermes-apply-runtime-config /usr/local/bin/hermes-apply-runtime-config
+COPY hermes/patches/hermes-agent/lite_non_native.py /opt/hermes-agent/hermes_cli/lite_non_native.py
+COPY hermes/patches/hermes-agent/lite_non_native.py /usr/local/share/hermes-lite/patches/lite_non_native.py
+COPY hermes/patches/hermes-agent/apply_lite_managed_reasoning.py /usr/local/share/hermes-lite/apply_lite_managed_reasoning.py
+RUN sed -i 's/\r$//' /usr/local/bin/hermes-apply-runtime-config \
+    && /opt/hermes-agent/.venv/bin/python /usr/local/share/hermes-lite/apply_lite_managed_reasoning.py /opt/hermes-agent \
+    && /opt/hermes-agent/.venv/bin/python /usr/local/share/hermes-lite/verify_lite_release.py \
+       --lock /usr/local/share/hermes-lite/source-lock.json --generate-release --verify-release
+LABEL org.opencontainers.image.revision=$VCS_REF
