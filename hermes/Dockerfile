@@ -104,12 +104,13 @@ RUN set -eux; \
     npm --version; \
     rm -f /tmp/node.tar.xz
 
+COPY hermes/vendor/hermes-agent/install.sh /tmp/hermes-install.sh
+COPY hermes/vendor/hermes-agent/LICENSE /usr/local/share/licenses/hermes-agent-installer/LICENSE
+
 RUN set -eux; \
     mkdir -p "${HERMES_HOME}" "${PLAYWRIGHT_BROWSERS_PATH}"; \
     export HOME=/root; \
-    curl --retry 5 --retry-delay 2 --retry-max-time 120 -fsSL \
-        "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_GIT_REF}/scripts/install.sh" \
-        -o /tmp/hermes-install.sh; \
+    echo '85ef536d455e51ab67aa74d79272efd49fe717597dbaadfd3cca179a905f4706  /tmp/hermes-install.sh' | sha256sum -c -; \
     bash /tmp/hermes-install.sh --branch "${HERMES_GIT_REF}" --hermes-home "${HERMES_HOME}" --skip-setup; \
     rm -f /tmp/hermes-install.sh; \
     test "$(git -C /usr/local/lib/hermes-agent rev-parse HEAD)" = "${HERMES_GIT_COMMIT}"; \
