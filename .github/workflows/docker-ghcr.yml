@@ -97,20 +97,9 @@ jobs:
             "deepseek-harness-lite|.|./deepseek-harness/Dockerfile.lite|deepseek-harness-lite"
           )
 
-          # Changes on the default branch publish all four Lite runtimes and the
-          # existing Pro variants selected by the workflow path filter. Manual
-          # dispatches may publish either the full matrix or one selected runtime.
-          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
-            specs=(
-              "hermes|.|./hermes/Dockerfile|hermes"
-              "hermes-lite|.|./hermes/Dockerfile.lite|hermes-lite"
-              "openclaw|.|./openclaw/Dockerfile.openclaw|openclaw"
-              "openclaw-lite|.|./openclaw/Dockerfile.lite|openclaw-lite"
-              "opencode-lite|.|./opencode/Dockerfile.lite|opencode-lite"
-              "deepseek-harness|.|./deepseek-harness/Dockerfile.pro|deepseek-harness"
-              "deepseek-harness-lite|.|./deepseek-harness/Dockerfile.lite|deepseek-harness-lite"
-            )
-          elif [ -n "${RUNTIME_INPUT}" ] && [ "${RUNTIME_INPUT}" != "all" ]; then
+          # Pushes and manual "all" builds share the complete Lite/Pro matrix.
+          # Only a manual single-runtime selection narrows it.
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && [ -n "${RUNTIME_INPUT}" ] && [ "${RUNTIME_INPUT}" != "all" ]; then
             selected=()
             for spec in "${specs[@]}"; do
               IFS="|" read -r runtime _ <<< "${spec}"
