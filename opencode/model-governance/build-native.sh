@@ -18,7 +18,11 @@ bun /governance/apply-governance.mjs /src
 bun install --frozen-lockfile
 cd packages/core
 GOMAXPROCS=2 GOMEMLIMIT=2GiB bun typecheck
-bun test test/clawmanager-governance.test.ts test/clawmanager-image-tools.test.ts test/clawmanager-team-tools.test.ts --timeout 30000
+# Each suite pins different gateway credentials at module import time.
+# Separate processes keep their environments and cached modules isolated.
+bun test test/clawmanager-governance.test.ts --timeout 30000
+bun test test/clawmanager-image-tools.test.ts --timeout 30000
+bun test test/clawmanager-team-tools.test.ts --timeout 30000
 TEAM_TEST_GENERATION=0 bun test test/clawmanager-team-tools.test.ts --timeout 30000
 cd ../cli
 OPENCODE_VERSION=2.0.27 OPENCODE_CHANNEL=latest bun run script/build.ts --target="$target"

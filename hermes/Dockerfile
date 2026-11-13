@@ -107,8 +107,11 @@ RUN set -eux; \
 RUN set -eux; \
     mkdir -p "${HERMES_HOME}" "${PLAYWRIGHT_BROWSERS_PATH}"; \
     export HOME=/root; \
-    curl -fsSL "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_GIT_REF}/scripts/install.sh" \
-        | bash -s -- --branch "${HERMES_GIT_REF}" --hermes-home "${HERMES_HOME}" --skip-setup; \
+    curl --retry 5 --retry-delay 2 --retry-max-time 120 -fsSL \
+        "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_GIT_REF}/scripts/install.sh" \
+        -o /tmp/hermes-install.sh; \
+    bash /tmp/hermes-install.sh --branch "${HERMES_GIT_REF}" --hermes-home "${HERMES_HOME}" --skip-setup; \
+    rm -f /tmp/hermes-install.sh; \
     test "$(git -C /usr/local/lib/hermes-agent rev-parse HEAD)" = "${HERMES_GIT_COMMIT}"; \
     /usr/local/lib/hermes-agent/venv/bin/python -m ensurepip --upgrade; \
     /usr/local/lib/hermes-agent/venv/bin/python -m pip install --no-cache-dir "hermes-agent[dingtalk,messaging,matrix,pty,web,wecom]==${HERMES_VERSION}"; \
