@@ -158,7 +158,7 @@ func (m *GatewayManager) runIsolatedGateway(ctx context.Context, record *gateway
 		// Stop must finish before any reservation is released or successor can
 		// write the same workspace. It includes the entire process group.
 		m.mu.Lock()
-		idleStop := record.idleStop
+		idleStop, forceDelete := record.idleStop, record.forceDelete
 		if record.automationStopFailed {
 			stopFailed = true
 			failure = ErrGatewayStopFailed
@@ -167,7 +167,9 @@ func (m *GatewayManager) runIsolatedGateway(ctx context.Context, record *gateway
 		record.state.State = "stopping"
 		m.mu.Unlock()
 		stop := process.Stop
-		if idleStop {
+		if forceDelete {
+			stop = process.ForceStop
+		} else if idleStop {
 			stop = process.GracefulStop
 		}
 		if process.PID != 0 && stop == nil {
@@ -340,6 +342,12 @@ func (m *GatewayManager) runIsolatedGateway(ctx context.Context, record *gateway
 		idleStop := record.idleStop
 		m.mu.RUnlock()
 		if idleStop || ctx.Err() != nil || failure == nil || errors.Is(failure, ErrGatewayStopFailed) || !m.automaticGatewayRecoveryEnabled() {
+			return
+		}
+		// Native slot processes need externally verified container termination.
+		// Retain the original failure and writer for the controller's reset path;
+		// an in-process Stop cannot confirm this boundary or authorize a respawn.
+		if process.PrepareReset != nil {
 			return
 		}
 		m.mu.Lock()
@@ -646,6 +654,87 @@ func (m *GatewayManager) Shutdown(ctx context.Context) error {
 		if reserved {
 			return fmt.Errorf("gateway_stop_failed")
 		}
+	}
+	return nil
+}
+
+// ForceDeleteGateway is available only through explicit deletion. An absent
+// dedicated kill-and-proof hook must never silently fall back to graceful Stop.
+func (m *GatewayManager) ForceDeleteGateway(ctx context.Context, id string) error {
+	if m.cfg.SandboxProfile == "nfs-rootless-v1" {
+		return ErrGatewayStopUnsupported
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	record := m.gateways[id]
+	if record == nil {
+		m.mu.Unlock()
+		return nil
+	}
+	process := record.process
+	if process.PID != 0 && process.ForceStop == nil {
+		m.mu.Unlock()
+		return ErrGatewayStopUnsupported
+	}
+	if record.deleteBusy {
+		m.mu.Unlock()
+		return ErrGatewayStopConflict
+	}
+	record.forceDelete, record.deletePending, record.deleteBusy = true, true, true
+	record.state.State = "stopping"
+	if record.cancel != nil {
+		record.cancel()
+	}
+	m.mu.Unlock()
+	defer func() { m.mu.Lock(); record.deleteBusy = false; m.mu.Unlock() }()
+	if process.PID != 0 {
+		if err := process.ForceStop(ctx); err != nil {
+			return err
+		}
+	}
+	if record.finished != nil {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-record.finished:
+		}
+	}
+	record.stopMu.Lock()
+	defer record.stopMu.Unlock()
+	m.mu.RLock()
+	current, cleanup, uncertain := record.process, record.executionCleanup, record.automationStopFailed
+	m.mu.RUnlock()
+	if uncertain {
+		return ErrGatewayStopFailed
+	}
+	if current.PID != 0 && current.PID != process.PID {
+		if current.ForceStop == nil {
+			return ErrGatewayStopUnsupported
+		}
+		if err := current.ForceStop(ctx); err != nil {
+			return err
+		}
+	}
+	if cleanup != nil {
+		if err := cleanup(ctx); err != nil {
+			return err
+		}
+	}
+	m.mu.Lock()
+	if m.gateways[id] != record {
+		m.mu.Unlock()
+		return ErrGatewayStopConflict
+	}
+	release := record.idleRelease
+	record.idleRelease = nil
+	m.ports.Release(record.state.Port)
+	delete(m.gateways, id)
+	m.notifyGatewayStateChangedLocked()
+	m.mu.Unlock()
+	if release != nil {
+		release()
 	}
 	return nil
 }

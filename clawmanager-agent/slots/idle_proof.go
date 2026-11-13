@@ -9,7 +9,7 @@ func (w *Worker) idleConfirmed() bool {
 	if a := w.book.Assignment; a != nil && a.State != "stopped" {
 		return false
 	}
-	if (w.book.StopIntent != nil || w.book.TerminationProof != nil) && !w.book.StopFinalized {
+	if (w.book.StopIntent != nil || w.book.TerminationProof != nil || w.book.FaultRecovery != nil) && !w.book.StopFinalized && !w.book.faultFinalized() {
 		return false
 	}
 	if w.network != nil {

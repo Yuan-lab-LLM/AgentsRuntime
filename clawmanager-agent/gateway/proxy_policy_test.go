@@ -92,3 +92,33 @@ func TestProxyPolicyCASNamespaceAndExactAddresses(t *testing.T) {
 		t.Fatalf("stored policy mismatch: %v", err)
 	}
 }
+
+func TestProxyPolicyAbsoluteExpiryPreservesCoordinatorLease(t *testing.T) {
+	for _, scenario := range []string{"bounded", "expired", "negative", "too-long"} {
+		t.Run(scenario, func(t *testing.T) {
+			store := NewProxyPolicyStore(filepath.Join(t.TempDir(), "policy.json"), "tenant")
+			expiry := time.Now().Add(20 * time.Second).UnixMilli()
+			switch scenario {
+			case "expired":
+				expiry = time.Now().Add(-time.Second).UnixMilli()
+			case "negative":
+				expiry = -1
+			case "too-long":
+				expiry = time.Now().Add(91 * time.Second).UnixMilli()
+			}
+			raw, _ := json.Marshal(map[string]any{"namespace": "tenant", "proxies": []string{"10.1.2.3"}, "expires_at_ms": expiry})
+			var request ProxyPolicyUpdate
+			if err := json.Unmarshal(raw, &request); err != nil {
+				t.Fatal(err)
+			}
+			policy, err := store.Update(request)
+			if scenario == "bounded" {
+				if err != nil || policy.ExpiresAtMS != expiry {
+					t.Fatalf("coordinator lease extended: policy=%+v wantExpiry=%d err=%v", policy, expiry, err)
+				}
+			} else if err == nil || store.Snapshot().Revision != "" {
+				t.Fatalf("invalid lease published: policy=%+v err=%v", policy, err)
+			}
+		})
+	}
+}

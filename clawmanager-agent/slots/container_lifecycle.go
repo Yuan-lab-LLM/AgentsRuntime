@@ -97,47 +97,113 @@ func (w *Worker) matchesContainerIntent(intent containerStopIntent) bool {
 		intent.AssignmentDigest == w.book.Digest && len(intent.AssignmentDigest) == 64
 }
 
+type containerPreparation struct {
+	intent containerStopIntent
+	cancel context.CancelFunc
+}
+
+// Explicit deletion may supersede only the same committed execution. Keeping
+// the operation ID binds takeover to the controller's durable compare-and-swap.
+func forceDeleteSupersedes(previous, next containerStopIntent) bool {
+	if previous.Kind != "" || next.Kind != "force-delete" || next.Graceful {
+		return false
+	}
+	previous.Kind, previous.Graceful = "force-delete", false
+	return previous == next
+}
+
 func (w *Worker) serveContainerStop(out http.ResponseWriter, r *http.Request, id string) {
 	var intent containerStopIntent
-	if err := decodeContainerOperation(r, &intent); err != nil || intent.GatewayID != id || intent.Kind != "" {
+	if err := decodeContainerOperation(r, &intent); err != nil || intent.GatewayID != id || intent.Kind != "" && (intent.Kind != "force-delete" || intent.Graceful || r.Method != http.MethodDelete) {
 		http.Error(out, "invalid container stop intent", 400)
 		return
 	}
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	if w.book.quarantined || !w.matchesContainerIntent(intent) || intent.WorkerEpoch != w.workerEpoch || w.book.Assignment.State == "stopped" {
+		w.mu.Unlock()
 		http.Error(out, "slot cannot prepare an unknown execution", 409)
 		return
 	}
-	if w.book.StopIntent != nil && *w.book.StopIntent != intent {
+	previous := w.book.StopIntent
+	if previous != nil && *previous != intent && (w.resetReady || !forceDeleteSupersedes(*previous, intent)) {
+		w.mu.Unlock()
 		http.Error(out, "different container stop is already committed", 409)
 		return
 	}
-	if w.book.StopIntent == nil {
+	if previous == nil || *previous != intent {
 		w.book.StopIntent = &intent
 		if err := w.book.save(); err != nil {
-			w.book.StopIntent = nil
+			w.book.StopIntent = previous
+			w.mu.Unlock()
 			http.Error(out, "cannot persist container stop", 409)
 			return
 		}
+		if w.containerPreparation != nil {
+			w.containerPreparation.cancel()
+		}
 	}
 	if !w.resetReady {
+		if active := w.containerPreparation; active != nil && active.intent == intent {
+			w.mu.Unlock()
+			http.Error(out, "container reset preparation is already active", 409)
+			return
+		}
+		ctx, cancel := context.WithCancel(r.Context())
+		preparation := &containerPreparation{intent: intent, cancel: cancel}
+		w.containerPreparation = preparation
 		w.network.fenceForContainerReset()
-		if err := w.manager.PrepareContainerReset(r.Context(), id, intent.Graceful, func() error {
+		w.mu.Unlock()
+		defer func() {
+			cancel()
+			w.mu.Lock()
+			if w.containerPreparation == preparation {
+				w.containerPreparation = nil
+			}
+			w.mu.Unlock()
+		}()
+		persistGraceful := func() error {
+			w.mu.Lock()
+			defer w.mu.Unlock()
+			if w.book.StopIntent == nil || *w.book.StopIntent != intent {
+				return gateway.ErrGatewayStopConflict
+			}
 			w.book.Assignment.IdleStop = true
 			return w.book.save()
-		}); err != nil {
+		}
+		var err error
+		if intent.Kind == "force-delete" {
+			err = w.manager.PrepareContainerForceDelete(ctx, id)
+		} else {
+			err = w.manager.PrepareContainerReset(ctx, id, intent.Graceful, persistGraceful)
+		}
+		if err != nil {
 			log.Printf("runtime-agent container reset preparation failed: %v", err)
 			http.Error(out, "container reset preparation is incomplete", 409)
 			return
 		}
-		if err := w.network.closeForContainerReset(r.Context()); err != nil {
+		w.mu.Lock()
+		current := w.book.StopIntent != nil && *w.book.StopIntent == intent
+		w.mu.Unlock()
+		if !current || ctx.Err() != nil {
+			http.Error(out, "container reset preparation was superseded", 409)
+			return
+		}
+		if err = w.network.closeForContainerReset(ctx); err != nil {
 			log.Printf("runtime-agent container network cleanup failed: %v", err)
 			http.Error(out, "execution resource cleanup is incomplete", 409)
 			return
 		}
+		w.mu.Lock()
+		// The old operation may finish concurrently with explicit deletion. Only
+		// the currently committed intent may write the container's sole receipt.
+		if w.book.StopIntent == nil || *w.book.StopIntent != intent || ctx.Err() != nil {
+			w.mu.Unlock()
+			http.Error(out, "container reset preparation was superseded", 409)
+			return
+		}
 		message := containerTerminationMessage{containerStopIntent: intent, CleanupConfirmed: true}
-		if err := writeContainerTermination(message); err != nil {
+		if err = writeContainerTermination(message); err != nil {
+			w.mu.Unlock()
 			http.Error(out, "cannot persist container cleanup receipt", 409)
 			return
 		}
@@ -152,6 +218,7 @@ func (w *Worker) serveContainerStop(out http.ResponseWriter, r *http.Request, id
 	default:
 		close(w.reset)
 	}
+	w.mu.Unlock()
 }
 
 func (o *networkOwner) closeForContainerReset(ctx context.Context) error {
@@ -224,7 +291,7 @@ func (w *Worker) serveContainerReconcile(out http.ResponseWriter, r *http.Reques
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if proof.Kind != "" || !validContainerProofSource(proof) || !proof.CleanupConfirmed || proof.ContainerID == "" || proof.FinishedAt.IsZero() || proof.WorkerEpoch == w.workerEpoch || !w.matchesContainerIntent(proof.containerStopIntent) || w.book.StopIntent == nil || *w.book.StopIntent != proof.containerStopIntent {
+	if (proof.Kind != "" && proof.Kind != "force-delete" || proof.Kind == "force-delete" && proof.Graceful) || !validContainerProofSource(proof) || !proof.CleanupConfirmed || proof.ContainerID == "" || proof.FinishedAt.IsZero() || proof.WorkerEpoch == w.workerEpoch || !w.matchesContainerIntent(proof.containerStopIntent) || w.book.StopIntent == nil || *w.book.StopIntent != proof.containerStopIntent {
 		http.Error(out, "container proof does not match old execution", 409)
 		return
 	}

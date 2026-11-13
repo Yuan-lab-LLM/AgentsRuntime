@@ -13,6 +13,8 @@ import (
 )
 
 type book struct {
+	LastFaultRelease *faultSlotRecovery         `json:"last_fault_release,omitempty"`
+	FaultRecovery    *faultSlotRecovery         `json:"fault_recovery,omitempty"`
 	StopIntent       *containerStopIntent       `json:"stop_intent,omitempty"`
 	TerminationProof *containerTerminationProof `json:"termination_proof,omitempty"`
 	StopFinalized    bool                       `json:"stop_finalized,omitempty"`
@@ -38,7 +40,7 @@ func openBook(dir string) (*book, error) {
 	if err = json.Unmarshal(data, b); err != nil {
 		return nil, fmt.Errorf("invalid slot assignment: %w", err)
 	}
-	b.quarantined = b.Assignment != nil && (b.Assignment.State != "stopped" || b.TerminationProof != nil && !b.StopFinalized)
+	b.quarantined = b.Assignment != nil && (b.Assignment.State != "stopped" || (b.TerminationProof != nil || b.FaultRecovery != nil) && !b.StopFinalized && !b.faultFinalized())
 	return b, nil
 }
 
@@ -67,6 +69,7 @@ func (b *book) begin(req gateway.CreateGatewayRequest, epoch ...string) error {
 	previous, previousDigest := b.Assignment, b.Digest
 	previousIntent, previousProof := b.StopIntent, b.TerminationProof
 	previousFinalized := b.StopFinalized
+	previousFaultRecovery := b.FaultRecovery
 	previousMaintenance := b.Maintenance
 	b.Assignment = &Assignment{GatewayID: id, InstanceID: req.InstanceID, UserID: req.UserID, Generation: req.Generation, State: "starting", PodUID: req.PodUID}
 	if len(epoch) != 0 {
@@ -74,12 +77,14 @@ func (b *book) begin(req gateway.CreateGatewayRequest, epoch ...string) error {
 	}
 	b.StopIntent, b.TerminationProof = nil, nil
 	b.StopFinalized = false
+	b.FaultRecovery = nil
 	b.Maintenance = nil
 	b.Digest = digest
 	if err = b.save(); err != nil {
 		b.Assignment, b.Digest = previous, previousDigest
 		b.StopIntent, b.TerminationProof = previousIntent, previousProof
 		b.StopFinalized = previousFinalized
+		b.FaultRecovery = previousFaultRecovery
 		b.Maintenance = previousMaintenance
 		return err
 	}
@@ -100,3 +105,7 @@ func (b *book) stopped(id string) error {
 }
 
 func (b *book) save() error { return atomicJSON(b.path, b) }
+
+func (b *book) faultFinalized() bool {
+	return b.FaultRecovery != nil && sameFaultRecovery(b.FaultRecovery, b.LastFaultRelease)
+}
