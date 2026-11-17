@@ -520,6 +520,7 @@ class RedisClient {
         ? tls.connect({ host, port, servername: host })
         : net.connect({ host, port });
     this.socket = socket;
+    socket.setTimeout(30000, () => socket.destroy(new Error("Redis transport deadline exceeded")));
     this.parser = new RespParser();
     socket.on("data", (chunk) => {
       if (this.socket !== socket) return;
@@ -567,6 +568,7 @@ class RedisClient {
   connectedCommand(...args) {
     if (this.closed) return Promise.reject(new Error("redis client is closed"));
     if (!this.socket || this.socket.destroyed || !this.socket.writable) return Promise.reject(new Error("redis connection closed"));
+    if (this.pending.length >= 64) return Promise.reject(new Error("Redis command capacity exhausted; command not sent"));
     return new Promise((resolve, reject) => {
       this.pending.push({ resolve, reject });
       this.socket.write(encodeResp(args));
@@ -724,8 +726,298 @@ async function ensureDirs(cfg) {
 async function writeJson(file, value, fileMode = 0o664, dirMode = TEAM_SHARED_DIR_MODE) {
   await mkdirBestEffort(path.dirname(file), dirMode, "JSON parent");
   const tmp = file + "." + process.pid + "." + Date.now() + "." + randomUUID() + ".tmp";
-  await fs.writeFile(tmp, JSON.stringify(value, null, 2) + "\n", { encoding: "utf8", mode: fileMode });
+  const handle = await fs.open(tmp, "wx", fileMode);
+  try { await handle.writeFile(JSON.stringify(value, null, 2) + "\n"); await handle.sync(); }
+  finally { await handle.close(); }
   await fs.rename(tmp, file);
+  const parent = await fs.open(path.dirname(file), "r");
+  try { await parent.sync(); } finally { await parent.close(); }
+}
+
+const TERMINAL_SLOT_BYTES = 6 * 1024 * 1024;
+const TERMINAL_FRAME_HEADER = 128;
+const TERMINAL_BANK_BYTES = TERMINAL_SLOT_BYTES + TERMINAL_FRAME_HEADER;
+let terminalJournalLock = Promise.resolve();
+const terminalReceiptObservers = new Set();
+const terminalScanCursors = new Map();
+// One supervised gateway owns this PVC. Serialize admission and publication
+// across its accounts; a second gateway must never share this private state.
+function terminalJournal(cfg, limits = {}) {
+  const directory = path.join(path.resolve(runtimeStateDir(cfg), "../../.."), "terminal-delivery");
+  const id = envelope => createHash("sha256").update(JSON.stringify([cfg.teamId, cfg.memberId,
+    envelope.idempotencyKey || envelope.messageId || assignmentAttemptAlias(envelope)])).digest("hex");
+  const file = envelope => path.join(directory, id(envelope) + ".json");
+  const scope = envelope => JSON.stringify([String(cfg.teamId), cfg.memberId, envelope.rootTaskId || envelope.taskId || "",
+    envelope.assignmentId || envelope.workId || "", Number(envelope.revision || 1)]);
+  const proofFile = envelope => path.join(directory, "assignment-receipts", createHash("sha256").update(scope(envelope)).digest("hex") + ".json");
+  const locked = fn => { const next = terminalJournalLock.then(fn); terminalJournalLock = next.catch(() => {}); return next; };
+  async function writeAt(handle, bytes, position) {
+    for (let offset = 0; offset < bytes.length;) {
+      const result = await handle.write(bytes, offset, bytes.length - offset, position + offset);
+      if (!result.bytesWritten) throw Error("Terminal journal short write");
+      offset += result.bytesWritten;
+    }
+  }
+  async function frame(handle) {
+    let newest = null;
+    for (let index = 0; index < 2; index++) {
+      const header = Buffer.alloc(TERMINAL_FRAME_HEADER);
+      await handle.read(header, 0, header.length, index * TERMINAL_BANK_BYTES);
+      const match = /^CMJ3 ([1-9][0-9]*) ([0-9]+) ([a-f0-9]{64})\n/.exec(header.toString("ascii"));
+      if (!match || Number(match[2]) > TERMINAL_SLOT_BYTES) continue;
+      const body = Buffer.alloc(Number(match[2]));
+      let read = 0;
+      while (read < body.length) { const result = await handle.read(body, read, body.length - read, index * TERMINAL_BANK_BYTES + TERMINAL_FRAME_HEADER + read); if (!result.bytesRead) break; read += result.bytesRead; }
+      if (read !== body.length || createHash("sha256").update(match[1] + "\n").update(body).digest("hex") !== match[3]) continue;
+      try { const record = JSON.parse(body.toString("utf8")); if (!newest || Number(match[1]) > newest.generation) newest = { index, generation: Number(match[1]), record }; } catch {}
+    }
+    return newest;
+  }
+  async function readRecord(filename) {
+    const handle = await fs.open(filename, "r");
+    try {
+      const found = await frame(handle);
+      if (found) return found.record;
+      const prefix = Buffer.alloc(4096);
+      const { bytesRead } = await handle.read(prefix, 0, prefix.length, 0);
+      if (prefix[0] !== 123) throw Error("Terminal journal has no committed frame; execution retained for reconciliation");
+      const newline = prefix.subarray(0, bytesRead).indexOf(10);
+      return JSON.parse(newline >= 0 ? prefix.subarray(0, newline).toString("utf8") : await fs.readFile(filename, "utf8"));
+    } finally { await handle.close(); }
+  }
+  async function read(envelope) {
+    try { return await readRecord(file(envelope)); }
+    catch (error) { if (error.code === "ENOENT") return null; throw error; }
+  }
+  async function save(record) {
+    const body = Buffer.from(JSON.stringify(record));
+    const slotBytes = record.compact ? 4096 : TERMINAL_SLOT_BYTES;
+    if (body.length + 1 > slotBytes) throw Error("Terminal journal reserved result capacity exceeded; full outcome requires an existing artifact reference");
+    const target = file(record.envelope), temporary = target + ".tmp";
+    async function commit(handle, previous) {
+      const generation = (previous?.generation || 0) + 1, index = previous ? 1 - previous.index : 0;
+      const checksum = createHash("sha256").update(generation + "\n").update(body).digest("hex");
+      const header = Buffer.alloc(TERMINAL_FRAME_HEADER);
+      header.write(`CMJ3 ${generation} ${body.length} ${checksum}\n`, "ascii");
+      await writeAt(handle, body, index * TERMINAL_BANK_BYTES + TERMINAL_FRAME_HEADER);
+      await handle.sync();
+      await writeAt(handle, header, index * TERMINAL_BANK_BYTES);
+      await handle.sync();
+    }
+    if (!record.compact) {
+      const existing = await fs.open(target, "r+").catch(error => { if (error.code === "ENOENT") return null; throw error; });
+      if (existing) {
+        try { const previous = await frame(existing); if (previous) { await commit(existing, previous); return; } }
+        finally { await existing.close(); }
+      }
+    }
+    const handle = await fs.open(temporary, "w", 0o600);
+    try {
+      if (record.compact) await handle.writeFile(Buffer.concat([body, Buffer.alloc(slotBytes - body.length, 32)]));
+      else {
+        const block = Buffer.alloc(1024 * 1024);
+        for (let offset = 0; offset < 2 * TERMINAL_BANK_BYTES; offset += block.length) await writeAt(handle, block.subarray(0, Math.min(block.length, 2 * TERMINAL_BANK_BYTES - offset)), offset);
+        await handle.sync();
+        await commit(handle, null);
+      }
+      await handle.sync();
+    } finally { await handle.close(); }
+    await fs.rename(temporary, target);
+    const parent = await fs.open(directory, "r");
+    try { await parent.sync(); } finally { await parent.close(); }
+  }
+  async function admit(envelope) {
+    const existing = await read(envelope);
+    if (existing) return existing;
+    if (!(envelope.idempotencyKey || envelope.messageId || assignmentAttemptAlias(envelope))) throw Error("Terminal admission requires stable identity");
+    await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+    const names = (await fs.readdir(directory)).filter(name => /^[a-f0-9]{64}\.json$/.test(name));
+    const proofCount = (await fs.readdir(path.join(directory, "assignment-receipts")).catch(error => { if (error.code === "ENOENT") return []; throw error; })).length;
+    let team = 0, member = 0, pending = 0, compact = 0;
+    for (const name of names) {
+      const row = await readRecord(path.join(directory, name));
+      if (row.compact) { compact++; continue; }
+      pending++;
+      if (row.teamId === cfg.teamId) { team++; if (row.memberId === cfg.memberId) member++; }
+    }
+    if (pending >= (limits.global ?? 4096) || team >= (limits.team ?? 1024) || member >= (limits.member ?? 256) || (compact + proofCount + pending * 2 + 2) * 4096 > 64 * 1024 * 1024 || names.length + proofCount + pending + 2 > 65536)
+      throw Error("Terminal journal capacity exhausted; new execution not admitted");
+    const free = await fs.statfs(directory);
+    if (free.bavail * free.bsize < 4 * TERMINAL_SLOT_BYTES) throw Error("Terminal journal disk capacity exhausted; new execution not admitted");
+    const record = { version: 1, teamId: cfg.teamId, memberId: cfg.memberId, envelope, sourceStreamID: envelope.redisId || "", state: "admitted", publications: [] };
+    await save(record); return record;
+  }
+  async function state(envelope, value) {
+    return locked(async () => { const row = await admit(envelope); row.state = value; await save(row); return row; });
+  }
+  const wireBytes = value => eventStreamFields(value).reduce((total, field) => total + Buffer.byteLength(String(field)), 0);
+  async function materialize(row, publication) {
+    if (!publication.materializationPending) return;
+    const event = publication.event, body = String(event.resultMarkdown || event.result || event.text || "");
+    const digest = createHash("sha256").update(body).digest("hex");
+    const artifact = path.join(cfg.sharedDir, "results", safeName(row.envelope.taskId || row.envelope.rootTaskId), "terminal-" + digest + ".md");
+    await fs.mkdir(path.dirname(artifact), { recursive: true, mode: TEAM_SHARED_DIR_MODE });
+    const previous = await fs.readFile(artifact).catch(error => { if (error.code === "ENOENT") return null; throw error; });
+    if (!previous || previous.length !== Buffer.byteLength(body) || createHash("sha256").update(previous).digest("hex") !== digest) {
+      const temporary = artifact + ".tmp", handle = await fs.open(temporary, "w", 0o664);
+      try { await handle.writeFile(body); await handle.sync(); } finally { await handle.close(); }
+      await fs.rename(temporary, artifact);
+      const parent = await fs.open(path.dirname(artifact), "r"); try { await parent.sync(); } finally { await parent.close(); }
+    }
+    const reference = canonicalArtifactRef(cfg, artifact);
+    const explanation = `Full answer (${Buffer.byteLength(body)} bytes, SHA-256 ${digest}): [Open complete answer](${reference})`;
+    const payload = { ...event, result: undefined, text: event.nativePublicDelivery ? explanation : undefined,
+      resultMarkdown: explanation, resultBodyRef: reference, resultBodySHA256: digest, resultBodyBytes: Buffer.byteLength(body),
+      bodyExternalized: true, textTruncated: false, artifactRefs: [...new Set([...(event.artifactRefs || []), reference])] };
+    if (wireBytes(payload) > 60 * 1024) throw Error("Terminal metadata exceeds wire capacity; full original outcome remains in reserved storage");
+    publication.event = payload; publication.materializationPending = false;
+    await save(row);
+  }
+  return {
+    read, admit: envelope => locked(() => admit(envelope)),
+    async started(envelope) {
+      return locked(async () => {
+        const row = await admit(envelope);
+        if (row.state !== "admitted") return false;
+        row.state = "started";
+        await save(row);
+        return true;
+      });
+    },
+    uncertain: envelope => state(envelope, "started"), accepted: envelope => state(envelope, "accepted"),
+    async context(envelope, nextState, proof = {}) {
+      return locked(async () => {
+        const row = await admit(envelope), previous = row.contextDelivery;
+        if (row.compact) return null;
+        if (nextState === "queued" && !previous && row.state !== "admitted") return null;
+        if (nextState === "submitting" && (previous?.state !== "queued" || row.state !== "admitted")) return null;
+        if (previous?.state === "request_included" && nextState !== "request_included") return previous;
+        const fields = Object.fromEntries(["nativeSessionId", "nativeMessageId", "nativeRunId", "generation", "reason", "marker"].filter(key => proof[key] !== undefined).map(key => [key, typeof proof[key] === "string" ? proof[key].slice(0, 512) : proof[key]]));
+        row.contextDelivery = { ...previous, ...fields, state: nextState };
+        row.state = ["submitted", "native_context_consumed", "request_included"].includes(nextState) ? "accepted" : nextState === "queued" ? "admitted" : "started";
+        await save(row); return row.contextDelivery;
+      });
+    },
+    async stage(envelope, event) {
+      return locked(async () => {
+        const row = await admit(envelope);
+        // Same completion content uses the first persisted attempt/event IDs.
+        const semanticKey = createHash("sha256").update(JSON.stringify({ ...event, eventId: undefined, attemptId: undefined, at: undefined })).digest("hex");
+        const equivalent = row.publications.find(item => item.decision !== "rejected" && item.semanticKey === semanticKey);
+        if (equivalent) return equivalent;
+        if (row.compact) throw Error("Completed delivery identity is immutable; use a new corrective message identity");
+        const payload = { ...event };
+        if (payload.result === payload.resultMarkdown) delete payload.result;
+        const publication = { event: payload, semanticKey, streamId: "", materializationPending: wireBytes(payload) > 60 * 1024 };
+        row.publications.push(publication); row.state = "result_saved";
+        await save(row); // Reserve owns the full outcome before any artifact allocation.
+        try { await materialize(row, publication); } catch (error) { publication.deliveryError = String(error?.message || error); }
+        return publication;
+      });
+    },
+    async flush(redis, onlyEnvelope, reconcile = false) {
+      return locked(async () => {
+        const recovery = !onlyEnvelope || reconcile;
+        const deadline = Date.now() + 30000;
+        let names;
+        try { names = onlyEnvelope ? [path.basename(file(onlyEnvelope))] : (await fs.readdir(directory)).filter(name => /^[a-f0-9]{64}\.json$/.test(name)); }
+        catch (error) { if (error.code === "ENOENT") return; throw error; }
+        let closure = null;
+        if (recovery) {
+          const raw = await redis.command("GET", keyPrefix(cfg) + ":__cm_capacity:replay-source-closed");
+          if (raw) closure = JSON.parse(String(raw));
+        }
+        if (!onlyEnvelope) {
+          names.sort();
+          const cursor = terminalScanCursors.get(directory + cfg.memberId) || "";
+          names = [...names.filter(name => name > cursor), ...names.filter(name => name <= cursor)].slice(0, 128);
+        }
+        for (const name of names) {
+          if (!onlyEnvelope) terminalScanCursors.set(directory + cfg.memberId, name);
+          const row = await readRecord(path.join(directory, name));
+          if (row.teamId !== cfg.teamId || row.memberId !== cfg.memberId) continue;
+          if (recovery && !row.compact) {
+            const proof = await readJson(proofFile(row.envelope));
+            if (proof?.schema === 1 && proof.scope === scope(row.envelope) && proof.origin !== id(row.envelope) &&
+                proof.publication?.decision === "accepted" && proof.publication?.ack?.decision === "accepted") {
+              row.resolvedByAcceptedCompletion = proof.origin;
+              row.executionMayHaveOccurred = row.state === "started";
+              if (!row.publications.some(item => item.event.eventId === proof.publication.event.eventId)) row.publications.push({ ...proof.publication, inherited: true });
+              row.state = "accepted"; await save(row);
+            }
+          }
+          for (const publication of row.publications) {
+            if (!publication.streamId) {
+              await materialize(row, publication);
+              const receipt = await xaddTerminalOnce(redis, cfg, "delivery-" + createHash("sha256").update(publication.event.eventId).digest("hex"), publication.event);
+              if (!receipt.streamId) throw Error("Terminal publication returned no durable receipt");
+              publication.streamId = receipt.streamId; await save(row);
+            }
+            const event = publication.event;
+            if (!recovery || event.event !== "completion_proposed" || ["accepted", "rejected"].includes(publication.decision)) continue;
+            for (const key of [completionAckKey(cfg, event.completionId, event.attemptId), completionStateKey(cfg, event.completionId)]) {
+              const raw = await redis.command("GET", key);
+              if (!raw) continue;
+              const ack = JSON.parse(String(raw));
+              if (ack.completionId && ack.completionId !== event.completionId || ack.attemptId && ack.attemptId !== event.attemptId) continue;
+              if ((ack.assignmentId || ack.workId) && (ack.assignmentId || ack.workId) !== (event.assignmentId || event.workId) ||
+                  ack.revision != null && Number(ack.revision) !== Number(event.revision || 1)) continue;
+              if (!["accepted", "rejected"].includes(ack.decision)) continue;
+              const active = await readJson(privateActiveAssignmentPath(cfg));
+              if (ack.decision === "accepted" && active && active.messageId === row.envelope.messageId &&
+                  Number(active.revision || 1) === Number(row.envelope.revision || 1)) {
+                await writeLocalStatus(cfg, { availability: event.status === "succeeded" ? "idle" : "blocked", runtimeStatus: event.status,
+                  currentTaskId: event.taskId, currentAssignmentId: event.assignmentId, lastSummary: event.summary,
+                  artifactRefs: event.artifactRefs, resultContentHash: event.contentHash || event.resultContentHash });
+                await markActiveAssignmentTerminal(cfg, event.taskId, event.assignmentId, event.status);
+              }
+              publication.decision = ack.decision; publication.ack = ack; await save(row); break;
+            }
+          }
+          const terminal = row.publications.filter(item => item.event.event === "completion_proposed").at(-1);
+          if (recovery && terminal?.decision === "accepted" && !terminal.inherited && terminal.ack &&
+              String(terminal.ack.teamId) === String(cfg.teamId) && terminal.ack.memberId === cfg.memberId &&
+              terminal.ack.rootTaskId === (row.envelope.rootTaskId || row.envelope.taskId) &&
+              terminal.ack.completionId === terminal.event.completionId && terminal.ack.attemptId === terminal.event.attemptId &&
+              (terminal.event.assignmentId || terminal.event.workId) === (row.envelope.assignmentId || row.envelope.workId) &&
+              Number(terminal.event.revision) === Number(row.envelope.revision || 1)) {
+            const proof = { schema: 1, scope: scope(row.envelope), origin: id(row.envelope), publication: {
+              streamId: terminal.streamId, decision: "accepted", ack: terminal.ack, semanticKey: terminal.semanticKey,
+              event: Object.fromEntries(["event", "eventId", "completionId", "attemptId", "status", "assignmentId", "workId", "revision"].map(key => [key, terminal.event[key]])) } };
+            await writeJson(proofFile(row.envelope), proof, 0o600, 0o700);
+          }
+          if (recovery && terminal?.decision === "accepted" && row.publications.every(item => item.streamId) && row.state === "accepted") {
+            if (!row.compact) {
+              const artifact = path.join(cfg.sharedDir, "results", safeName(row.envelope.taskId || row.envelope.rootTaskId), "delivery-" + id(row.envelope) + ".json");
+              await writeJson(artifact, row, 0o600);
+              row.resultRef = canonicalArtifactRef(cfg, artifact);
+              row.envelope = Object.fromEntries(["idempotencyKey", "messageId", "taskId", "rootTaskId", "assignmentId", "workId", "revision", "redisId"].filter(key => row.envelope[key] !== undefined).map(key => [key, row.envelope[key]]));
+              row.publications = [{ semanticKey: terminal.semanticKey, streamId: terminal.streamId, decision: "accepted", ack: terminal.ack, inherited: terminal.inherited, event: {
+                event: "completion_proposed", eventId: terminal.event.eventId, completionId: terminal.event.completionId,
+                attemptId: terminal.event.attemptId, status: terminal.event.status, resultBodyRef: row.resultRef } }];
+              row.compact = true; row.state = "accepted"; await save(row);
+            }
+            const source = /^(\d+)-\d+$/.exec(row.sourceStreamID || "");
+            if (source && closure?.schema === 1 && /^[a-f0-9]{64}$/.test(closure.proof_sha256 || "") && closure.committed_cursor &&
+                Number.isFinite(Date.parse(closure.verified_at)) && Number(closure.closed_before_ms) > 0 && Number(source[1]) <= Number(closure.closed_before_ms)) {
+              await fs.unlink(file(row.envelope));
+              const proof = await readJson(proofFile(row.envelope));
+              if (/^[a-f0-9]{64}$/.test(proof?.origin || "") && !await readRecord(path.join(directory, proof.origin + ".json")).catch(error => { if (error.code === "ENOENT") return null; throw error; })) {
+                let unresolved = false;
+                for (const candidate of (await fs.readdir(directory)).filter(value => /^[a-f0-9]{64}\.json$/.test(value))) {
+                  const other = await readRecord(path.join(directory, candidate));
+                  if (!other.compact && other.teamId === cfg.teamId && other.memberId === cfg.memberId && scope(other.envelope) === scope(row.envelope)) { unresolved = true; break; }
+                }
+                if (!unresolved) await fs.unlink(proofFile(row.envelope));
+              }
+              const parent = await fs.open(directory, "r"); try { await parent.sync(); } finally { await parent.close(); }
+            }
+          }
+          if (Date.now() >= deadline) break;
+        }
+      });
+    },
+  };
 }
 function analyzeResponseLocale(locale, text) {
   const normalizedLocale = trim(locale).toLowerCase();
@@ -4319,6 +4611,7 @@ function normalizeEnvelope(raw) {
     schemaVersion: raw.v || raw.schemaVersion || WIRE_SCHEMA_VERSION,
     protocolVersion: raw.protocolVersion || raw.protocol_version || raw.v || WIRE_SCHEMA_VERSION,
     messageId: raw.messageId || raw.message_id || raw.id || ("msg_" + randomUUID()),
+    redisId: raw.redisId,
     taskId,
     rootTaskId: rootTaskId || taskId,
     rootMessageId: raw.rootMessageId || raw.root_message_id || textRootMessageId || raw.messageId || raw.message_id,
@@ -4752,7 +5045,7 @@ function createRuntime(api) {
     if (decision === "accepted") {
       await withRedis(cfg, redis, async (client) => {
         await client.command("SET", completionKey(cfg, completionId), streamId || attemptId, "EX", 604800);
-      });
+      }).catch(() => {}); // The authoritative receipt and local journal already retain identity.
       await writeLocalStatus(cfg, {
         availability: completionStatus === "succeeded" ? "idle" : "blocked",
         runtimeStatus: completionStatus,
@@ -4852,7 +5145,7 @@ function createRuntime(api) {
     const messageId = trim(meta.eventMessageId) || envelope.messageId || completionMessageId || ("msg_" + randomUUID());
     const inReplyTo = trim(meta.inReplyTo) || envelope.messageId;
 
-    const attemptId = trim(meta.attemptId) || ("attempt_" + randomUUID());
+    let attemptId = trim(meta.attemptId) || ("attempt_" + randomUUID());
     const workflowFinal = singleMember || (meta.workflowFinal === undefined ? currentIsLeader : boolFrom(meta.workflowFinal, false));
     const finalAnswerReady = singleMember || (meta.finalAnswerReady === undefined ? currentIsLeader : boolFrom(meta.finalAnswerReady, false));
     const remainingActions = Array.isArray(meta.remainingActions) ? meta.remainingActions.filter(Boolean) : [];
@@ -4879,7 +5172,6 @@ function createRuntime(api) {
       lastSummary: summary,
       artifactRefs,
     });
-    const terminal = await withRedis(cfg, meta.redis, async (redis) => {
 		const completionProvenance = completionProposalProvenance(meta);
       const proposal = taskEvent(cfg, "completion_proposed", envelope, {
         messageId,
@@ -4973,7 +5265,12 @@ function createRuntime(api) {
         verificationMode: verificationEvidence.verificationMode,
         browserVerification: verificationEvidence.browserVerification,
       });
-      const streamId = await xaddJson(redis, eventsKey(cfg), proposal);
+      const journal = terminalJournal(cfg);
+      const saved = await journal.stage(envelope, proposal);
+      attemptId = saved.event.attemptId;
+      const terminal = await withRedis(cfg, meta.redis, async (redis) => {
+      await journal.flush(redis, envelope);
+      const streamId = (await journal.read(envelope)).publications.find(item => item.event.eventId === saved.event.eventId)?.streamId;
       await recordTurnFacts(redis, cfg, envelope, {
         completionProposed: true,
         artifactRefs,
@@ -4986,7 +5283,7 @@ function createRuntime(api) {
         Number(meta.ackTimeoutMs || 10000),
       );
       return { published: true, streamId: String(streamId || ""), ack };
-    });
+    }).catch(error => ({ published: false, streamId: "", ack: null, pendingReason: String(error?.message || error) }));
     const decision = await persistCompletionDecision({
       cfg,
       taskId,
@@ -5004,7 +5301,9 @@ function createRuntime(api) {
     if (decision === "accepted" && typeof meta.onAccepted === "function") {
       await meta.onAccepted();
     }
-    if (decision === "submitted" || decision === "deferred") {
+    const observerKey = cfg.teamId + ":" + cfg.memberId + ":" + attemptId;
+    if ((decision === "submitted" || decision === "deferred") && terminal?.published && terminalReceiptObservers.size < 32 && !terminalReceiptObservers.has(observerKey)) {
+      terminalReceiptObservers.add(observerKey);
       void (async () => {
         const lateRedis = new RedisClient(cfg.redisUrl);
         await lateRedis.connect();
@@ -5057,14 +5356,15 @@ function createRuntime(api) {
         } finally {
           lateRedis.close();
         }
-      })().catch(() => {});
+      })().catch(() => {}).finally(() => terminalReceiptObservers.delete(observerKey));
     }
     return {
       published: terminal?.published !== false,
       completionId,
       attemptId,
       decision,
-      reason: terminal?.ack?.reason || (decision === "submitted" ? "ack_timeout" : ""),
+      durable: true,
+      reason: terminal?.ack?.reason || terminal?.pendingReason || (decision === "submitted" ? "ack_timeout" : ""),
       acknowledgement: terminal?.ack || null,
     };
   }
@@ -5144,6 +5444,8 @@ function createRuntime(api) {
       });
     }
 
+    const failureJournal = terminalJournal(cfg);
+    await failureJournal.stage(envelope || { messageId, taskId }, envelope ? taskEvent(cfg, "task_failed", envelope, base) : eventFor(cfg, "task_failed", base));
     await withRedis(cfg, meta.redis, async (redis) => {
       if (meta.eventName === "message_failed") {
         await xaddJson(
@@ -5152,13 +5454,8 @@ function createRuntime(api) {
           envelope ? taskEvent(cfg, "message_failed", envelope, base) : eventFor(cfg, "message_failed", base),
         );
       }
-      await xaddTerminalOnce(
-        redis,
-        cfg,
-        completionId,
-        envelope ? taskEvent(cfg, "task_failed", envelope, base) : eventFor(cfg, "task_failed", base),
-      );
-    });
+      await failureJournal.flush(redis, envelope || { messageId, taskId });
+    }).catch(() => {}); // The fsynced terminal journal owns publication retry.
     if (envelope) {
       await markActiveAssignmentTerminal(
         cfg,
@@ -6378,6 +6675,15 @@ function createRuntime(api) {
         throw new Error("team_complete_task status must be succeeded, failed or cancelled");
       }
       const completionEnvelope = await resolveActiveAssignmentEnvelope(cfg, params || {}, { includeTerminal: true, preferBusinessAssignment: true });
+      const rawProposal = JSON.stringify(params || {});
+      if (Buffer.byteLength(rawProposal) > 1024 * 1024) {
+        const journal = terminalJournal(cfg);
+        await journal.stage(completionEnvelope, { event: "task_progress", eventKind: "runtime_reconciliation_needed",
+          eventId: "oversized-proposal-" + createHash("sha256").update(rawProposal).digest("hex"),
+          resultMarkdown: rawProposal, executionMayHaveOccurred: true, nonAuthoritative: true, stateEffect: "none", rootTaskTerminal: false });
+        await journal.uncertain(completionEnvelope);
+        throw Error("Completion proposal exceeds 1 MiB encoded JSON; full raw proposal retained for reconciliation. Native execution may have occurred. Save larger answers as complete artifacts and submit their references; do not rerun the business action.");
+      }
       const resultTaskId = completionTaskIdFor(
         completionEnvelope,
         params.rootTaskId || params.root_task_id || reportedTaskId,
@@ -6482,14 +6788,14 @@ function createRuntime(api) {
 
       if (cfg.enabled && cfg.redisUrl && cfg.memberId && hasRequiredRedisTeamKeys(cfg)) {
         const redis = new RedisClient(cfg.redisUrl);
-        await redis.connect();
+        await redis.connect().catch(() => {});
         try {
           let terminalEnvelope = completionEnvelope || (activeTaskMatches(params.taskId)
             ? activeEnvelope
             : await readTaskEnvelope(cfg, params.taskId));
           let currentWorkflow = null;
           if (terminalEnvelope && taskMatchesEnvelope(terminalEnvelope, params.taskId)) {
-            currentWorkflow = await readCurrentRootWorkflowState(redis, cfg, resultTaskId);
+            currentWorkflow = await readCurrentRootWorkflowState(redis, cfg, resultTaskId).catch(() => null);
             if (currentWorkflow) {
               const currentLedgerVersion = Number(currentWorkflow.ledgerVersion || 0);
               const currentPlanVersion = Number(currentWorkflow.planVersion || 0);
@@ -6632,6 +6938,7 @@ function activeContextMatches(cfg, active, notice) {
 
 async function startActiveContextWatcher(cfg, { getActive, deliver, observe, intervalMs = 5000 }, log = console) {
   const redis = new RedisClient(cfg.redisUrl);
+  const journal = terminalJournal(cfg);
   const file = path.join(runtimeStateDir(cfg), "active-context-delivery.json");
   await ensureDirs(cfg);
   let records = {};
@@ -6641,10 +6948,9 @@ async function startActiveContextWatcher(cfg, { getActive, deliver, observe, int
     writes = writes.catch(() => {}).then(async () => {
       const entries = Object.entries(records);
       if (entries.length > 64) for (const [key] of entries.slice(0, entries.length - 64)) delete records[key];
-      await fs.writeFile(file + ".tmp", JSON.stringify(records), { mode: 0o600 });
-      await fs.rename(file + ".tmp", file);
+      await writeJson(file, records, 0o600, 0o700);
     });
-    return writes;
+    return writes.catch(() => log.warn?.("redis-team: context mirror deferred; durable admission journal owns recovery"));
   };
   const emit = async record => {
     try { await xaddJson(redis, eventsKey(cfg), taskEvent(cfg, "task_progress", record.envelope, {
@@ -6658,9 +6964,13 @@ async function startActiveContextWatcher(cfg, { getActive, deliver, observe, int
     const changed = record.state !== state;
     if (!changed && record.reportedState === state && Object.entries(proof).every(([key, value]) => record[key] === value)) return;
     Object.assign(record, proof, { state, updatedAt: nowIso() });
+    await journal.context(record.envelope, state, proof);
     await persist();
     if (changed || record.reportedState !== state) { if (await emit(record)) { record.reportedState = state; await persist(); } }
-    if (["submitted", "native_context_consumed", "request_included"].includes(state)) await redis.command("SET", processedMessageKey(cfg, record.envelope.idempotencyKey), record.envelope.messageId, "EX", 604800);
+    if (["submitted", "native_context_consumed", "request_included"].includes(state)) {
+      try { await redis.command("SET", processedMessageKey(cfg, record.envelope.idempotencyKey), record.envelope.messageId, "EX", 604800); }
+      catch { log.warn?.("redis-team: context transport marker deferred; durable accepted identity retained"); }
+    }
   }
   async function confirm(messageId, proof = {}) {
     const record = records[trim(messageId)], active = await getActive();
@@ -6682,13 +6992,17 @@ async function startActiveContextWatcher(cfg, { getActive, deliver, observe, int
         const envelope = normalizeEnvelope(message);
         if (!activeContextMatches(cfg, active, envelope) || await redis.command("GET", processedMessageKey(cfg, envelope.idempotencyKey))) continue;
         if (await workflowReminderIsStale(cfg, envelope, log)) continue;
+        const admission = await journal.admit(envelope);
+        let durableContext = admission.contextDelivery;
+        if (!durableContext) durableContext = await journal.context(envelope, "queued", { generation: active.generation });
+        if (!durableContext) continue;
         if (!records[envelope.messageId] && Object.keys(records).length >= 64) {
           for (const [key, old] of Object.entries(records)) {
             if (!activeContextMatches(cfg, active, old.envelope) || old.state === "request_included") { delete records[key]; break; }
           }
         }
         if (!records[envelope.messageId] && Object.keys(records).length < 64) {
-          records[envelope.messageId] = { envelope, state: "queued", receivedAt: nowIso(), generation: active.generation };
+          records[envelope.messageId] = { envelope, receivedAt: nowIso(), generation: active.generation, ...durableContext };
           await persist();
         }
       }
@@ -6704,15 +7018,21 @@ async function startActiveContextWatcher(cfg, { getActive, deliver, observe, int
         if (await workflowReminderIsStale(cfg, record.envelope, log)) continue;
         const marker = "[team-context:" + createHash("sha256").update(record.envelope.messageId).digest("hex").slice(0, 24) + "]";
         record.marker = marker;
+        const claim = await journal.context(record.envelope, "submitting", { marker, generation: current.generation });
+        if (!claim) {
+          const durable = (await journal.read(record.envelope))?.contextDelivery;
+          if (durable) Object.assign(record, durable);
+          continue;
+        }
         record.state = "submitting";
         await persist(); // Do not replay an uncertain external side effect.
         try {
           const outcome = await deliver(record.envelope, marker + "\n" + String(record.envelope.text || ""), current);
           if (outcome?.state) await transition(record, outcome.state, outcome);
-          else { record.state = "queued"; await persist(); }
+          else await transition(record, "unconfirmed");
         } catch { await transition(record, "unconfirmed"); }
       }
-    } catch { if (!stopped) log.warn?.("redis-team: active context observation unavailable; serial delivery retained"); }
+    } catch { cursor = null; if (!stopped) log.warn?.("redis-team: active context observation unavailable; durable execution identity retained"); }
     finally { busy = false; }
   }
   await redis.connect();
@@ -6774,6 +7094,7 @@ async function startConsumer(cfg, onMessage, onProcessingFailure, log) {
   async function emitPresence() {
     try {
 		const maintenance = await teamMaintenanceState(presenceRedis, cfg);
+      if (!maintenance.enabled) await terminalJournal(cfg).flush(presenceRedis);
       const status = await writeLocalStatus(cfg, {
         liveness: "online",
 		maintenance: maintenance.enabled,
@@ -6792,8 +7113,10 @@ async function startConsumer(cfg, onMessage, onProcessingFailure, log) {
   async function loop() {
     let readID = "0";
     let pendingDrainBatches = 3;
+    let nextPendingProbe = Date.now() + 5000;
     while (running) {
       try {
+        if (Date.now() >= nextPendingProbe) { readID = "0"; pendingDrainBatches = 3; nextPendingProbe = Date.now() + 5000; }
 		const maintenance = await teamMaintenanceState(redis, cfg);
 		if (maintenance.enabled) {
 			await emitPresence();
@@ -6857,9 +7180,27 @@ async function startConsumer(cfg, onMessage, onProcessingFailure, log) {
               await redis.command("XACK", inboxKey(cfg), cfg.consumerGroup, msg.redisId);
               continue;
             }
+            const journal = terminalJournal(cfg);
+            const admission = await journal.admit(envelope);
+            if (admission.state === "accepted" || admission.state === "result_saved") {
+              await journal.flush(redis, envelope);
+              await journal.accepted(envelope);
+              await redis.command("SET", processedKey, envelope.messageId, "EX", 604800);
+              await redis.command("XACK", inboxKey(cfg), cfg.consumerGroup, msg.redisId);
+              continue;
+            }
+            if (admission.state === "started") {
+              log.warn("redis-team: execution outcome uncertain; original work retained for explicit reconciliation " + envelope.messageId);
+              continue;
+            }
+            // Admission is only a snapshot. The active-context watcher may
+            // claim this identity while we await I/O; only the locked CAS
+            // authorizes native execution. A lost claim remains pending.
+            if (!await journal.started(envelope)) continue;
             if (isContextOnlyEnvelope(envelope)) {
               log.info("redis-team: dispatching context-only notification " + envelope.messageId);
               await onMessage(envelope);
+              await journal.accepted(envelope);
               await redis.command("SET", processedKey, envelope.messageId, "EX", 604800);
               await redis.command("XACK", inboxKey(cfg), cfg.consumerGroup, msg.redisId);
               continue;
@@ -6876,6 +7217,7 @@ async function startConsumer(cfg, onMessage, onProcessingFailure, log) {
               }),
             );
             await onMessage(envelope);
+            await journal.accepted(envelope);
             await redis.command("SET", processedKey, envelope.messageId, "EX", 604800);
             await redis.command("XACK", inboxKey(cfg), cfg.consumerGroup, msg.redisId);
           } catch (err) {
@@ -6886,6 +7228,13 @@ async function startConsumer(cfg, onMessage, onProcessingFailure, log) {
             const error = err instanceof Error ? err.message : String(err);
             log.error("redis-team: message processing failed: " + error);
             const envelope = normalizeEnvelope(msg) || {};
+            const saved = await terminalJournal(cfg).read(envelope);
+            if (saved || /capacity exhausted/.test(error)) {
+              // Admission/transport faults never turn already executed work
+              // into a failed unexecuted task, and never ACK an uncertain run.
+              log.warn("redis-team: durable delivery retained for retry/reconciliation " + envelope.messageId);
+              continue;
+            }
             if (typeof onProcessingFailure === "function") {
               await onProcessingFailure(envelope, error);
             } else {
@@ -7032,13 +7381,14 @@ const progressParameters = {
 
 const completeParameters = {
   type: "object",
+  description: "Maximum encoded proposal is 1 MiB JSON. Save larger full answers as artifacts first and pass their references; never truncate a completed result.",
   additionalProperties: false,
   required: ["status", "summary"],
   properties: {
     taskId: { type: "string", description: "Optional task/root/assignment alias. Omit it in an active Team turn rather than inventing an id; the Runtime restores the canonical assignment envelope." },
     status: { type: "string", enum: ["succeeded", "failed", "cancelled"] },
     summary: { type: "string" },
-    resultMarkdown: { type: "string" },
+    resultMarkdown: { type: "string", maxLength: 1048576, description: "Complete answer within the 1 MiB total encoded proposal limit, or an explicit reference to its previously saved full artifact." },
     artifactRefs: { type: "array", items: { type: "string" } },
     reviewedArtifactRefs: {
       type: "array",

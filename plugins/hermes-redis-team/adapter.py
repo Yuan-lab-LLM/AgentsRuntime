@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
+import errno
+from contextlib import contextmanager
 import base64
 import hashlib
 import hmac
@@ -188,10 +191,18 @@ def _ensure_shared_directory(path: Path) -> None:
 def _atomic_write_json(path: Path, value: Any) -> None:
     _ensure_shared_directory(path.parent)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{int(time.time() * 1000)}.{uuid.uuid4().hex}.tmp")
-    tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    with tmp.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
     tmp.chmod(TEAM_SHARED_FILE_MODE)
     tmp.replace(path)
     path.chmod(TEAM_SHARED_FILE_MODE)
+    descriptor = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _atomic_write_text(path: Path, value: str) -> None:
@@ -532,6 +543,12 @@ def _context_notice_path(settings: RedisTeamSettings) -> Path:
     return settings.shared_path / ".hermes-redis-team" / f"context-{_safe_name(settings.member_id)}.json"
 
 
+def _load_context_notices(settings: RedisTeamSettings) -> dict:
+    # The auxiliary file is a bounded observation mirror, never submission authority.
+    entries = _read_json(_context_notice_path(settings)) or {}
+    return TerminalJournal(settings).recover_context(entries)
+
+
 def _write_online_status(settings: RedisTeamSettings, patch: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     # A new connected publisher cannot inherit a previous process's offline
     # marker. Business progress remains unchanged and is never inferred here.
@@ -542,12 +559,13 @@ def _record_context_request(settings: RedisTeamSettings, kwargs: dict[str, Any])
     # Observe the actual prepared request, not a Redis ACK. Retain no request
     # body, tool output or reasoning in the delivery journal.
     with _CONTEXT_NOTICE_LOCK:
-        entries = _read_json(_context_notice_path(settings)) or {}
+        entries = _load_context_notices(settings)
         request = json.dumps(kwargs.get("request_messages") or [], ensure_ascii=False)
         changed = False
         for item in entries.values():
-            if item.get("state") in {"queued", "submitted"} and item.get("marker") in request:
+            if item.get("state") in {"queued", "submitting", "unconfirmed", "submitted"} and item.get("marker") in request:
                 item.update(state="request_included", includedAt=_now_iso(), apiRequestId=_trim(kwargs.get("api_request_id")), nativeSessionId=_trim(kwargs.get("session_id")))
+                TerminalJournal(settings).context(item["envelope"], "request_included", {"nativeSessionId": _trim(kwargs.get("session_id"))})
                 item.pop("text", None)
                 changed = True
         if changed:
@@ -1952,7 +1970,7 @@ class AsyncRedisClient:
         host = self._url.hostname or "localhost"
         port = self._url.port or (6380 if scheme == "rediss" else 6379)
         ssl_ctx = ssl.create_default_context() if scheme == "rediss" else None
-        self._reader, self._writer = await asyncio.open_connection(host, port, ssl=ssl_ctx)
+        self._reader, self._writer = await asyncio.wait_for(asyncio.open_connection(host, port, ssl=ssl_ctx), timeout=10)
         if self._url.password:
             if self._url.username:
                 await self.command("AUTH", unquote(self._url.username), unquote(self._url.password))
@@ -1973,8 +1991,12 @@ class AsyncRedisClient:
                 frame.append(part)
                 frame.append(b"\r\n")
             self._writer.write(b"".join(frame))
-            await self._writer.drain()
-            return await self._read_value()
+            try:
+                await asyncio.wait_for(self._writer.drain(), timeout=10)
+                return await asyncio.wait_for(self._read_value(), timeout=30)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                self.close()  # A late reply must never be consumed by another command.
+                raise
 
     async def _read_value(self) -> Any:
         assert self._reader is not None
@@ -2055,11 +2077,458 @@ async def _publish_once(
     *,
     ttl_seconds: int = 7 * 24 * 60 * 60,
 ) -> dict[str, Any]:
-    claimed = await redis.command("SET", dedupe_key, json.dumps(event, ensure_ascii=False), "NX", "EX", ttl_seconds)
-    if claimed != "OK":
-        return {"published": False, "streamId": ""}
-    stream_id = await xadd_json(redis, events_key(settings), event)
-    return {"published": True, "streamId": stream_id}
+    # Exact OpenClaw terminal script, also allowed by the managed CM bridge.
+    # Never reserve a dedup key before XADD: OOM would lose the event forever.
+    script = "\n".join([
+        "local existing = redis.call('GET', KEYS[1])",
+        "if existing then return {0, existing} end",
+        "local streamId = redis.call('XADD', KEYS[2], '*', unpack(ARGV))",
+        "redis.call('SET', KEYS[1], streamId)",
+        "return {1, streamId}",
+    ])
+    result = await redis.command("EVAL", script, 2, dedupe_key, events_key(settings),
+                                 "payload", json.dumps(event, ensure_ascii=False))
+    return {"published": int(result[0]) == 1, "streamId": str(result[1])}
+
+
+_TERMINAL_SCAN_CURSORS = {}
+_CONTEXT_SCAN_CURSORS = {}
+
+
+class TerminalJournal:
+    """Bounded PVC handoff, never a queue that re-executes business work.
+
+    Retained receipts are reclaimed only by verified Team lifecycle cleanup;
+    quota exhaustion rejects new admission rather than expiring replay safety.
+    flock covers the Gateway and Hermes tool subprocesses on the same PVC.
+    """
+    SLOT_BYTES = 6 * 1024 * 1024
+    HEADER_BYTES = 128
+    BANK_BYTES = SLOT_BYTES + HEADER_BYTES
+
+    def __init__(self, settings, *, global_limit=4096, team_limit=1024, member_limit=256):
+        self.settings = settings
+        self.directory = settings.shared_path / ".hermes-redis-team" / "terminal-delivery"
+        self.limits = global_limit, team_limit, member_limit
+
+    def _file(self, envelope):
+        identity = envelope.get("idempotencyKey") or envelope.get("messageId") or json.dumps(_assignment_identity(envelope))
+        digest = hashlib.sha256(json.dumps([self.settings.team_id, self.settings.member_id, identity]).encode()).hexdigest()
+        return self.directory / (digest + ".json")
+
+    def _scope(self, envelope):
+        return json.dumps([str(self.settings.team_id), self.settings.member_id, envelope.get("rootTaskId") or envelope.get("taskId") or "",
+                           envelope.get("assignmentId") or envelope.get("workId") or "", int(envelope.get("revision") or 1)])
+
+    def _proof_file(self, envelope):
+        return self.directory / "assignment-receipts" / (hashlib.sha256(self._scope(envelope).encode()).hexdigest() + ".json")
+
+    @contextmanager
+    def _locked(self):
+        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock_file = self.directory / ".lock"
+        try:
+            lock = lock_file.open("r+b")
+        except FileNotFoundError:
+            try:
+                lock = lock_file.open("x+b")
+            except FileExistsError:
+                lock = lock_file.open("r+b")
+        with lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
+
+    def read(self, envelope):
+        try:
+            return self._read_record(self._file(envelope))
+        except FileNotFoundError:
+            return None
+
+    @classmethod
+    def _frames(cls, handle):
+        newest = None
+        for index in range(2):
+            handle.seek(index * cls.BANK_BYTES)
+            header = handle.read(cls.HEADER_BYTES)
+            match = re.match(rb"CMJ3 ([1-9][0-9]*) ([0-9]+) ([a-f0-9]{64})\n", header)
+            if not match or int(match[2]) > cls.SLOT_BYTES:
+                continue
+            body = handle.read(int(match[2]))
+            if len(body) != int(match[2]) or hashlib.sha256(match[1] + b"\n" + body).hexdigest().encode() != match[3]:
+                continue
+            try:
+                record = json.loads(body)
+                if newest is None or int(match[1]) > newest["generation"]:
+                    newest = {"index": index, "generation": int(match[1]), "record": record}
+            except (ValueError, UnicodeError):
+                pass
+        return newest
+
+    @classmethod
+    def _read_record(cls, file):
+        with file.open("rb") as handle:
+            found = cls._frames(handle)
+            if found:
+                return found["record"]
+            handle.seek(0)
+            return json.loads(handle.readline())  # Legacy JSON/compact receipts.
+
+    def _save(self, row):
+        data = json.dumps(row, ensure_ascii=False).encode()
+        slot_bytes = 4096 if row.get("compact") else self.SLOT_BYTES
+        if len(data) + 1 > slot_bytes:
+            raise RuntimeError("Terminal journal reserved capacity exceeded; execution retained")
+        target = self._file(row["envelope"])
+        temporary = target.with_suffix(".tmp")
+        def write_at(handle, body, offset):
+            position = 0
+            while position < len(body):
+                written = os.pwrite(handle.fileno(), body[position:], offset + position)
+                if not written:
+                    raise OSError("Terminal journal short write")
+                position += written
+
+        def commit(handle, previous):
+            generation = previous["generation"] + 1 if previous else 1
+            index = 1 - previous["index"] if previous else 0
+            digest = hashlib.sha256(str(generation).encode() + b"\n" + data).hexdigest()
+            header = f"CMJ3 {generation} {len(data)} {digest}\n".encode().ljust(self.HEADER_BYTES, b"\x00")
+            write_at(handle, data, index * self.BANK_BYTES + self.HEADER_BYTES)
+            os.fsync(handle.fileno())
+            write_at(handle, header, index * self.BANK_BYTES)
+            os.fsync(handle.fileno())
+
+        if not row.get("compact"):
+            try:
+                handle = target.open("r+b", buffering=0)
+            except FileNotFoundError:
+                handle = None
+            if handle:
+                with handle:
+                    previous = self._frames(handle)
+                    if previous:
+                        commit(handle, previous)
+                        return
+        with temporary.open("wb") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            if row.get("compact"):
+                handle.write(data + b"\n" + b" " * (slot_bytes - len(data) - 1))
+            else:
+                block = b"\x00" * (1024 * 1024)
+                remaining = 2 * self.BANK_BYTES
+                while remaining:
+                    written = handle.write(block[:min(len(block), remaining)])
+                    remaining -= written
+            handle.flush()
+            os.fsync(handle.fileno())
+            if not row.get("compact"):
+                commit(handle, None)
+        temporary.replace(target)
+        descriptor = os.open(self.directory, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _admit(self, envelope):
+        existing = self.read(envelope)
+        if existing:
+            return existing
+        rows = [self._read_record(file) for file in self.directory.glob("*.json")]
+        compact_count = sum(bool(row.get("compact")) for row in rows)
+        proof_count = len(list((self.directory / "assignment-receipts").glob("*.json")))
+        pending_count = len(rows) - compact_count
+        if (compact_count + proof_count + pending_count * 2 + 2) * 4096 > 64 * 1024 * 1024 or len(rows) + proof_count + pending_count + 2 > 65536:
+            raise RuntimeError("Terminal receipt capacity exhausted; new execution not admitted")
+        pending = [row for row in rows if not row.get("compact")]
+        team = [row for row in pending if row["teamId"] == self.settings.team_id]
+        member = [row for row in team if row["memberId"] == self.settings.member_id]
+        if any(count >= limit for count, limit in zip(map(len, (pending, team, member)), self.limits)):
+            raise RuntimeError("Terminal journal capacity exhausted; new execution not admitted")
+        disk = os.statvfs(self.directory)
+        if disk.f_bavail * disk.f_frsize < 4 * self.SLOT_BYTES:
+            raise RuntimeError("Terminal journal disk capacity exhausted; new execution not admitted")
+        row = {"version": 1, "teamId": self.settings.team_id, "memberId": self.settings.member_id,
+               "envelope": envelope, "sourceStreamID": envelope.get("redisId") or "", "state": "admitted", "publications": []}
+        self._save(row)
+        return row
+
+    def admit(self, envelope):
+        with self._locked():
+            return self._admit(envelope)
+
+    def _state(self, envelope, state):
+        with self._locked():
+            row = self._admit(envelope)
+            context = row.get("contextDelivery") or {}
+            if state == "accepted" and not row.get("compact") and (context.get("state") in {"submitting", "unconfirmed"} or
+                    (context.get("state") == "queued" and context.get("serialHandoff") and not row.get("contextHandoff"))):
+                return None  # A transport commit cannot resolve uncertain native ownership.
+            row["state"] = state
+            self._save(row)
+            return row
+
+    def started(self, envelope):
+        with self._locked():
+            row = self._admit(envelope)
+            if row["state"] != "admitted":
+                return False
+            row["state"] = "started"
+            self._save(row)
+            return True
+
+    def uncertain(self, envelope):
+        return self._state(envelope, "started")
+
+    def accepted(self, envelope):
+        return self._state(envelope, "accepted")
+
+    def context(self, envelope, state, proof=None, *, owned=False, handoff=None):
+        with self._locked():
+            row = self._admit(envelope)
+            previous = row.get("contextDelivery")
+            if row.get("compact"):
+                return None
+            if state == "queued" and not previous and row["state"] != "admitted" and not owned:
+                return None
+            if state == "submitting" and ((previous or {}).get("state") != "queued" or
+                    not (row["state"] == "admitted" or (row["state"] == "accepted" and (previous or {}).get("serialHandoff")))):
+                return None
+            if state == "ignored" and previous and previous.get("state") != "queued":
+                return None  # A stale scope observer cannot resolve a native submission.
+            if (previous or {}).get("state") == "request_included" and state != "request_included":
+                return previous
+            if handoff and not previous:
+                pending = sum(1 for file in self.directory.glob("*.json")
+                              for other in [self._read_record(file)]
+                              if other.get("teamId") == self.settings.team_id and other.get("memberId") == self.settings.member_id
+                              and other.get("contextHandoff") and (other.get("contextDelivery") or {}).get("state") not in {"ignored", "request_included"})
+                if pending >= 64:
+                    raise RuntimeError("Team context observation capacity reached; original work retained")
+                row["contextHandoff"] = {key: value for key, value in handoff.items() if key != "envelope"}
+            fields = {key: (value[:512] if isinstance(value, str) else value) for key, value in (proof or {}).items()
+                      if key in {"nativeSessionId", "nativeMessageId", "nativeRunId", "generation", "reason", "marker"}}
+            row["contextDelivery"] = {**(previous or {}), **fields, "state": state}
+            if owned:
+                row["contextDelivery"]["serialHandoff"] = True
+            # The serial owner may transfer an already claimed notice to the
+            # durable context queue. Do not reopen admitted and authorize a
+            # second serial owner while the queued context awaits native steer.
+            row["state"] = "accepted" if state in {"submitted", "native_context_consumed", "request_included", "ignored"} or (state == "queued" and row["contextDelivery"].get("serialHandoff")) else "admitted" if state == "queued" else "started"
+            self._save(row)
+            return row["contextDelivery"]
+
+    def recover_context(self, entries):
+        with self._locked():
+            deadline = time.monotonic() + 30
+            names = sorted(self.directory.glob("*.json"))
+            cursor_key = (str(self.directory), self.settings.team_id, self.settings.member_id)
+            cursor = _CONTEXT_SCAN_CURSORS.get(cursor_key, 0)
+            if cursor >= len(names): cursor = 0
+            batch = names[cursor:cursor + 128]
+            _CONTEXT_SCAN_CURSORS[cursor_key] = cursor + len(batch)
+            # Refresh existing mirrors even when outside this recovery scan page.
+            files = dict.fromkeys([*(self._file(item["envelope"]) for item in entries.values() if item.get("envelope")), *batch])
+            for file in files:
+                if time.monotonic() >= deadline: break
+                if not file.exists(): continue
+                row = self._read_record(file)
+                if row.get("teamId") != self.settings.team_id or row.get("memberId") != self.settings.member_id: continue
+                handoff, delivery = row.get("contextHandoff"), row.get("contextDelivery")
+                if not handoff or not delivery or row.get("compact"): continue
+                message_id = row["envelope"]["messageId"]
+                if message_id not in entries:
+                    if delivery["state"] in {"ignored", "request_included"}: continue
+                    finished = [key for key, item in entries.items() if item.get("state") in {"ignored", "request_included"}]
+                    while len(entries) >= 64 and finished: entries.pop(finished.pop(0))
+                    if len(entries) >= 64: continue
+                entries[message_id] = {**entries.get(message_id, {}), **handoff, **delivery, "envelope": row["envelope"]}
+            return entries
+
+    def _materialize(self, row, publication):
+        if not publication.get("materializationPending"):
+            return
+        event = publication["event"]
+        body = str(event.get("resultMarkdown") or event.get("result") or event.get("text") or "")
+        data = body.encode()
+        digest = hashlib.sha256(data).hexdigest()
+        artifact = self.settings.shared_path / "results" / _safe_name(row["envelope"].get("taskId") or row["envelope"].get("rootTaskId")) / ("terminal-" + digest + ".md")
+        try:
+            existing = artifact.read_bytes()
+        except FileNotFoundError:
+            existing = None
+        if existing is None or len(existing) != len(data) or hashlib.sha256(existing).hexdigest() != digest:
+            _ensure_shared_directory(artifact.parent)
+            temporary = artifact.with_suffix(".tmp")
+            with temporary.open("wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.replace(artifact)
+            descriptor = os.open(artifact.parent, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        reference = canonical_artifact_ref(self.settings, artifact)
+        explanation = f"Full answer ({len(data)} bytes, SHA-256 {digest}): [Open complete answer]({reference})"
+        payload = {**event, "result": None, "resultMarkdown": explanation,
+                   "resultBodyRef": reference, "resultBodySHA256": digest, "resultBodyBytes": len(data),
+                   "bodyExternalized": True, "artifactRefs": list(dict.fromkeys([*(event.get("artifactRefs") or []), reference]))}
+        if event.get("nativePublicDelivery"):
+            payload["text"], payload["textTruncated"] = explanation, False
+        if len(json.dumps(payload, ensure_ascii=False).encode()) > 60 * 1024:
+            raise RuntimeError("Terminal metadata exceeds wire capacity; full original outcome remains in reserved storage")
+        publication["event"], publication["materializationPending"] = payload, False
+        self._save(row)
+
+    def stage(self, envelope, event):
+        with self._locked():
+            row = self._admit(envelope)
+            semantic_key = hashlib.sha256(json.dumps({key: value for key, value in event.items() if key not in {"eventId", "attemptId", "at"}}, sort_keys=True).encode()).hexdigest()
+            for publication in row["publications"]:
+                if publication.get("decision") != "rejected" and publication.get("semanticKey") == semantic_key:
+                    return publication
+            if row.get("compact"):
+                raise RuntimeError("Completed delivery identity is immutable; use a new corrective message identity")
+            event = dict(event)
+            if event.get("result") == event.get("resultMarkdown"):
+                event.pop("result", None)
+            publication = {"event": event, "semanticKey": semantic_key, "streamId": "", "materializationPending": len(json.dumps(event, ensure_ascii=False).encode()) > 60 * 1024}
+            row["publications"].append(publication)
+            row["state"] = "result_saved"
+            self._save(row)
+            try:
+                self._materialize(row, publication)
+            except (OSError, RuntimeError) as exc:
+                publication["deliveryError"] = str(exc)
+            return publication
+
+    async def flush(self, redis, envelope=None, reconcile=False):
+        recovery = not envelope or reconcile
+        deadline = time.monotonic() + 30
+        files = [self._file(envelope)] if envelope else sorted(self.directory.glob("*.json"))
+        closure = None
+        if recovery and files:
+            raw = await redis.command("GET", f"{_key_prefix(self.settings)}:__cm_capacity:replay-source-closed")
+            if raw:
+                closure = json.loads(raw)
+        cursor_key = str(self.directory) + self.settings.member_id
+        if not envelope:
+            cursor = _TERMINAL_SCAN_CURSORS.get(cursor_key, "")
+            files = ([file for file in files if file.name > cursor] + [file for file in files if file.name <= cursor])[:128]
+        for file in files:
+            if not envelope:
+                _TERMINAL_SCAN_CURSORS[cursor_key] = file.name
+            with self._locked():
+                try:
+                    row = self._read_record(file)
+                except FileNotFoundError:
+                    continue
+            if row["teamId"] != self.settings.team_id or row["memberId"] != self.settings.member_id:
+                continue
+            if recovery and not row.get("compact"):
+                proof = _read_json(self._proof_file(row["envelope"])) or {}
+                if proof.get("schema") == 1 and proof.get("scope") == self._scope(row["envelope"]) and proof.get("origin") != file.stem and (proof.get("publication") or {}).get("decision") == "accepted" and (proof.get("publication", {}).get("ack") or {}).get("decision") == "accepted":
+                    with self._locked():
+                        row = self.read(row["envelope"])
+                        if row is None or row.get("compact"):
+                            continue
+                        row["resolvedByAcceptedCompletion"] = proof["origin"]
+                        row["executionMayHaveOccurred"] = row["state"] == "started"
+                        if not any(item["event"]["eventId"] == proof["publication"]["event"]["eventId"] for item in row["publications"]):
+                            row["publications"].append({**proof["publication"], "inherited": True})
+                        row["state"] = "accepted"
+                        self._save(row)
+            for publication in row["publications"]:
+                event = publication["event"]
+                if publication["streamId"] and publication.get("decision") in {"accepted", "rejected"}:
+                    continue
+                if not publication["streamId"]:
+                    with self._locked():
+                        current = self.read(row["envelope"])
+                        if current is None or current.get("compact"):
+                            continue
+                        owned = next((item for item in current["publications"] if item["event"]["eventId"] == event["eventId"]), None)
+                        if owned is None:
+                            continue
+                        self._materialize(current, owned)
+                        publication = dict(owned)
+                        event = publication["event"]
+                    key = f"{_key_prefix(self.settings)}:completions:delivery-{hashlib.sha256(event['eventId'].encode()).hexdigest()}"
+                    receipt = await _publish_once(redis, self.settings, key, event)
+                    if not receipt["streamId"]:
+                        raise RuntimeError("Terminal publication returned no durable receipt")
+                    publication["streamId"] = receipt["streamId"]
+                if recovery and event.get("event") == "completion_proposed" and publication.get("decision") not in {"accepted", "rejected"}:
+                    ack = await _completion_ack(redis, self.settings, event["completionId"], event["attemptId"], wait_seconds=0)
+                    if ack:
+                        ack_assignment = ack.get("assignmentId") or ack.get("workId")
+                        if (ack_assignment and ack_assignment != (event.get("assignmentId") or event.get("workId"))) or (
+                            ack.get("revision") is not None and int(ack["revision"]) != int(event.get("revision") or 1)
+                        ):
+                            ack = None
+                    if (ack or {}).get("decision") in {"accepted", "rejected"}:
+                        publication["decision"] = ack["decision"]
+                        publication["ack"] = ack
+                with self._locked():
+                    current = self.read(row["envelope"])
+                    if current is None or current.get("compact"):
+                        continue
+                    for item in current["publications"]:
+                        if item["event"]["eventId"] == event["eventId"]:
+                            # Another tool process may have recorded the final ACK
+                            # while this process awaited Redis. Never replace its
+                            # event/decision with an older publication snapshot.
+                            item["streamId"] = item.get("streamId") or publication["streamId"]
+                            if item.get("decision") not in {"accepted", "rejected"}:
+                                for key in ("decision", "ack"):
+                                    if key in publication:
+                                        item[key] = publication[key]
+                    self._save(current)
+            if not recovery:
+                continue
+            with self._locked():
+                row = self.read(row["envelope"])
+                if row is None:
+                    continue
+                terminals = [item for item in row["publications"] if item["event"].get("event") == "completion_proposed"]
+                if not terminals or terminals[-1].get("decision") != "accepted" or not all(item["streamId"] for item in row["publications"]) or row["state"] == "started":
+                    continue
+                terminal = terminals[-1]
+                ack, event = terminal.get("ack") or {}, terminal["event"]
+                if not terminal.get("inherited") and str(ack.get("teamId")) == str(self.settings.team_id) and ack.get("memberId") == self.settings.member_id and ack.get("rootTaskId") == (row["envelope"].get("rootTaskId") or row["envelope"].get("taskId")) and ack.get("completionId") == event.get("completionId") and ack.get("attemptId") == event.get("attemptId") and (event.get("assignmentId") or event.get("workId")) == (row["envelope"].get("assignmentId") or row["envelope"].get("workId")) and event.get("revision") == int(row["envelope"].get("revision") or 1):
+                    proof = {"schema": 1, "scope": self._scope(row["envelope"]), "origin": file.stem, "publication": {
+                        "streamId": terminal["streamId"], "decision": "accepted", "ack": ack, "semanticKey": terminal["semanticKey"],
+                        "event": {key: event.get(key) for key in ("event", "eventId", "completionId", "attemptId", "status", "assignmentId", "workId", "revision")}}}
+                    _atomic_write_json(self._proof_file(row["envelope"]), proof)
+                if not row.get("compact"):
+                    artifact = self.settings.shared_path / "results" / _safe_name(row["envelope"].get("taskId") or row["envelope"].get("rootTaskId")) / ("delivery-" + file.name)
+                    _atomic_write_json(artifact, row)
+                    row["resultRef"] = canonical_artifact_ref(self.settings, artifact)
+                    row["envelope"] = {key: value for key, value in row["envelope"].items() if key in {"idempotencyKey", "messageId", "taskId", "rootTaskId", "assignmentId", "workId", "revision", "redisId"}}
+                    row["publications"] = [{"semanticKey": terminal["semanticKey"], "streamId": terminal["streamId"], "decision": "accepted", "ack": terminal.get("ack"), "inherited": terminal.get("inherited", False), "event": {
+                        **{key: terminal["event"].get(key) for key in ("event", "eventId", "completionId", "attemptId", "status")}, "resultBodyRef": row["resultRef"]}}]
+                    row.pop("contextHandoff", None)  # Full closed handoff remains in resultRef.
+                    row["compact"], row["state"] = True, "accepted"
+                    self._save(row)
+                source = re.fullmatch(r"(\d+)-\d+", row.get("sourceStreamID") or "")
+                if source and isinstance(closure, dict) and closure.get("schema") == 1 and re.fullmatch(r"[a-f0-9]{64}", closure.get("proof_sha256") or "") and closure.get("committed_cursor") and closure.get("verified_at") and 0 < int(source[1]) <= int(closure.get("closed_before_ms") or 0):
+                    file.unlink()
+                    proof_file = self._proof_file(row["envelope"])
+                    proof = _read_json(proof_file) or {}
+                    if re.fullmatch(r"[a-f0-9]{64}", proof.get("origin") or "") and not (self.directory / (proof["origin"] + ".json")).exists():
+                        unresolved = any(not other.get("compact") and other["teamId"] == self.settings.team_id and other["memberId"] == self.settings.member_id and self._scope(other["envelope"]) == self._scope(row["envelope"])
+                                         for other in (self._read_record(candidate) for candidate in self.directory.glob("*.json")))
+                        if not unresolved:
+                            proof_file.unlink()
+                    descriptor = os.open(self.directory, os.O_RDONLY)
+                    try:
+                        os.fsync(descriptor)
+                    finally:
+                        os.close(descriptor)
+            if time.monotonic() >= deadline:
+                break
 
 
 async def _completion_ack(
@@ -2133,7 +2602,13 @@ def _record_completion_decision(
         active["explicitCompletionSubmitted"] = True
     if decision == "accepted":
         active["completedAt"] = _now_iso()
-    _persist_active_envelope(settings, active)
+    try:
+        _persist_active_envelope(settings, active)
+    except OSError as exc:
+        if exc.errno not in {errno.ENOSPC, errno.EDQUOT}:
+            raise
+        logger.warning("Redis Team: completion mirror deferred; reserved terminal journal retains outcome")
+        return False
     write_local_status(
         settings,
         {
@@ -2153,6 +2628,7 @@ async def _reconcile_pending_completion(redis: AsyncRedisClient, settings: Redis
     # Owned by the long-lived adapter presence loop, not the temporary tool
     # asyncio loop. Persisted receipt identity also survives Gateway restart.
     # Redis remains the authority; the local envelope is only a recovery cursor.
+    await TerminalJournal(settings).flush(redis)
     active = _load_active_envelope(settings)
     if active.get("terminal") or active.get("completionDecision") not in {"submitted", "deferred"}:
         return
@@ -2171,6 +2647,19 @@ async def _reconcile_pending_completion(redis: AsyncRedisClient, settings: Redis
         )
 
 
+def _validate_completion_capacity(settings, envelope, proposal):
+    raw = json.dumps(proposal, ensure_ascii=False, separators=(",", ":"))
+    if len(raw.encode()) <= 1024 * 1024:
+        return
+    journal = TerminalJournal(settings)
+    journal.stage(envelope, {"event": "task_progress", "eventKind": "runtime_reconciliation_needed",
+                            "eventId": "oversized-proposal-" + hashlib.sha256(raw.encode()).hexdigest(),
+                            "resultMarkdown": raw, "executionMayHaveOccurred": True,
+                            "nonAuthoritative": True, "stateEffect": "none", "rootTaskTerminal": False})
+    journal.uncertain(envelope)
+    raise ValueError("Completion proposal exceeds 1 MiB encoded JSON; full raw proposal retained for reconciliation. Native execution may have occurred. Save larger answers as complete artifacts and submit their references; do not rerun the business action.")
+
+
 async def _propose_completion(
     settings: RedisTeamSettings,
     envelope: dict[str, Any],
@@ -2187,6 +2676,9 @@ async def _propose_completion(
 ) -> dict[str, Any]:
     if not settings.valid:
         raise ValueError("Redis Team env is incomplete")
+    _validate_completion_capacity(settings, envelope, {"status": status, "summary": summary, "resultMarkdown": result_markdown,
+        "artifactRefs": artifact_refs, "reviewVerdict": review_verdict, "reviewedAssignmentId": reviewed_assignment_id,
+        "reviewedRevision": reviewed_revision, "reviewedArtifactRefs": reviewed_artifact_refs})
     status = _trim(status).lower()
     if status not in {"succeeded", "failed", "cancelled"}:
         raise ValueError("completion status must be succeeded, failed or cancelled")
@@ -2200,15 +2692,17 @@ async def _propose_completion(
         artifact_refs,
     )
     normalized_artifact_refs = [*(artifact_refs or []), *canonical_review_refs]
-    result = write_task_result(
-        settings,
-        task_id,
-        envelope=envelope,
-        status=status,
-        summary=summary,
-        result_markdown=result_markdown,
-        artifact_refs=normalized_artifact_refs,
-    )
+    try:
+        result = write_task_result(settings, task_id, envelope=envelope, status=status, summary=summary,
+                                   result_markdown=result_markdown, artifact_refs=normalized_artifact_refs)
+    except OSError as exc:
+        if exc.errno not in {errno.ENOSPC, errno.EDQUOT}:
+            raise
+        # Shared mirrors can wait; the admitted private banks own the outcome.
+        result = {"taskId": task_id, "rootTaskId": envelope.get("rootTaskId") or task_id,
+                  "assignmentId": envelope.get("assignmentId") or envelope.get("workId"),
+                  "memberId": settings.member_id, "status": status, "summary": summary,
+                  "resultMarkdown": result_markdown, "artifactRefs": validate_artifact_refs(settings, normalized_artifact_refs)}
     completion_id = _completion_id(settings, envelope)
     single_member = _is_single_member_envelope(settings, envelope)
     attempt_id = f"attempt_{uuid.uuid4().hex}"
@@ -2253,20 +2747,24 @@ async def _propose_completion(
             "chatPolicy": "hidden",
         },
     )
+    journal = TerminalJournal(settings)
+    saved = journal.stage(envelope, completion)
+    attempt_id = saved["event"]["attemptId"]
+    _record_completion_decision(
+        settings, envelope, completion_id, attempt_id, status, summary,
+        result["artifactRefs"], "submitted", new_attempt=True, explicit=explicit,
+    )
     redis = AsyncRedisClient(settings.redis_url)
+    acknowledgement = None
+    published = {"published": False, "streamId": "", "durable": True}
     try:
         await redis.connect()
-        published = await _publish_once(
-            redis,
-            settings,
-            _completion_attempt_key(settings, completion_id, attempt_id),
-            completion,
-        )
-        _record_completion_decision(
-            settings, envelope, completion_id, attempt_id, status, summary,
-            result["artifactRefs"], "submitted", new_attempt=True, explicit=explicit,
-        )
+        await journal.flush(redis, envelope)
+        published = {"published": True, "durable": True, "streamId": next(
+            item["streamId"] for item in journal.read(envelope)["publications"] if item["event"]["eventId"] == saved["event"]["eventId"])}
         acknowledgement = await _completion_ack(redis, settings, completion_id, attempt_id)
+    except Exception as exc:
+        logger.warning("Redis Team: completed result durably retained for publication retry: %s", exc)
     finally:
         redis.close()
     decision = _trim((acknowledgement or {}).get("decision")).lower() or "submitted"
@@ -2681,6 +3179,7 @@ async def _tool_team_complete_task(args: dict[str, Any], **_kwargs) -> str:
     active["rootTaskId"] = active.get("rootTaskId") or task_id
     _persist_active_envelope(settings, active)
     try:
+        _validate_completion_capacity(settings, active, args)
         result = await _propose_completion(
             settings,
             active,
@@ -3680,7 +4179,8 @@ class RedisTeamAdapter(BasePlatformAdapter):
         while self.is_connected:
             try:
                 if self._redis is not None:
-                    await _reconcile_pending_completion(self._redis, self.settings)
+                    if not await _team_maintenance_enabled(self._redis, self.settings):
+                        await _reconcile_pending_completion(self._redis, self.settings)
                     await self._flush_context_notices()
                 for identity in list(self._active_assignments):
                     self._retire_terminal_assignment(identity)
@@ -3799,8 +4299,12 @@ class RedisTeamAdapter(BasePlatformAdapter):
         redis = self._consumer_redis
         read_id = "0"
         pending_batches = 0
+        next_pending_probe = time.monotonic() + 5
         while self.is_connected:
             try:
+                if time.monotonic() >= next_pending_probe:
+                    read_id, pending_batches = "0", 0
+                    next_pending_probe = time.monotonic() + 5
                 if await _team_maintenance_enabled(redis, self.settings):
                     await asyncio.sleep(0.2)
                     continue
@@ -3895,6 +4399,27 @@ class RedisTeamAdapter(BasePlatformAdapter):
                 await self._redis.command("XACK", inbox_key(self.settings), self.settings.consumer_group, redis_id)
             return
 
+        journal = TerminalJournal(self.settings)
+        admission = journal.admit(envelope)
+        if admission["state"] in {"accepted", "result_saved"}:
+            context = admission.get("contextDelivery") or {}
+            if context.get("state") == "queued" and context.get("serialHandoff") and not admission.get("compact"):
+                if not admission.get("contextHandoff"):
+                    logger.warning("Redis Team: legacy context handoff lacks execution binding; retained for reconciliation: %s", envelope["messageId"])
+                    return
+                await self._flush_context_notices()
+            await journal.flush(self._redis, envelope)
+            if journal.accepted(envelope) is None:
+                return
+            await self._redis.command("SET", _processed_message_key(self.settings, dedup_key), _now_iso(), "EX", 7 * 24 * 60 * 60)
+            if redis_id:
+                await self._redis.command("XACK", inbox_key(self.settings), self.settings.consumer_group, redis_id)
+            self._transport_accepted_messages.discard(envelope["messageId"])
+            return
+        if admission["state"] == "started":
+            logger.warning("Redis Team: execution outcome uncertain; original work retained for explicit reconciliation: %s", envelope["messageId"])
+            return
+
         # The model/control action was already accepted and only the Redis
         # marker or ACK failed. Never dispatch it a second time; finish the
         # transport commit after the connection has recovered.
@@ -3925,6 +4450,10 @@ class RedisTeamAdapter(BasePlatformAdapter):
                     },
                 ),
             )
+            if not journal.started(envelope):
+                # A context/serial owner won after our admission snapshot.
+                # Keep its durable state and pending transport for recovery.
+                return
             handled_without_dispatch = await self._try_resolve_approval_response(envelope)
             if not handled_without_dispatch:
                 handled_without_dispatch = await self._report_monitor_without_model(envelope)
@@ -4014,6 +4543,12 @@ class RedisTeamAdapter(BasePlatformAdapter):
         except Exception as exc:
             error = str(exc)
             logger.warning("Redis Team: message processing failed: %s", error)
+            saved = journal.read(envelope)
+            if saved:
+                # Retain a possibly executed action. Redis failure is never
+                # evidence that native model/tool execution did not happen.
+                logger.warning("Redis Team: durable execution retained for retry/reconciliation: %s", envelope["messageId"])
+                return
             retry_key = _processed_message_key(self.settings, f"retry:{dedup_key}")
             retry_count = int(await self._redis.command("INCR", retry_key))
             await self._redis.command("EXPIRE", retry_key, 60 * 60)
@@ -4096,6 +4631,8 @@ class RedisTeamAdapter(BasePlatformAdapter):
         # The business action is now accepted. Redis finalization is a
         # transport concern: let failures bubble to the consumer reconnect
         # path instead of reporting a false task failure or rerunning Hermes.
+        if journal.accepted(envelope) is None:
+            return
         self._transport_accepted_messages.add(envelope["messageId"])
         await self._redis.command(
             "SET",
@@ -4238,16 +4775,26 @@ class RedisTeamAdapter(BasePlatformAdapter):
         message_id = _trim(envelope.get("messageId"))
         if not message_id:
             return False
+        journal = TerminalJournal(self.settings)
         with _CONTEXT_NOTICE_LOCK:
             path = _context_notice_path(self.settings)
-            entries = _read_json(path) or {}
+            entries = _load_context_notices(self.settings)
             if message_id not in entries:
                 finished = sorted((k for k,v in entries.items() if v.get("state") in {"request_included","ignored"}),key=lambda k:entries[k].get("receivedAt", ""))
                 while len(entries)>=64 and finished: entries.pop(finished.pop(0))
                 if len(entries)>=64:
                     raise RuntimeError("Team context observation capacity reached; original work retained")
                 marker = "[Team context " + hashlib.sha256(message_id.encode()).hexdigest() + "]"
-                entries[message_id] = {"marker":marker,"text":text,"envelope":envelope,"activeMessageId":active.get("messageId"),"identity":[root,assignment],"revision":revision,"generation":self.settings.generation,"receivedAt":_now_iso(),"state":"ignored" if reason else "queued","reason":reason}
+                item = {"marker":marker,"text":text,"envelope":envelope,"activeMessageId":active.get("messageId"),"identity":[root,assignment],"revision":revision,"generation":self.settings.generation,"receivedAt":_now_iso(),"state":"ignored" if reason else "queued","reason":reason}
+                admission = journal.admit(envelope)
+                if admission.get("contextDelivery"):
+                    raise RuntimeError("Existing context handoff requires original execution reconciliation")
+                # Full original binding is committed in the reserved journal before
+                # auxiliary allocation or transport ACK. Never rebind on restart.
+                delivery = journal.context(envelope, item["state"], {"generation": self.settings.generation, "marker": marker, "reason": reason}, owned=True, handoff=item)
+                if not delivery:
+                    raise RuntimeError("Context ownership transfer was not accepted")
+                entries[message_id] = item
                 _atomic_write_json(path,entries)
         await self._flush_context_notices()
         return True
@@ -4261,15 +4808,29 @@ class RedisTeamAdapter(BasePlatformAdapter):
         agent = reader(self._context_source(active)) if reader and active and not terminal else None
         with _CONTEXT_NOTICE_LOCK:
             path = _context_notice_path(self.settings)
-            entries = _read_json(path) or {}
+            entries = _load_context_notices(self.settings)
             for message_id,item in entries.items():
-                if item.get("state") in {"queued","submitted"}:
+                if item.get("state") == "queued":
+                    journal = TerminalJournal(self.settings)
+                    durable = journal.admit(item["envelope"])
+                    if not durable.get("contextHandoff"):
+                        journal.context(item["envelope"], "unconfirmed", {"reason": "legacy_context_requires_reconciliation"})
+                        item.update(state="unconfirmed", reason="legacy_context_requires_reconciliation")
+                        continue
                     if terminal or item.get("identity") != list(_assignment_identity(active)) or item.get("revision") != int(active.get("revision") or 1) or item.get("generation") != self.settings.generation or item.get("activeMessageId") != active.get("messageId"):
-                        item.update(state="ignored",reason="execution_changed_or_delivered")
+                        if journal.context(item["envelope"], "ignored", {"reason": "execution_changed_or_delivered"}):
+                            item.update(state="ignored",reason="execution_changed_or_delivered")
                     elif agent is not None and callable(getattr(agent,"steer",None)):
                         lifetime = str(os.getpid())+":"+str(id(agent))
-                        if item.get("agentLifetime") != lifetime and agent.steer(item["marker"]+"\n"+item["text"]):
-                            item.update(state="submitted",submittedAt=_now_iso(),agentLifetime=lifetime)
+                        claim = journal.context(item["envelope"], "submitting", {"marker": item["marker"], "generation": self.settings.generation})
+                        if claim:
+                            item["state"] = "submitting"
+                            if agent.steer(item["marker"]+"\n"+item["text"]):
+                                delivery = journal.context(item["envelope"], "submitted")
+                                item.update(state=delivery["state"],submittedAt=_now_iso(),agentLifetime=lifetime)
+                            else:
+                                journal.context(item["envelope"], "queued")
+                                item["state"] = "queued"
                 _atomic_write_json(path,entries)
         # Publish without holding the thread-shared hook lock. A lost response
         # retries the same event identity, never a second model execution.
@@ -4760,7 +5321,7 @@ def register(ctx) -> None:
         toolset="redis_team",
         schema={
             "name": "team_complete_task",
-            "description": "Mark a Redis Team task succeeded, failed or cancelled, and write durable result files.",
+            "description": "Complete a Redis Team task. Maximum encoded proposal is 1 MiB JSON. Save larger complete answers as artifacts first and pass their references; never truncate a completed result.",
             "parameters": {
                 "type": "object",
                 "additionalProperties": False,
@@ -4769,7 +5330,7 @@ def register(ctx) -> None:
                     "taskId": {"type": "string"},
                     "status": {"type": "string"},
                     "summary": {"type": "string"},
-                    "resultMarkdown": {"type": "string"},
+                    "resultMarkdown": {"type": "string", "maxLength": 1048576, "description": "Complete answer within the 1 MiB total encoded proposal limit, or a reference to its previously saved full artifact."},
                     "artifactRefs": {"type": "array", "items": {"type": "string"}},
                     "reviewVerdict": {"type": "string", "enum": ["pass", "fail"]},
                     "reviewedAssignmentId": {"type": "string"},

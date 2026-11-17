@@ -1,0 +1,35 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import os from 'node:os';
+import {setTimeout as sleep} from 'node:timers/promises';
+const root=await fs.mkdtemp(path.join(os.tmpdir(),'durable-context-'));process.env.XDG_STATE_HOME=path.join(root,'state');
+const source=(await fs.readFile(new URL('../dist/index.js',import.meta.url),'utf8')).replace('import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";','const definePluginEntry=x=>x;').replace('const READ_BLOCK_MS = 15000;','const READ_BLOCK_MS = 100;');
+const p=await import(`data:text/javascript;base64,${Buffer.from(source+'\nexport {terminalJournal,RedisClient,startActiveContextWatcher,startConsumer,runtimeStateDir};\n//# sourceURL=context-reservation-protocol.mjs').toString('base64')}`);
+const cfg={enabled:true,redisUrl:process.env.REDIS_TEAM_TEST_URL,teamId:'context-reserve-'+crypto.randomUUID(),memberId:'worker',sharedDir:path.join(root,'shared'),consumerGroup:'context-reserve'};
+const redis=new p.RedisClient(cfg.redisUrl);await redis.connect();assert.equal(await redis.command('GET','cm:test:runtime-durable:isolated'),'runtime-durable-20261118');
+const business={teamId:cfg.teamId,to:'worker',from:'leader',taskId:'root',rootTaskId:'root',assignmentId:'work',workId:'work',revision:1,messageId:'business',text:'Original work',requiresCompletion:true};
+const active={envelope:business,generation:3};
+const notice={...business,from:'clawmanager-monitor',requiresCompletion:false,businessDeliveryKind:'context',businessMutation:false,messageId:'notice',idempotencyKey:'notice',text:'Continue original work'};
+const wait=async(fn)=>{for(let i=0;i<100;i++){if(await fn())return;await sleep(50)}throw Error('Context condition timed out')};
+const log={info(){},warn(){},error(){}};let watcher,consumer,calls=0,command=p.RedisClient.prototype.command;
+try{
+ const full=p.terminalJournal(cfg);for(let i=0;i<256;i++)await full.admit({messageId:'reserved-'+i,taskId:'pending-'+i});
+ watcher=await p.startActiveContextWatcher(cfg,{getActive:()=>active,intervalMs:100,deliver:async()=>{calls++;return{state:'submitted'}}},log);
+ await redis.command('XADD',`claw:team:${cfg.teamId}:inbox:worker`,'*','payload',JSON.stringify(notice));await sleep(550);
+ assert.equal(calls,0,'active context injection must obey the same 256-slot quota');await watcher.stop();watcher=null;
+ const next={...cfg,teamId:cfg.teamId+'-restart',sharedDir:path.join(root,'shared-restart')};
+ const owned={envelope:{...business,teamId:next.teamId},generation:3};const message={...notice,teamId:next.teamId,messageId:'lost-marker',idempotencyKey:'lost-marker'};
+ p.RedisClient.prototype.command=async function(...args){if(args[0]==='SET'&&String(args[1]).startsWith(`claw:team:${next.teamId}:processed:`))throw Error('lost transport marker');return command.apply(this,args)};
+ watcher=await p.startActiveContextWatcher(next,{getActive:()=>owned,intervalMs:100,deliver:async()=>{calls++;return{state:'submitted',nativeMessageId:'accepted-context'}}},log);
+ await redis.command('XADD',`claw:team:${next.teamId}:inbox:worker`,'*','payload',JSON.stringify(message));await wait(()=>calls===1);
+ await wait(async()=>(await p.terminalJournal(next).read(message))?.contextDelivery?.state==='submitted');
+ await watcher.stop();watcher=null;await fs.rm(path.join(p.runtimeStateDir(next),'active-context-delivery.json'),{force:true});
+ watcher=await p.startActiveContextWatcher(next,{getActive:()=>owned,intervalMs:100,deliver:async()=>{calls++;return{state:'submitted'}}},log);await sleep(400);
+ assert.equal(calls,1,'restart with lost auxiliary mirror and processed marker must not inject twice');
+ await watcher.stop();watcher=null;p.RedisClient.prototype.command=command;
+ let serialCalls=0;consumer=await p.startConsumer(next,async()=>{serialCalls++},null,log);
+ await wait(async()=>(await redis.command('XPENDING',`claw:team:${next.teamId}:inbox:worker`,next.consumerGroup))[0]===0);
+ await sleep(150);assert.equal(serialCalls,0,'serial consumer must honor the durable context handoff');
+ console.log(JSON.stringify({capacity:256,injectedAtCapacity:0,restartAfterNativeSubmission:true,lostProcessedMarker:true,lostAuxiliaryMirror:true,nativeInjections:calls,serialReexecution:serialCalls}));
+}finally{p.RedisClient.prototype.command=command;await watcher?.stop();await consumer?.stop();redis.close();await fs.rm(root,{recursive:true,force:true});}

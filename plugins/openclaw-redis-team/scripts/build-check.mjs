@@ -51,7 +51,7 @@ if (dist.includes('from "openclaw/plugin-sdk/direct-dm"')) {
 if (dist.includes("await fs.chmod(tmp") || dist.includes("await fs.chmod(file")) {
   throw new Error("atomic Team file publication must not chmod shared files after creation or rename");
 }
-if (!dist.includes('mode: fileMode') || !dist.includes('mode: 0o664')) {
+if (!(dist.includes('mode: fileMode') || dist.includes('fs.open(tmp, "wx", fileMode)')) || !dist.includes('mode: 0o664')) {
   throw new Error("atomic Team files must receive cooperative permissions when their temporary inode is created");
 }
 for (const token of [
