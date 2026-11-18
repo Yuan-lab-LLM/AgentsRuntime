@@ -276,13 +276,13 @@ def catalog(path, schema):
             reference.executescript("\n".join(schema["sql"]))
             reference.execute(schema["journal_sql"])
             expected = [r[0] for r in reference.execute("SELECT name FROM sqlite_master WHERE type='table'")]
-            actual = [r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+            actual = [r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT GLOB 'sqlite_*'")]
             require(set(actual) == set(expected), "unsupported_database_tables")
             # The observed pinned binary's empty bootstrap matches these exact
             # DDL strings. This checks CHECK/UNIQUE/table options as well as the
             # object inventory; an arbitrary historical Drizzle layout is not
             # part of this first preserve contract.
-            schema_query = "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name"
+            schema_query = "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY type,name"
             require(db.execute(schema_query).fetchall() == reference.execute(schema_query).fetchall(),
                     "unsupported_database_schema")
             for table in expected:
@@ -404,7 +404,7 @@ def require_original_history(workspace, files, original_path):
     with private_database(workspace, files) as current_path:
         original, current = db_open(original_path), db_open(current_path)
         try:
-            for (table,) in original.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"):
+            for (table,) in original.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT GLOB 'sqlite_*'"):
                 require(table in CONTINUITY, "unsupported_native_continuity_policy")
                 immutable, monotonic = CONTINUITY[table]
                 current_rows = keyed_rows(current, table)
@@ -413,10 +413,16 @@ def require_original_history(workspace, files, original_path):
                     after = current_rows[key]
                     require(all(typed(before[col]) == typed(after[col]) for col in immutable),
                             "original_native_history_changed")
+                    if table == "session_context_epoch" and before["baseline_seq"] == after["baseline_seq"]:
+                        require(all(typed(before[col]) == typed(after[col]) for col in ("baseline", "snapshot")),
+                                "native_epoch_changed_without_progress")
                     for col in monotonic:
                         old, new = before[col], after[col]
                         if old is None and new is None:
                             continue
+                        if col in ("seq", "baseline_seq", "promoted_seq"):
+                            require(isinstance(new, int) and (old is None or isinstance(old, int)),
+                                    "native_progress_invalid")
                         require(isinstance(new, (int, float)) and math.isfinite(new) and new >= 0,
                                 "native_progress_invalid")
                         require(old is None or isinstance(old, (int, float)) and math.isfinite(old) and new >= old,

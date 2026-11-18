@@ -137,6 +137,23 @@ class PreserveTests(unittest.TestCase):
         db.commit()
         self.call("compatibility", ok=False)
 
+    def test_sqlite_like_custom_table_is_not_hidden_from_native_schema_validation(self):
+        db = self.fixture()
+        db.execute("CREATE TABLE sqliteXcustom(id TEXT PRIMARY KEY, data TEXT)")
+        db.execute("INSERT INTO sqliteXcustom VALUES('id','must not be silently excluded')")
+        db.commit()
+        before = (self.data / "opencode.db-wal").read_bytes()
+        self.call("compatibility", ok=False)
+        self.assertEqual(before, (self.data / "opencode.db-wal").read_bytes())
+
+    def test_sqlite_like_custom_trigger_is_not_hidden_from_native_schema_validation(self):
+        db = self.fixture()
+        db.execute("CREATE TRIGGER sqliteXcustom AFTER INSERT ON message BEGIN DELETE FROM event; END")
+        db.commit()
+        before = (self.data / "opencode.db-wal").read_bytes()
+        self.call("compatibility", ok=False)
+        self.assertEqual(before, (self.data / "opencode.db-wal").read_bytes())
+
     def test_restore_preserves_new_history_and_rejects_stale_identity(self):
         db = self.fixture()
         self.call("migrate")
@@ -181,10 +198,26 @@ class PreserveTests(unittest.TestCase):
         db.execute("INSERT INTO event(id,aggregate_id,seq,type,data) VALUES('next','ses',2,'fixture','{}')")
         db.execute("UPDATE event_sequence SET seq=2")
         db.execute("UPDATE credential SET value='rotated-secret',time_updated=2,active=1")
-        db.execute("UPDATE session_context_epoch SET baseline_seq=2,snapshot='{}',baseline='new-baseline'")
+        db.execute("UPDATE session_context_epoch SET baseline_seq=2,snapshot='{\"new_epoch\":true}',baseline='new-baseline'")
         db.execute("UPDATE session_input SET promoted_seq=2")
         db.commit()
         self.call("restore", preserve_session_sqlite=True)
+
+    def test_same_sequence_epoch_cannot_discard_original_baseline_or_snapshot(self):
+        db = self.fixture()
+        db.execute("UPDATE session_context_epoch SET baseline='original-baseline',snapshot='{\"original\":true}'")
+        db.commit()
+        self.call("migrate")
+        db.execute("UPDATE session_context_epoch SET baseline='',snapshot='{}'")
+        db.commit()
+        self.call("restore", ok=False, preserve_session_sqlite=True)
+
+    def test_fractional_sequence_is_not_native_epoch_progress(self):
+        db = self.fixture()
+        self.call("migrate")
+        db.execute("UPDATE session_context_epoch SET baseline_seq=1.5,baseline='',snapshot='{}'")
+        db.commit()
+        self.call("restore", ok=False, preserve_session_sqlite=True)
 
     def test_preserve_rollback_rejects_deleted_original_legacy_message(self):
         db = self.fixture()
