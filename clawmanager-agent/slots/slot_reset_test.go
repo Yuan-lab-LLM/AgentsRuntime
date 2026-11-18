@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -253,5 +254,48 @@ func TestPhysicalSlotResetRejectsNoncanonicalCoordinatorRoute(t *testing.T) {
 	p.ServeHTTP(out, r)
 	if out.Code != 400 {
 		t.Fatalf("ambiguous slot route returned %d", out.Code)
+	}
+}
+
+func TestPoolRegistersManualSlotResetOnlyForSupportedProfile(t *testing.T) {
+	const digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	t.Setenv("CLAWMANAGER_RUNTIME_IMAGE_DIGEST", digest)
+	for _, tc := range []struct {
+		name, profile string
+		wantReset     bool
+	}{{"NFS slot pool", "nfs-rootless-v1", true}, {"legacy slot pool", "", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			registration := make(chan gateway.RegisterPayload, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/api/v1/runtime-agent/register" || r.Header.Get(gateway.AgentTokenHeader) != "report" {
+					http.Error(w, "unexpected report", 400)
+					return
+				}
+				var payload gateway.RegisterPayload
+				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+					t.Error(err)
+				}
+				registration <- payload
+				cancel()
+				w.WriteHeader(http.StatusServiceUnavailable)
+			}))
+			defer server.Close()
+			cfg := gateway.Config{ControlToken: "control", ReportToken: "report", BackendURL: server.URL, PodUID: "pod", ImageRef: "repo/image@" + digest, SandboxProfile: tc.profile, GatewayPortStart: 20000, GatewayPortEnd: 20000, GatewayPortBlockSize: 1}
+			p, err := NewPool(cfg, 1, func(context.Context, int, string, string, []byte) (int, []byte, error) { return 503, nil, nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			p.report(ctx)
+			select {
+			case payload := <-registration:
+				if payload.PodUID != cfg.PodUID || payload.ImageRef != cfg.ImageRef || payload.ImageDigest != digest || !slices.Contains(payload.Capabilities, "container-slots-v1") || slices.Contains(payload.Capabilities, "manual-slot-reset-v1") != tc.wantReset {
+					t.Fatalf("wrong source identity or capabilities: %+v", payload)
+				}
+			default:
+				t.Fatal("pool registration missing")
+			}
+		})
 	}
 }

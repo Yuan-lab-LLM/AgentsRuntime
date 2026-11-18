@@ -217,6 +217,9 @@ func (p *Pool) report(ctx context.Context) {
 		payload.MaxGateways = p.count
 		payload.AvailableSlots = 0
 		payload.Capabilities = append(payload.Capabilities, "container-slots-v1")
+		if p.cfg.SandboxProfile == "nfs-rootless-v1" {
+			payload.Capabilities = append(payload.Capabilities, "manual-slot-reset-v1")
+		}
 		var err error
 		podID, err = reporter.Register(ctx, payload)
 		if err == nil && podID > 0 {
