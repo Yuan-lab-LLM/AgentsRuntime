@@ -384,5 +384,10 @@ func (p Profile) RegistrationMetadata(gateway.Config) gateway.RuntimeRegistratio
 	if os.Getenv("CLAWMANAGER_REDIS_TEAM_PLUGIN_VERSION") == "opencode-team-v1" {
 		metadata.TeamPluginVersion = "opencode-team-v1"
 	}
+	if os.Getenv("CLAWMANAGER_OPENCODE_UPGRADE_PROTOCOL") == OpenCodeUpgradeProtocol {
+		metadata.ProtocolVersion = OpenCodeUpgradeProtocol
+		metadata.SessionStore = "sqlite"
+		metadata.Capabilities = append([]string(nil), OpenCodeUpgradeCapabilities...)
+	}
 	return metadata
 }
