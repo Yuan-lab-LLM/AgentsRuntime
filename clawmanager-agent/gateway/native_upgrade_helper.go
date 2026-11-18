@@ -51,6 +51,9 @@ func (h *scopedUpgradeHost) matchesRead(r WorkspaceUpgradeRequest) bool {
 }
 
 func (h *scopedUpgradeHost) WorkspaceForUpgrade(r WorkspaceUpgradeRequest) (string, error) {
+	if err := ValidateUpgradePodIdentity(h.cfg, r); err != nil {
+		return "", err
+	}
 	if !h.matchesRead(r) {
 		return "", fmt.Errorf("native host identity mismatch")
 	}
@@ -130,6 +133,9 @@ func runNativeUpgradeHelper(profile RuntimeProfile, in io.Reader, out io.Writer)
 	}
 	op := payload.Operation
 	if err := op.Validate(); err != nil {
+		return err
+	}
+	if err := ValidateUpgradePodIdentity(Config{PodUID: payload.Config.PodUID}, op.Request); err != nil {
 		return err
 	}
 	if op.Request.LeaseToken != "" || os.Geteuid() != op.Request.UID || os.Getegid() != op.Request.GID || profile == nil || profile.Type() != payload.Config.RuntimeType || payload.Config.SandboxProfile != "nfs-rootless-v1" || payload.Config.NetworkSecurityProfile != "isolated-network-v1" {

@@ -78,6 +78,9 @@ func (p *Pool) nativeRecordPath(id string) (string, error) {
 }
 func (s *nativeUpgradeSession) save() error { return atomicJSON(s.path, s.record) }
 func (p *Pool) nativeSession(ctx context.Context, op gateway.NativeUpgradeOperation, finalizedOnly bool) (*nativeUpgradeSession, error) {
+	if err := gateway.ValidateUpgradePodIdentity(p.cfg, op.Request); err != nil {
+		return nil, err
+	}
 	if s := p.maintenance[op.OperationID]; s != nil {
 		digest, _ := nativeOperationDigest(op)
 		if s.record.Digest != digest || s.record.LeaseToken != op.Request.LeaseToken {
@@ -322,6 +325,9 @@ func (p *Pool) openNativeCallback(s *nativeUpgradeSession, op gateway.NativeUpgr
 }
 func (p *Pool) startNativeMaintenance(ctx context.Context, op gateway.NativeUpgradeOperation) (nativeMaintenancePending, error) {
 	var empty nativeMaintenancePending
+	if err := gateway.ValidateUpgradePodIdentity(p.cfg, op.Request); err != nil {
+		return empty, err
+	}
 	if err := op.Validate(); err != nil {
 		return empty, err
 	}
@@ -403,6 +409,9 @@ func (p *Pool) startNativeMaintenance(ctx context.Context, op gateway.NativeUpgr
 // Resume only an authenticated finalized record. Unlike start, this must never
 // reserve a slot, acquire a writer or recreate a missing operation.
 func (p *Pool) resumeNativeMaintenance(ctx context.Context, op gateway.NativeUpgradeOperation) (nativeMaintenancePending, error) {
+	if err := gateway.ValidateUpgradePodIdentity(p.cfg, op.Request); err != nil {
+		return nativeMaintenancePending{}, err
+	}
 	p.maintenanceMu.Lock()
 	defer p.maintenanceMu.Unlock()
 	if p.maintenance == nil {

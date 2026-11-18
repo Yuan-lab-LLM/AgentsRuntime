@@ -67,6 +67,9 @@ func prepareNativeUpgradeCapsules(cfg gateway.Config, op gateway.NativeUpgradeOp
 // ExecuteNativeUpgrade returns a staged result only. The worker must persist it
 // and reset its container; the coordinator publishes it after termination proof.
 func ExecuteNativeUpgrade(ctx context.Context, cfg gateway.Config, op gateway.NativeUpgradeOperation, verify func(context.Context) error) (json.RawMessage, error) {
+	if err := gateway.ValidateUpgradePodIdentity(cfg, op.Request); err != nil {
+		return nil, err
+	}
 	if cfg.SandboxProfile != "nfs-rootless-v1" || cfg.NetworkSecurityProfile != "isolated-network-v1" || cfg.Runtime == nil || verify == nil {
 		return nil, fmt.Errorf("native maintenance execution unavailable")
 	}

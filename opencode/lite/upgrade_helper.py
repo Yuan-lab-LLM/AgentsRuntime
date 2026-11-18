@@ -615,7 +615,8 @@ def main(payload):
                                         "output_sha256": db["sha256"]}], "checked_at": now()}
         require(action == "compatibility", "unsupported_native_action")
         config = files["home/.opencode/opencode.json"]
-        return {"instance_id": req["instance_id"], "status": "compatible",
+        return {"instance_id": req["instance_id"], "rollout_id": req["rollout_id"],
+                "generation": req["generation"], "status": "compatible",
                 "config_original_sha256": config["sha256"], "config_target_sha256": config["sha256"],
                 "config_bytes": config["bytes"], "session_bytes": files[DB]["bytes"],
                 "state_bytes": sum(f["bytes"] for f in files.values()),

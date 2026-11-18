@@ -263,6 +263,17 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.forward(w, r, 0, body)
 			return
 		}
+		var target struct {
+			ExpectedPodUID string `json:"expected_pod_uid,omitempty"`
+		}
+		if json.Unmarshal(body, &target) != nil {
+			http.Error(w, "invalid upgrade activation", 400)
+			return
+		}
+		if err := gateway.ValidateUpgradePodIdentity(p.cfg, gateway.WorkspaceUpgradeRequest{ExpectedPodUID: target.ExpectedPodUID}); err != nil {
+			http.Error(w, err.Error(), 409)
+			return
+		}
 		if p.broadcast(w, r, body) {
 			if r.URL.Path == "/v1/openclaw/upgrade/activate" {
 				var req struct {

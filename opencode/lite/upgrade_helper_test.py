@@ -76,6 +76,9 @@ class PreserveTests(unittest.TestCase):
 
     def test_wal_backup_preserves_native_history_and_projects_are_out_of_scope(self):
         db = self.fixture()
+        compatible = self.call("compatibility")
+        self.assertEqual(self.req["rollout_id"], compatible["rollout_id"])
+        self.assertEqual(self.req["generation"], compatible["generation"])
         self.assertGreater((self.data / "opencode.db-wal").stat().st_size, 0)
         source_bytes = {p.name: p.read_bytes() for p in self.data.iterdir()}
         result = self.call("migrate")

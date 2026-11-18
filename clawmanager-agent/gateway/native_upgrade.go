@@ -10,6 +10,15 @@ import (
 
 var ErrNativeStorageUncertain = errors.New("native storage outcome is uncertain")
 
+// Empty preserves the legacy wire contract. A supplied UID binds maintenance
+// to this exact Pod before any record, writer lease or dispatch is permitted.
+func ValidateUpgradePodIdentity(cfg Config, req WorkspaceUpgradeRequest) error {
+	if req.ExpectedPodUID != "" && req.ExpectedPodUID != cfg.PodUID {
+		return errors.New("native upgrade expected Pod UID mismatch")
+	}
+	return nil
+}
+
 // NativeUpgradeOperation is a fixed native action, never an arbitrary command.
 // The lease token belongs only to the trusted parent; Child removes it.
 type NativeUpgradeOperation struct {

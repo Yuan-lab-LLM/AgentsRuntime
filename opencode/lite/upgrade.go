@@ -31,6 +31,7 @@ const (
 var OpenCodeUpgradeCapabilities = []string{
 	"opencode.native-preserve-v1", "opencode.workspace.writer-lease",
 	"opencode.session-continuity-v1", "opencode.runtime-standby-v1",
+	"opencode.native-payload-poduid-v1",
 }
 
 // These reviewed upstream inputs are tied to their immutable revision and
@@ -55,6 +56,9 @@ func (Profile) UpgradeService(cfg gateway.Config, host gateway.UpgradeHost) gate
 // All production I/O happens inside the existing offline maintenance container.
 // Direct legacy HTTP calls cannot bypass its writer and teardown proofs.
 func (Profile) RunScopedNativeUpgrade(ctx context.Context, cfg gateway.Config, op gateway.NativeUpgradeOperation, host gateway.UpgradeHost) (json.RawMessage, error) {
+	if err := gateway.ValidateUpgradePodIdentity(cfg, op.Request); err != nil {
+		return nil, err
+	}
 	if err := op.Validate(); err != nil {
 		return nil, err
 	}
@@ -68,20 +72,29 @@ func (Profile) RunScopedNativeUpgrade(ctx context.Context, cfg gateway.Config, o
 	return service.run(ctx, op.Action, op.Request)
 }
 
-func validateOpenCodeNativePayload(ctx context.Context) error {
+func unsupportedOpenCodeNativeEnvironment() error {
 	for _, key := range []string{"OPENCODE_DB", "OPENCODE_CHANNEL", "OPENCODE_DISABLE_CHANNEL_DB"} {
 		if _, present := os.LookupEnv(key); present {
 			return errors.New("OpenCode native database/channel overrides are unsupported")
 		}
 	}
-	const attestationPath = "/usr/local/share/clawmanager/opencode-native-preserve-attestation.json"
-	for _, path := range []string{"/usr/bin/python3", "/usr/local/bin/opencode", attestationPath} {
+	return nil
+}
+
+func validateOpenCodeNativePayloadFiles(ctx context.Context, paths nativePayloadPaths) error {
+	if err := unsupportedOpenCodeNativeEnvironment(); err != nil {
+		return err
+	}
+	if _, err := readNativePayloadKey(paths); err != nil {
+		return err
+	}
+	for _, path := range []string{paths.python, paths.binary, paths.attestation} {
 		info, err := os.Stat(path)
 		if err != nil || !info.Mode().IsRegular() {
 			return errors.New("OpenCode native preservation payload is unavailable")
 		}
 	}
-	raw, err := os.ReadFile(attestationPath)
+	raw, err := os.ReadFile(paths.attestation)
 	if err != nil || len(raw) > 1<<20 {
 		return errors.New("OpenCode native revision is unavailable")
 	}
@@ -93,17 +106,20 @@ func validateOpenCodeNativePayload(ctx context.Context) error {
 	if json.Unmarshal(raw, &manifest) != nil || manifest.Revision != OpenCodeNativeRevision || manifest.Version != OpenCodeNativeVersion || manifest.BinarySHA256 != OpenCodeNativeBinarySHA256 {
 		return errors.New("OpenCode native revision is unsupported")
 	}
-	binary, err := os.Open("/usr/local/bin/opencode")
+	binary, err := os.Open(paths.binary)
 	if err != nil {
 		return errors.New("OpenCode native binary is unavailable")
 	}
 	hash := sha256.New()
 	_, hashErr := io.Copy(hash, binary)
 	closeErr := binary.Close()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if hashErr != nil || closeErr != nil || fmt.Sprintf("%x", hash.Sum(nil)) != OpenCodeNativeBinarySHA256 {
 		return errors.New("OpenCode native binary differs from the preserved source image")
 	}
-	cmd := exec.CommandContext(ctx, "/usr/local/bin/opencode", "--version")
+	cmd := exec.CommandContext(ctx, paths.binary, "--version")
 	cmd.Env = []string{"PATH=/usr/local/bin:/usr/bin:/bin", "LANG=C.UTF-8", "HOME=/tmp"}
 	output, err := cmd.Output()
 	if err != nil || strings.TrimSpace(string(output)) != OpenCodeNativeVersion {

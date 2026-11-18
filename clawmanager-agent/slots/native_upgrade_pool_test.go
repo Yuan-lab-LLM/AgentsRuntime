@@ -41,6 +41,84 @@ func TestNativeUpgradeNeverSelectsBusySlot(t *testing.T) {
 	}
 }
 
+func TestNativeExpectedPodRejectsBeforeDispatchOrRecords(t *testing.T) {
+	for _, action := range []string{"start", "resume"} {
+		t.Run(action, func(t *testing.T) {
+			root := t.TempDir()
+			calls := 0
+			cfg := gateway.Config{SandboxProfile: "nfs-rootless-v1", RuntimeType: "opencode", ControlToken: "ctl", PodUID: "new", WorkspaceRoot: root, GatewayPortStart: 20000, GatewayPortEnd: 20000, GatewayPortBlockSize: 1}
+			p, err := NewPool(cfg, 1, func(context.Context, int, string, string, []byte) (int, []byte, error) {
+				calls++
+				raw, _ := json.Marshal(Snapshot{})
+				return 200, raw, nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var op gateway.NativeUpgradeOperation
+			json.Unmarshal([]byte(`{"operation_id":"0123456789abcdef0123456789abcdef","action":"inventory","request":{"rollout_id":"r1","instance_id":2,"user_id":1,"generation":3,"uid":200002,"gid":200002,"expected_pod_uid":"old"}}`), &op)
+			if action == "start" {
+				_, err = p.startNativeMaintenance(context.Background(), op)
+			} else {
+				_, err = p.resumeNativeMaintenance(context.Background(), op)
+			}
+			if err == nil || !strings.Contains(err.Error(), "expected Pod UID") || calls != 0 {
+				t.Fatalf("stale UID contacted worker: calls=%d err=%v", calls, err)
+			}
+			entries, _ := os.ReadDir(root)
+			if len(entries) != 0 {
+				t.Fatal("stale UID wrote a record")
+			}
+		})
+	}
+}
+
+func TestNativeExpectedPodEmptyKeepsCanonicalDigest(t *testing.T) {
+	var plain, empty gateway.NativeUpgradeOperation
+	raw := `{"operation_id":"0123456789abcdef0123456789abcdef","action":"inventory","request":{"rollout_id":"r1","instance_id":2,"user_id":1,"generation":3,"uid":200002,"gid":200002}}`
+	json.Unmarshal([]byte(raw), &plain)
+	json.Unmarshal([]byte(strings.Replace(raw, `"gid":200002`, `"gid":200002,"expected_pod_uid":""`, 1)), &empty)
+	a, _ := nativeOperationDigest(plain)
+	b, _ := nativeOperationDigest(empty)
+	if a != b {
+		t.Fatal("empty optional UID changed legacy digest")
+	}
+}
+
+func TestPoolUpgradeActivationExpectedPodBeforeBroadcast(t *testing.T) {
+	for _, pod := range []string{"old", "new", ""} {
+		t.Run("expected-"+pod, func(t *testing.T) {
+			calls := 0
+			cfg := gateway.Config{ControlToken: "ctl", PodUID: "new", RuntimeType: "opencode", WorkspaceRoot: t.TempDir(), UpgradeID: "r1", GatewayPortStart: 20000, GatewayPortEnd: 20000, GatewayPortBlockSize: 1}
+			p, err := NewPool(cfg, 1, func(_ context.Context, _ int, _ string, path string, _ []byte) (int, []byte, error) {
+				calls++
+				if path != "/v1/openclaw/upgrade/activate" {
+					t.Fatal(path)
+				}
+				return 200, []byte(`{"activated":true}`), nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := `{"rollout_id":"r1"}`
+			if pod != "" {
+				body = `{"rollout_id":"r1","expected_pod_uid":"` + pod + `"}`
+			}
+			r := httptest.NewRequest(http.MethodPost, "/v1/openclaw/upgrade/activate", strings.NewReader(body))
+			r.Header.Set(gateway.ControlTokenHeader, "ctl")
+			out := httptest.NewRecorder()
+			p.ServeHTTP(out, r)
+			if pod == "old" {
+				if out.Code != 409 || calls != 0 || !p.metadata.UpgradeStandby() {
+					t.Fatalf("stale UID broadcast activation: code=%d calls=%d", out.Code, calls)
+				}
+			} else if out.Code != 200 || calls != 1 || p.metadata.UpgradeStandby() {
+				t.Fatalf("valid/legacy activation: code=%d calls=%d body=%s", out.Code, calls, out.Body.String())
+			}
+		})
+	}
+}
+
 func TestNativeUncertainProofKeepsParentFences(t *testing.T) {
 	cfg := gateway.Config{SandboxProfile: "nfs-rootless-v1", ControlToken: "control", PodUID: "pod", GatewayPortStart: 20000, GatewayPortEnd: 20002, GatewayPortBlockSize: 3}
 	intent := containerStopIntent{Version: 1, OperationID: "0123456789abcdef0123456789abcdef", PodUID: "pod", Slot: "slot-0", GatewayID: "gw-2-3", InstanceID: 2, UserID: 1, Generation: 3, WorkerEpoch: "abcdef0123456789abcdef0123456789", AssignmentDigest: strings.Repeat("a", 64), Kind: "maintenance"}

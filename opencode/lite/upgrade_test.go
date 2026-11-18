@@ -45,8 +45,19 @@ func TestOpenCodePreserveCapabilityIsDeliveredImageOnly(t *testing.T) {
 	}
 	t.Setenv("CLAWMANAGER_OPENCODE_UPGRADE_PROTOCOL", "opencode-preserve-v1")
 	metadata := p.RegistrationMetadata(gateway.Config{})
-	if metadata.ProtocolVersion != "opencode-preserve-v1" || metadata.SessionStore != "sqlite" || len(metadata.Capabilities) != 4 || metadata.OpenClawVersion != "" {
-		t.Fatalf("missing native delivery metadata: %+v", metadata)
+	proof := validateOpenCodeNativePayload(context.Background())
+	if proof != nil {
+		if metadata.ProtocolVersion != "" || metadata.SessionStore != "" || len(metadata.Capabilities) != 0 {
+			t.Fatalf("ENV advertised an unverified native payload: %+v", metadata)
+		}
+	} else if metadata.ProtocolVersion != "opencode-preserve-v1" || metadata.SessionStore != "sqlite" || len(metadata.Capabilities) != 5 || metadata.OpenClawVersion != "" {
+		t.Fatalf("verified native payload lost delivery metadata: %+v", metadata)
+	}
+}
+
+func TestOpenCodeNativePayloadAndPodUIDCapabilityDistinguishesLegacyTarget(t *testing.T) {
+	if len(OpenCodeUpgradeCapabilities) != 5 || OpenCodeUpgradeCapabilities[4] != "opencode.native-payload-poduid-v1" {
+		t.Fatalf("target cannot distinguish legacy ENV-only four-capability images: %v", OpenCodeUpgradeCapabilities)
 	}
 }
 
