@@ -153,7 +153,7 @@ func TestPhysicalSlotResetEmptyBookSurvivesRestart(t *testing.T) {
 }
 
 func TestPhysicalSlotResetRejectsUnknownOrActiveOwnerAndChangedProof(t *testing.T) {
-	for _, kind := range []string{"unknown-owner", "current-worker", "wrong-digest", "wrong-new-worker", "namespace", "container", "receipt-digest", "unconfirmed", "maintenance", "lease", "malformed-book", "reconcile-save", "release-save"} {
+	for _, kind := range []string{"unknown-owner", "current-worker", "wrong-digest", "wrong-new-worker", "namespace", "node-name", "container", "receipt-digest", "unconfirmed", "maintenance", "lease", "malformed-book", "reconcile-save", "release-save"} {
 		t.Run(kind, func(t *testing.T) {
 			w, p := slotResetFixture(t)
 			r := p["receipt"].(map[string]any)
@@ -170,6 +170,8 @@ func TestPhysicalSlotResetRejectsUnknownOrActiveOwnerAndChangedProof(t *testing.
 				p["current_worker_epoch"] = strings.Repeat("f", 32)
 			case "namespace":
 				w.cfg.Namespace = "different"
+			case "node-name":
+				w.cfg.NodeName = "different-node"
 			case "container":
 				r["container_id"] = "containerd://" + strings.Repeat("2", 64)
 			case "receipt-digest":
@@ -230,5 +232,26 @@ func TestPhysicalSlotResetQuarantinesUnreadableOwnerlessBook(t *testing.T) {
 		}
 		p["worker_epoch"], p["assignment_digest"] = "", ""
 		resetCall(t, w, p, "reconcile-reset", 409)
+	}
+}
+
+func TestPhysicalSlotResetRejectsNoncanonicalCoordinatorRoute(t *testing.T) {
+	w, proof := slotResetFixture(t)
+	cfg := w.cfg
+	cfg.GatewayPortStart, cfg.GatewayPortEnd, cfg.GatewayPortBlockSize = 20000, 20000, 1
+	p, err := NewPool(cfg, 1, func(context.Context, int, string, string, []byte) (int, []byte, error) {
+		t.Fatal("invalid physical slot route reached a worker")
+		return 0, nil, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(proof)
+	r := httptest.NewRequest(http.MethodPost, "/v1/slots/slot-00/reconcile-reset", bytes.NewReader(raw))
+	r.Header.Set(gateway.ControlTokenHeader, cfg.ControlToken)
+	out := httptest.NewRecorder()
+	p.ServeHTTP(out, r)
+	if out.Code != 400 {
+		t.Fatalf("ambiguous slot route returned %d", out.Code)
 	}
 }

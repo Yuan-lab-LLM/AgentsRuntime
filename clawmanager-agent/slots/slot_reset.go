@@ -64,7 +64,7 @@ func (w *Worker) validateSlotReset(p slotResetRequest) error {
 	if p.CurrentWorkerEpoch != w.workerEpoch || !executionTokenValid(w.workerEpoch) || p.WorkerEpoch == w.workerEpoch || p.WorkerEpoch != "" && !executionTokenValid(p.WorkerEpoch) {
 		return errors.New("physical slot reset worker epoch changed")
 	}
-	if s.Version != 1 || s.PodUID != w.cfg.PodUID || s.Namespace != w.cfg.Namespace || s.PodName != w.cfg.PodName || s.ContainerName != w.slotName || !strings.HasPrefix(s.ContainerID, "containerd://") || !resetDigestValid(strings.TrimPrefix(s.ContainerID, "containerd://")) {
+	if s.Version != 1 || s.PodUID != w.cfg.PodUID || s.Namespace != w.cfg.Namespace || s.PodName != w.cfg.PodName || w.cfg.NodeName != "" && s.NodeName != w.cfg.NodeName || s.ContainerName != w.slotName || !strings.HasPrefix(s.ContainerID, "containerd://") || !resetDigestValid(strings.TrimPrefix(s.ContainerID, "containerd://")) {
 		return errors.New("physical slot scope changed")
 	}
 	for _, v := range []string{s.OperationID, s.Namespace, s.PodName, s.PodUID, s.NodeName, s.NodeUID, s.NodeBootID} {

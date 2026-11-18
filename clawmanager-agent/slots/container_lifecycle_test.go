@@ -426,7 +426,20 @@ func (s auxiliaryResetStarter) PrepareGateway(ctx context.Context, req gateway.C
 func TestContainerResetJoinedAuxiliaryRequiresExactExitAfterPrimary(t *testing.T) {
 	for _, kind := range []string{"stop", "sleep", "force-delete", "primary-error", "network-error"} {
 		t.Run(kind, func(t *testing.T) {
-			t.Setenv("RUNTIME_SLOT_TERMINATION_MESSAGE_PATH", "") // Exercise durable preparation without writing a host termination file.
+			// The optional fixture is a temporary file bound at /dev/termination-log
+			// in a private mount namespace. Never overwrite an unrelated host file.
+			const terminationLog = "/dev/termination-log"
+			fixture := os.Getenv("RUNTIME_SLOT_TEST_KUBELET_FILE")
+			if fixture == "" {
+				t.Setenv("RUNTIME_SLOT_TERMINATION_MESSAGE_PATH", "")
+			} else {
+				original, err := os.Lstat(fixture)
+				mounted, mountErr := os.Lstat(terminationLog)
+				if filepath.Dir(fixture) == "/dev" || err != nil || mountErr != nil || !original.Mode().IsRegular() || !os.SameFile(original, mounted) {
+					t.Fatal("an independently named, bind-mounted kubelet test fixture is required")
+				}
+				t.Setenv("RUNTIME_SLOT_TERMINATION_MESSAGE_PATH", terminationLog)
+			}
 			w, intent := forceDeleteWorker(t)
 			intent.Graceful = kind == "sleep"
 			if kind == "force-delete" {
@@ -489,8 +502,13 @@ func TestContainerResetJoinedAuxiliaryRequiresExactExitAfterPrimary(t *testing.T
 			if err = w.network.closeForContainerReset(context.Background()); err == nil || !strings.Contains(err.Error(), "auxiliary writer stop unconfirmed") {
 				t.Fatalf("missing original failure: %v", err)
 			}
-			if callContainerStop(w, intent) != 409 {
-				t.Fatal("missing kubelet receipt file allowed termination")
+			success := kind != "primary-error" && kind != "network-error"
+			wantStatus := http.StatusConflict
+			if success && fixture != "" {
+				wantStatus = http.StatusAccepted
+			}
+			if status := callContainerStop(w, intent); status != wantStatus {
+				t.Fatalf("prepare returned %d, expected %d", status, wantStatus)
 			}
 			raw, err := os.ReadFile(w.book.path)
 			if err != nil {
@@ -508,8 +526,19 @@ func TestContainerResetJoinedAuxiliaryRequiresExactExitAfterPrimary(t *testing.T
 				}
 				return
 			}
-			if !prepared || releaseCalls != 1 || !strings.HasPrefix(commitment, "C2:") || w.resetReady || w.book.TerminationProof != nil || w.book.Assignment.State == "stopped" {
+			if !prepared || releaseCalls != 1 || !strings.HasPrefix(commitment, "C2:") || w.resetReady != (fixture != "") || w.book.TerminationProof != nil || w.book.Assignment.State == "stopped" {
 				t.Fatalf("missing fenced C2 primary authorization: prepared=%t network=%d book=%s", prepared, releaseCalls, raw)
+			}
+			if fixture != "" {
+				data, err := os.ReadFile(fixture)
+				if err != nil || string(data) != commitment {
+					t.Fatalf("kubelet did not receive the exact durable C2: %q %v", data, err)
+				}
+				select {
+				case <-w.reset:
+				default:
+					t.Fatal("worker did not request its container exit")
+				}
 			}
 			var message map[string]any
 			raw, _ = json.Marshal(intent)
