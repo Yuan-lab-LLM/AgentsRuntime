@@ -172,7 +172,7 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.forward(w, copyReq, index, nil)
 			return
 		}
-		if (parts[1] == "reconcile-stop" || parts[1] == "release-stop" || parts[1] == "reconcile-fault-stop" || parts[1] == "release-fault-stop") && r.Method == http.MethodPost {
+		if (parts[1] == "reconcile-stop" || parts[1] == "release-stop" || parts[1] == "reconcile-fault-stop" || parts[1] == "release-fault-stop" || parts[1] == "reconcile-reset" || parts[1] == "release-reset") && r.Method == http.MethodPost {
 			body, err := io.ReadAll(io.LimitReader(r.Body, 16385))
 			if err != nil || len(body) > 16384 {
 				http.Error(w, "invalid reconciliation", 400)

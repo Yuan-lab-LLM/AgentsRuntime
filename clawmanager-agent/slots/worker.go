@@ -135,6 +135,10 @@ func (w *Worker) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		w.serveNativeMaintenanceReconcile(out, r)
 		return
 	}
+	if w.cfg.SandboxProfile == "nfs-rootless-v1" && (r.URL.Path == "/v1/reconcile-reset" || r.URL.Path == "/v1/release-reset") && r.Method == http.MethodPost {
+		w.serveSlotReset(out, r, r.URL.Path == "/v1/release-reset")
+		return
+	}
 	if w.cfg.SandboxProfile == "nfs-rootless-v1" && (r.URL.Path == "/v1/reconcile-fault-stop" || r.URL.Path == "/v1/release-fault-stop") && r.Method == http.MethodPost {
 		w.serveFaultRecovery(out, r, r.URL.Path == "/v1/release-fault-stop")
 		return

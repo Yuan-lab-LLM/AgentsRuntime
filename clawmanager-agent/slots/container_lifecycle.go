@@ -90,7 +90,7 @@ func decodeContainerOperation(r *http.Request, out any) error {
 
 func (w *Worker) matchesContainerIntent(intent containerStopIntent) bool {
 	a := w.book.Assignment
-	return a != nil && intent.Version == 1 && executionTokenValid(intent.OperationID) &&
+	return w.book.PendingReset == nil && a != nil && intent.Version == 1 && executionTokenValid(intent.OperationID) &&
 		intent.PodUID == w.cfg.PodUID && intent.PodUID == a.PodUID && intent.Slot == w.slotName &&
 		intent.GatewayID == a.GatewayID && intent.InstanceID == a.InstanceID && intent.UserID == a.UserID &&
 		intent.Generation == a.Generation && intent.WorkerEpoch == a.WorkerEpoch && executionTokenValid(intent.WorkerEpoch) &&
@@ -352,6 +352,10 @@ func (w *Worker) serveContainerRelease(out http.ResponseWriter, r *http.Request)
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	a := w.book.Assignment
+	if w.book.PendingReset != nil {
+		http.Error(out, "physical slot reset awaiting release", 409)
+		return
+	}
 	if a == nil {
 		http.Error(out, "slot release state is unknown", 409)
 		return

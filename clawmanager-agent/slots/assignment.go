@@ -13,16 +13,18 @@ import (
 )
 
 type book struct {
-	LastFaultRelease *faultSlotRecovery         `json:"last_fault_release,omitempty"`
-	FaultRecovery    *faultSlotRecovery         `json:"fault_recovery,omitempty"`
-	StopIntent       *containerStopIntent       `json:"stop_intent,omitempty"`
-	TerminationProof *containerTerminationProof `json:"termination_proof,omitempty"`
-	StopFinalized    bool                       `json:"stop_finalized,omitempty"`
-	Maintenance      *nativeMaintenanceBook     `json:"maintenance,omitempty"`
-	Assignment       *Assignment                `json:"assignment,omitempty"`
-	Digest           string                     `json:"digest,omitempty"`
-	path             string
-	quarantined      bool
+	PendingReset      *slotResetProof `json:"pending_reset,omitempty"`
+	unrecognizedEmpty bool
+	LastFaultRelease  *faultSlotRecovery         `json:"last_fault_release,omitempty"`
+	FaultRecovery     *faultSlotRecovery         `json:"fault_recovery,omitempty"`
+	StopIntent        *containerStopIntent       `json:"stop_intent,omitempty"`
+	TerminationProof  *containerTerminationProof `json:"termination_proof,omitempty"`
+	StopFinalized     bool                       `json:"stop_finalized,omitempty"`
+	Maintenance       *nativeMaintenanceBook     `json:"maintenance,omitempty"`
+	Assignment        *Assignment                `json:"assignment,omitempty"`
+	Digest            string                     `json:"digest,omitempty"`
+	path              string
+	quarantined       bool
 }
 
 func openBook(dir string) (*book, error) {
@@ -40,7 +42,16 @@ func openBook(dir string) (*book, error) {
 	if err = json.Unmarshal(data, b); err != nil {
 		return nil, fmt.Errorf("invalid slot assignment: %w", err)
 	}
-	b.quarantined = b.Assignment != nil && (b.Assignment.State != "stopped" || (b.TerminationProof != nil || b.FaultRecovery != nil) && !b.StopFinalized && !b.faultFinalized())
+	// Only an empty object or the pending reset written for an empty slot
+	// proves an ownerless book. An unrecognized schema must stay fenced.
+	if b.Assignment == nil {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(data, &fields); err != nil {
+			return nil, err
+		}
+		b.unrecognizedEmpty = fields == nil || len(fields) != 0 && !(len(fields) == 1 && b.PendingReset != nil)
+	}
+	b.quarantined = b.unrecognizedEmpty || b.PendingReset != nil || b.Assignment != nil && (b.Assignment.State != "stopped" || (b.TerminationProof != nil || b.FaultRecovery != nil) && !b.StopFinalized && !b.faultFinalized())
 	return b, nil
 }
 
