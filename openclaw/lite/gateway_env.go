@@ -23,6 +23,7 @@ func OpenClawGatewayEnv(base []string, cfg gateway.Config, req gateway.CreateGat
 	}
 	if cfg.RuntimeType == "openclaw" {
 		env = gateway.ApplyLiteTeamConfigEnvironment(env, req, workspacePath)
+		env = gateway.SetEnvironmentValue(env, ownerWaitEnvironment, strconv.FormatInt(nativeOwnerWaitBudget(cfg).Milliseconds(), 10))
 	}
 	env = gateway.SetEnvironmentValue(env, "CLAWMANAGER_INSTANCE_ID", strconv.Itoa(req.InstanceID))
 	env = gateway.SetEnvironmentValue(env, "CLAWMANAGER_USER_ID", strconv.Itoa(req.UserID))

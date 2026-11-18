@@ -84,7 +84,7 @@ func (p Profile) GatewayProcessCommand(command, env []string) []string {
 	if p.Type() != "openclaw" {
 		return command
 	}
-	return gateway.LiteTeamGatewayCommand(p.Type(), command, env)
+	return controlledGatewayCommand(command, env)
 }
 func (p Profile) prepareTeamWorkspace(cfg gateway.Config, req gateway.CreateGatewayRequest, workspace string) error {
 	if p.Type() != "openclaw" {
