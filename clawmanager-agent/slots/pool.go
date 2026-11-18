@@ -365,6 +365,17 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.forward(w, r, selected, body)
 		return
 	}
+	if strings.HasPrefix(r.URL.Path, "/v1/openclaw/writer-leases/") {
+		var req gateway.WorkspaceUpgradeRequest
+		if json.Unmarshal(body, &req) != nil {
+			http.Error(w, "invalid writer lease request", http.StatusBadRequest)
+			return
+		}
+		if err := gateway.ValidateUpgradePodIdentity(p.cfg, req); err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+	}
 	snapshots, _ := p.snapshots(r.Context())
 	if strings.HasPrefix(r.URL.Path, "/v1/gateways/") {
 		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/gateways/"), "/stop")

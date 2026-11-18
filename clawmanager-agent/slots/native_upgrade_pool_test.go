@@ -404,3 +404,41 @@ func TestNativeFinalizedResumeWithoutIdleSlot(t *testing.T) {
 		})
 	}
 }
+
+func TestPoolWriterLeaseExpectedPodBeforeWorkerCalls(t *testing.T) {
+	for _, action := range []string{"acquire", "renew", "release"} {
+		for _, pod := range []string{"old", "new", ""} {
+			t.Run(action+"-expected-"+pod, func(t *testing.T) {
+				calls, leaseCalls := 0, 0
+				cfg := gateway.Config{ControlToken: "ctl", PodUID: "new", RuntimeType: "opencode", WorkspaceRoot: t.TempDir(), GatewayPortStart: 20000, GatewayPortEnd: 20000, GatewayPortBlockSize: 1}
+				path := "/v1/openclaw/writer-leases/" + action
+				p, err := NewPool(cfg, 1, func(_ context.Context, _ int, _ string, target string, _ []byte) (int, []byte, error) {
+					calls++
+					if target == "/v1/slot-state" {
+						return 200, []byte(`{"gateways":[]}`), nil
+					}
+					if target != path {
+						t.Errorf("unexpected worker path %s", target)
+					}
+					leaseCalls++
+					return 200, []byte(`{"ok":true}`), nil
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				body, _ := json.Marshal(gateway.WorkspaceUpgradeRequest{ExpectedPodUID: pod, RolloutID: "r1", InstanceID: 7, UserID: 2, Generation: 3})
+				r := httptest.NewRequest(http.MethodPost, path, strings.NewReader(string(body)))
+				r.Header.Set(gateway.ControlTokenHeader, "ctl")
+				out := httptest.NewRecorder()
+				p.ServeHTTP(out, r)
+				if pod == "old" {
+					if out.Code != 409 || calls != 0 || leaseCalls != 0 {
+						t.Fatalf("stale UID contacted worker: code=%d calls=%d leases=%d", out.Code, calls, leaseCalls)
+					}
+				} else if out.Code != 200 || leaseCalls != 1 {
+					t.Fatalf("valid/legacy lease failed: code=%d calls=%d leases=%d", out.Code, calls, leaseCalls)
+				}
+			})
+		}
+	}
+}

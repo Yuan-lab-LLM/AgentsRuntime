@@ -102,3 +102,49 @@ func TestNativeMaintenanceResultRequiresOldContainerProof(t *testing.T) {
 		})
 	}
 }
+
+func TestNativeMaintenanceHandlerExpectedPodBeforeReservation(t *testing.T) {
+	for _, pod := range []string{"old", "new", ""} {
+		t.Run("expected-"+pod, func(t *testing.T) {
+			cfg := gateway.Config{SandboxProfile: "nfs-rootless-v1", RuntimeType: "opencode", PodUID: "new", ControlToken: "ctl", AgentDataDir: t.TempDir()}
+			b, err := openBook(cfg.AgentDataDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			w := &Worker{cfg: cfg, book: b, slotName: "slot-1", workerEpoch: strings.Repeat("1", 32), network: &networkOwner{}, manager: gateway.NewGatewayManager(cfg, nil, nil), reset: make(chan struct{})}
+			op := gateway.NativeUpgradeOperation{OperationID: strings.Repeat("2", 32), Action: "inventory", Request: gateway.WorkspaceUpgradeRequest{ExpectedPodUID: pod, RolloutID: "r1", InstanceID: 7, UserID: 2, Generation: 3, UID: 200007, GID: 200007}}
+			if pod != "old" {
+				// An exact accepted retry must return the original intent without relaunching a helper.
+				operation, _ := json.Marshal(op)
+				if _, err = w.reserveNativeMaintenance(op.OperationID, operation, 7, 2, 3); err != nil {
+					t.Fatal(err)
+				}
+				b.Maintenance.Started = true
+				if err = b.save(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, beforeErr := os.ReadFile(b.path)
+			body, _ := json.Marshal(nativeUpgradeWorkerRequest{Operation: op})
+			r := httptest.NewRequest(http.MethodPost, "/v1/native-upgrade", bytes.NewReader(body))
+			r.Header.Set(gateway.ControlTokenHeader, "ctl")
+			out := httptest.NewRecorder()
+			w.ServeHTTP(out, r)
+			w.mu.Lock()
+			defer w.mu.Unlock()
+			after, afterErr := os.ReadFile(b.path)
+			if pod == "old" {
+				if out.Code != 409 || b.Maintenance != nil || b.Assignment != nil || b.StopIntent != nil || w.resetReady || !os.IsNotExist(beforeErr) || !os.IsNotExist(afterErr) {
+					t.Fatalf("stale UID reserved/wrote maintenance: code=%d reserved=%v assigned=%v before=%v after=%v reset=%v", out.Code, b.Maintenance != nil, b.Assignment != nil, beforeErr, afterErr, w.resetReady)
+				}
+			} else if out.Code != 202 || !bytes.Equal(before, after) || beforeErr != nil || afterErr != nil {
+				t.Fatalf("valid/legacy retry changed reservation: code=%d before=%v after=%v", out.Code, beforeErr, afterErr)
+			}
+			select {
+			case <-w.reset:
+				t.Fatal("request reset the slot")
+			default:
+			}
+		})
+	}
+}

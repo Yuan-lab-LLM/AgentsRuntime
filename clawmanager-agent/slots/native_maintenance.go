@@ -59,6 +59,10 @@ func (w *Worker) serveNativeMaintenance(out http.ResponseWriter, r *http.Request
 		return
 	}
 	op := request.Operation
+	if err := gateway.ValidateUpgradePodIdentity(w.cfg, op.Request); err != nil {
+		http.Error(out, err.Error(), http.StatusConflict)
+		return
+	}
 	operation, err := json.Marshal(op)
 	if err != nil {
 		http.Error(out, "invalid native maintenance operation", 400)
