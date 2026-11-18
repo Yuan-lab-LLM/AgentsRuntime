@@ -36,7 +36,7 @@ class PreserveTests(unittest.TestCase):
         db.executescript("\n".join(manifest["sql"]))
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA wal_autocheckpoint=0")
-        db.execute("CREATE TABLE migration(id TEXT PRIMARY KEY,time_completed INTEGER NOT NULL)")
+        db.execute('CREATE TABLE "migration" (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL)')
         db.executemany("INSERT INTO migration VALUES(?,1)", [(x,) for x in manifest["migrations"]])
         db.execute("INSERT INTO project(id,worktree,time_created,time_updated,sandboxes) VALUES('prj','/workspace/project',1,1,'[]')")
         db.execute("INSERT INTO session(id,project_id,slug,directory,title,version,time_created,time_updated) VALUES('ses','prj','s','/workspace/project','Fixture','1.18.13',1,1)")
@@ -51,10 +51,21 @@ class PreserveTests(unittest.TestCase):
         db.commit()
         return db
 
-    def call(self, action, ok=True, **extra):
+    def call(self, action, ok=True, fault=None, **extra):
         payload = dict(action=action, workspace=str(self.workspace), capsule=str(self.capsule),
                        request={**self.req, **extra}, schema=json.loads((HERE / "upgrade_schema.json").read_text()))
-        p = subprocess.run(["/usr/bin/python3", "-I", "-B", str(HERE / "upgrade_helper.py")],
+        command = ["/usr/bin/python3", "-I", "-B", str(HERE / "upgrade_helper.py")]
+        if fault:
+            script = "import errno,os,runpy\n"
+            if fault == "rename_after_success":
+                script += "original=os.rename\ndef fail(*a,**kw):\n original(*a,**kw)\n raise OSError(errno.ESTALE,'private fault path must not leak')\nos.rename=fail\n"
+            elif fault == "capsule_fsync_after_write":
+                script += "original=os.fsync\ndef fail(fd):\n original(fd)\n if os.readlink('/proc/self/fd/'+str(fd)).startswith(" + repr(str(self.capsule)) + "):\n  raise OSError(errno.EIO,'private fault path must not leak')\nos.fsync=fail\n"
+            else:
+                self.fail("unknown fault fixture")
+            script += "runpy.run_path(" + repr(str(HERE / "upgrade_helper.py")) + ",run_name='__main__')\n"
+            command = ["/usr/bin/python3", "-I", "-B", "-c", script]
+        p = subprocess.run(command,
                            input=json.dumps(payload), text=True, capture_output=True)
         if ok:
             self.assertEqual(0, p.returncode, p.stderr)
@@ -95,6 +106,37 @@ class PreserveTests(unittest.TestCase):
         db.commit()
         self.call("compatibility", ok=False)
 
+    def test_missing_native_unique_index_is_rejected(self):
+        db = self.fixture()
+        db.execute("DROP INDEX event_aggregate_seq_idx")
+        db.commit()
+        before = (self.data / "opencode.db-wal").read_bytes()
+        self.call("compatibility", ok=False)
+        self.assertEqual(before, (self.data / "opencode.db-wal").read_bytes())
+        self.assertFalse((self.capsule / "opencode-preserve").exists())
+
+    def test_hidden_generated_column_is_rejected(self):
+        db = self.fixture()
+        db.execute("ALTER TABLE event ADD COLUMN generated_hidden TEXT GENERATED ALWAYS AS(type) VIRTUAL")
+        db.commit()
+        self.call("compatibility", ok=False)
+
+    def test_changed_native_check_constraint_is_rejected(self):
+        db = self.fixture()
+        sql = db.execute("SELECT sql FROM sqlite_schema WHERE name='event'").fetchone()[0]
+        at = sql.rfind(")")
+        changed = sql[:at] + ", CHECK(seq >= 0)" + sql[at:]
+        db.execute("PRAGMA writable_schema=ON")
+        db.execute("UPDATE sqlite_schema SET sql=? WHERE name='event'", (changed,))
+        db.commit()
+        self.call("compatibility", ok=False)
+
+    def test_unknown_drizzle_journal_layout_is_rejected(self):
+        db = self.fixture()
+        db.execute("CREATE TABLE __drizzle_migrations(arbitrary BLOB)")
+        db.commit()
+        self.call("compatibility", ok=False)
+
     def test_restore_preserves_new_history_and_rejects_stale_identity(self):
         db = self.fixture()
         self.call("migrate")
@@ -131,6 +173,68 @@ class PreserveTests(unittest.TestCase):
         db.execute("UPDATE session SET time_updated=99,cost=2,tokens_input=3")
         db.execute("INSERT INTO session_message(id,session_id,type,seq,time_created,time_updated,data) VALUES('new','ses','user',2,2,2,'{}')")
         db.commit()
+        self.call("restore", preserve_session_sqlite=True)
+
+    def test_preserve_rollback_allows_native_event_progress_and_credential_rotation(self):
+        db = self.fixture()
+        self.call("migrate")
+        db.execute("INSERT INTO event(id,aggregate_id,seq,type,data) VALUES('next','ses',2,'fixture','{}')")
+        db.execute("UPDATE event_sequence SET seq=2")
+        db.execute("UPDATE credential SET value='rotated-secret',time_updated=2,active=1")
+        db.execute("UPDATE session_context_epoch SET baseline_seq=2,snapshot='{}',baseline='new-baseline'")
+        db.execute("UPDATE session_input SET promoted_seq=2")
+        db.commit()
+        self.call("restore", preserve_session_sqlite=True)
+
+    def test_preserve_rollback_rejects_deleted_original_legacy_message(self):
+        db = self.fixture()
+        self.call("migrate")
+        db.execute("DELETE FROM part")
+        db.execute("DELETE FROM message")
+        db.commit()
+        self.call("restore", ok=False, preserve_session_sqlite=True)
+
+    def test_preserve_rollback_rejects_deleted_original_part(self):
+        db = self.fixture()
+        self.call("migrate")
+        db.execute("DELETE FROM part")
+        db.commit()
+        self.call("restore", ok=False, preserve_session_sqlite=True)
+
+    def test_preserve_rollback_rejects_deleted_original_input(self):
+        db = self.fixture()
+        self.call("migrate")
+        db.execute("DELETE FROM session_input")
+        db.commit()
+        self.call("restore", ok=False, preserve_session_sqlite=True)
+
+    def test_restore_rejects_lost_original_config_without_overwriting_current(self):
+        self.fixture()
+        config = self.workspace / "home/.opencode/opencode.json"
+        config.write_text('{"provider":{},"permission":{"bash":"ask"}}')
+        self.call("migrate")
+        config.write_text("{}")
+        self.call("restore", ok=False, preserve_session_sqlite=True)
+        self.assertEqual("{}", config.read_text())
+
+    def test_restore_and_restore_status_require_original_non_database_state(self):
+        self.fixture()
+        state = self.workspace / "home/.local/state/opencode/important.json"
+        state.parent.mkdir(parents=True)
+        state.write_text('{"setting":"preserved"}')
+        self.call("migrate")
+        self.call("restore", preserve_session_sqlite=True)
+        state.unlink()
+        self.call("restore-status", ok=False, preserve_session_sqlite=True)
+
+    def test_restore_allows_config_additions_and_append_only_native_logs(self):
+        self.fixture()
+        log = self.data / "log/native.log"
+        log.parent.mkdir()
+        log.write_text("original log\n")
+        self.call("migrate")
+        (self.workspace / "home/.opencode/opencode.json").write_text('{"provider":{},"new_option":true}')
+        log.write_text("original log\nnew log\n")
         self.call("restore", preserve_session_sqlite=True)
 
     def test_final_capsule_recovers_lost_receipt_publication(self):
@@ -176,6 +280,40 @@ class PreserveTests(unittest.TestCase):
         (incomplete / "database.sqlite").write_bytes(b"partial")
         self.call("migration-status", ok=False)
         self.call("migrate", ok=False)
+
+    def test_ambiguous_native_capsule_io_returns_uncertain_exit_and_can_resume(self):
+        self.fixture()
+        before = {p.name: p.read_bytes() for p in self.data.iterdir()}
+        for fault in ("capsule_fsync_after_write", "rename_after_success"):
+            result = self.call("migrate", ok=False, fault=fault)
+            self.assertEqual(75, result.returncode, result.stderr)
+            self.assertNotIn("private fault", result.stderr)
+        self.assertEqual(before, {p.name: p.read_bytes() for p in self.data.iterdir()})
+        self.assertEqual("validated", self.call("migrate")["status"])
+
+    def test_known_schema_rejection_is_a_confirmed_failure(self):
+        db = self.fixture()
+        db.execute("DROP INDEX event_aggregate_seq_idx")
+        db.commit()
+        self.assertEqual(1, self.call("migrate", ok=False).returncode)
+
+    def test_native_repository_cache_is_not_traversed_or_copied(self):
+        self.fixture()
+        project = self.data / "repos/actual-project/.git/objects"
+        project.mkdir(parents=True)
+        os.mkfifo(project / "must-never-open")
+        (project / "source-object").write_bytes(b"project git object")
+        self.call("migrate")
+        self.assertFalse(any("repos" in p.parts for p in (self.capsule / "opencode-preserve/original").rglob("*")))
+        self.assertTrue((project / "must-never-open").is_fifo())
+
+    def test_native_snapshot_git_objects_are_not_traversed_or_copied(self):
+        self.fixture()
+        project = self.data / "snapshot/project-id/objects"
+        project.mkdir(parents=True)
+        os.mkfifo(project / "must-never-open")
+        self.call("migrate")
+        self.assertFalse(any("snapshot" in p.parts for p in (self.capsule / "opencode-preserve/original").rglob("*")))
 
 
 if __name__ == "__main__":

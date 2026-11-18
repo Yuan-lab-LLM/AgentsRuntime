@@ -8,6 +8,7 @@ import contextlib
 import datetime
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -19,14 +20,20 @@ import uuid
 
 ROOTS = ("home/.opencode", "home/.local/share/opencode", "home/.local/state/opencode",
          "home/.config/opencode")
+EXCLUDED_PROJECT_ROOTS = ("home/.local/share/opencode/repos", "home/.local/share/opencode/snapshot")
 DB = "home/.local/share/opencode/opencode.db"
 HISTORY = ("session", "message", "part", "session_message", "session_input", "session_context_epoch")
 PROTOCOL = "opencode-preserve-v1"
+UNCERTAIN_EXIT = 75
+
+
+class NativeRejected(ValueError):
+    """A fixed, confirmed validation rejection, distinct from storage failure."""
 
 
 def require(ok, code):
     if not ok:
-        raise ValueError(code)
+        raise NativeRejected(code)
 
 
 def encode(value):
@@ -128,8 +135,15 @@ class Tree:
 
         def visit(fd, relative, depth):
             require(depth < 64, "native_tree_too_deep")
-            for name in sorted(os.listdir(fd)):
+            names = sorted(os.listdir(fd))
+            require(".git" not in names and not {"HEAD", "objects", "refs"}.issubset(names),
+                    "unclassified_project_repository")
+            for name in names:
                 child = relative + "/" + name
+                if child in EXCLUDED_PROJECT_ROOTS:
+                    # These pinned native paths are project/Git caches. Do not
+                    # stat, descend into, hash, or copy any of their contents.
+                    continue
                 st = os.stat(name, dir_fd=fd, follow_symlinks=False)
                 require(st.st_uid == self.uid, "unsafe_native_owner")
                 if stat.S_ISDIR(st.st_mode):
@@ -260,18 +274,29 @@ def catalog(path, schema):
         reference = sqlite3.connect(":memory:")
         try:
             reference.executescript("\n".join(schema["sql"]))
-            reference.execute("CREATE TABLE migration(id TEXT PRIMARY KEY,time_completed INTEGER NOT NULL)")
+            reference.execute(schema["journal_sql"])
             expected = [r[0] for r in reference.execute("SELECT name FROM sqlite_master WHERE type='table'")]
             actual = [r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
-            require(set(actual) in (set(expected), set(expected) | {"__drizzle_migrations"}),
-                    "unsupported_database_tables")
-            require(not db.execute("SELECT 1 FROM sqlite_master WHERE type IN ('view','trigger')").fetchall(),
-                    "unsupported_database_objects")
+            require(set(actual) == set(expected), "unsupported_database_tables")
+            # The observed pinned binary's empty bootstrap matches these exact
+            # DDL strings. This checks CHECK/UNIQUE/table options as well as the
+            # object inventory; an arbitrary historical Drizzle layout is not
+            # part of this first preserve contract.
+            schema_query = "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name"
+            require(db.execute(schema_query).fetchall() == reference.execute(schema_query).fetchall(),
+                    "unsupported_database_schema")
             for table in expected:
-                for pragma in ("table_info", "foreign_key_list"):
+                for pragma in ("table_xinfo", "foreign_key_list"):
                     require(db.execute("PRAGMA " + pragma + "(" + quote(table) + ")").fetchall() ==
                             reference.execute("PRAGMA " + pragma + "(" + quote(table) + ")").fetchall(),
                             "unsupported_database_schema")
+                indexes = sorted(row[1:] for row in db.execute("PRAGMA index_list(" + quote(table) + ")"))
+                required_indexes = sorted(row[1:] for row in reference.execute("PRAGMA index_list(" + quote(table) + ")"))
+                require(indexes == required_indexes, "unsupported_database_indexes")
+                for index in required_indexes:
+                    query = "PRAGMA index_xinfo(" + quote(index[0]) + ")"
+                    require(db.execute(query).fetchall() == reference.execute(query).fetchall(),
+                            "unsupported_database_indexes")
         finally:
             reference.close()
         tables = {}
@@ -292,7 +317,10 @@ def identity(req):
 def checked_capsule(tree, req):
     raw, _ = tree.read("opencode-preserve/manifest.json")
     manifest = json.loads(raw)
-    require(manifest["identity"] == identity(req) and manifest["protocol"] == PROTOCOL,
+    require(manifest.get("schema_version") == 2 and manifest["identity"] == identity(req) and
+            manifest["protocol"] == PROTOCOL and manifest["native_version"] == "1.18.13" and
+            manifest["native_revision"] == "a105350812f05f914c768e468559dbd6bd508d8e" and
+            manifest.get("excluded_project_roots") == list(EXCLUDED_PROJECT_ROOTS),
             "capsule_identity_mismatch")
     actual, _ = tree.files(["opencode-preserve"])
     actual.pop("opencode-preserve/manifest.json")
@@ -329,23 +357,106 @@ def current_inventory(workspace, schema):
     return files, present, result
 
 
+# Fixed policies for the pinned native schema: immutable transcript content,
+# stable row identities, and explicitly monotonic native progress. Tokens and
+# active-account state may rotate without deleting conversation history.
+CONTINUITY = {
+    "migration": (("id", "time_completed"), ()),
+    "data_migration": (("name", "time_completed"), ()),
+    "session": (("id", "project_id", "parent_id", "directory", "time_created"),
+                ("time_updated", "cost", "tokens_input", "tokens_output", "tokens_reasoning",
+                 "tokens_cache_read", "tokens_cache_write")),
+    "message": (("id", "session_id", "time_created", "data"), ("time_updated",)),
+    "part": (("id", "message_id", "session_id", "time_created", "data"), ("time_updated",)),
+    "session_message": (("id", "session_id", "type", "seq", "time_created", "data"), ("time_updated",)),
+    "session_input": (("id", "session_id", "prompt", "delivery", "admitted_seq", "time_created"), ("promoted_seq",)),
+    "event": (("id", "aggregate_id", "seq", "type", "data"), ()),
+    "event_sequence": (("aggregate_id",), ("seq",)),
+    "session_context_epoch": (("session_id",), ("baseline_seq",)),
+    "credential": (("id", "time_created"), ("time_updated",)),
+    "account": (("id", "email", "url", "time_created"), ("time_updated",)),
+    "control_account": (("email", "url", "time_created"), ("time_updated",)),
+    "account_state": (("id",), ()),
+    "project": (("id", "worktree", "time_created"), ("time_updated",)),
+    "project_directory": (("project_id", "directory", "time_created"), ()),
+    "workspace": (("id", "project_id"), ("time_used",)),
+    "permission": (("id", "project_id", "time_created"), ("time_updated",)),
+    "todo": (("session_id", "position", "time_created"), ("time_updated",)),
+    "session_share": (("session_id", "time_created"), ("time_updated",)),
+}
+
+
+def keyed_rows(db, table):
+    columns = db.execute("PRAGMA table_xinfo(" + quote(table) + ")").fetchall()
+    keys = [row[1] for row in sorted(columns, key=lambda row: row[5]) if row[5]]
+    require(keys, "native_table_identity_missing")
+    rows = {}
+    for values in db.execute("SELECT * FROM " + quote(table)):
+        row = dict(zip([col[1] for col in columns], values))
+        require(all(row[key] is not None for key in keys), "native_row_identity_missing")
+        key = digest([typed(row[key]) for key in keys])
+        require(key not in rows, "native_row_identity_duplicated")
+        rows[key] = row
+    return rows
+
+
 def require_original_history(workspace, files, original_path):
     with private_database(workspace, files) as current_path:
         original, current = db_open(original_path), db_open(current_path)
         try:
             for (table,) in original.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"):
-                # New activity legitimately updates session counters/titles and
-                # timestamps. The stable session identity and all original
-                # messages, queued inputs, credentials and events must remain.
-                columns = "id,project_id,parent_id,directory" if table == "session" else "*"
-                query = "SELECT " + columns + " FROM " + quote(table)
-                current_rows = {digest([typed(v) for v in row]) for row in current.execute(query)}
-                for row in original.execute(query):
-                    require(digest([typed(v) for v in row]) in current_rows,
-                            "original_native_history_missing")
+                require(table in CONTINUITY, "unsupported_native_continuity_policy")
+                immutable, monotonic = CONTINUITY[table]
+                current_rows = keyed_rows(current, table)
+                for key, before in keyed_rows(original, table).items():
+                    require(key in current_rows, "original_native_history_missing")
+                    after = current_rows[key]
+                    require(all(typed(before[col]) == typed(after[col]) for col in immutable),
+                            "original_native_history_changed")
+                    for col in monotonic:
+                        old, new = before[col], after[col]
+                        if old is None and new is None:
+                            continue
+                        require(isinstance(new, (int, float)) and math.isfinite(new) and new >= 0,
+                                "native_progress_invalid")
+                        require(old is None or isinstance(old, (int, float)) and math.isfinite(old) and new >= old,
+                                "native_progress_regressed")
         finally:
             current.close()
             original.close()
+
+
+def json_contains(original, current):
+    if type(original) is not type(current):
+        return False
+    if isinstance(original, dict):
+        return all(key in current and json_contains(value, current[key]) for key, value in original.items())
+    # Arrays and scalar decisions are configuration, not append-only history.
+    return original == current
+
+
+def require_original_files(workspace, files, capsule, manifest):
+    for name, before in manifest["original_files"].items():
+        if name in {DB + suffix for suffix in ("", "-wal", "-shm", "-journal")}:
+            continue
+        require(name in files, "original_native_state_missing")
+        if files[name]["sha256"] == before["sha256"] and files[name]["bytes"] == before["bytes"]:
+            continue
+        archived = "opencode-preserve/original/" + name
+        if name == "home/.opencode/opencode.json":
+            old, _ = capsule.read(archived)
+            new, _ = workspace.read(name)
+            require(json_contains(json.loads(old), json.loads(new)), "original_native_config_changed")
+            continue
+        if name.startswith("home/.local/share/opencode/log/"):
+            with capsule.file(archived) as (old, _), workspace.file(name) as (new, _):
+                while True:
+                    chunk = old.read(1 << 16)
+                    if not chunk:
+                        break
+                    require(new.read(len(chunk)) == chunk, "original_native_log_changed")
+            continue
+        require(False, "original_native_state_changed")
 
 
 def migration_status(capsule, req):
@@ -405,10 +516,11 @@ def migrate(workspace, capsule, req, schema):
         facts = {"opencode-preserve/" + k.split("/", 1)[1]: v for k, v in facts.items()}
     finally:
         stage_tree.close()
-    manifest = {"schema_version": 1, "protocol": PROTOCOL, "identity": identity(req),
+    manifest = {"schema_version": 2, "protocol": PROTOCOL, "identity": identity(req),
                 "native_revision": schema["revision"], "native_version": schema["version"],
                 "journal_sha256": digest(sorted(schema["migrations"])),
                 "original_roots": roots, "original_files": before,
+                "excluded_project_roots": list(EXCLUDED_PROJECT_ROOTS),
                 "database": saved, "files": facts, "created_at": now()}
     raw = encode(manifest)
     write_new(stage / "manifest.json", raw)
@@ -443,6 +555,9 @@ def restore(workspace, capsule, req, schema, status_only=False):
     _, manifest = migration_status(capsule, original)
     path = capsule.path / "opencode-preserve-restore.json"
     preserve = bool(req.get("preserve_session_sqlite"))
+    files, _, current = current_inventory(workspace, schema)
+    require_original_files(workspace, files, capsule, manifest)
+    require_original_history(workspace, files, capsule.path / "opencode-preserve/database.sqlite")
     if path.exists():
         raw = read_receipt(capsule, path.name)
         receipt = json.loads(raw)
@@ -450,8 +565,6 @@ def restore(workspace, capsule, req, schema, status_only=False):
                 "restore_identity_mismatch")
         return receipt["result"]
     require(not status_only, "restore_not_completed")
-    files, _, current = current_inventory(workspace, schema)
-    require_original_history(workspace, files, capsule.path / "opencode-preserve/database.sqlite")
     if not preserve:
         # No schema was changed in this strategy. Reverting a database with new
         # committed rows is unsafe; the caller must explicitly preserve it.
@@ -511,12 +624,17 @@ def main(payload):
 
 if __name__ == "__main__":
     os.umask(0o077)
+    mutating = False
     try:
-        result = main(json.load(sys.stdin))
+        payload = json.load(sys.stdin)
+        mutating = payload.get("action") in ("migrate", "restore")
+        result = main(payload)
         sys.stdout.buffer.write(encode(result))
-    except BaseException as error:
-        # SQLite errors may contain user identifiers or values. Only fixed
-        # helper categories leave this private process.
-        code = str(error) if type(error) is ValueError else "native_preservation_failed"
-        sys.stderr.write(code + "\n")
+    except NativeRejected as error:
+        sys.stderr.write("native_rejected_" + str(error) + "\n")
         sys.exit(1)
+    except BaseException as error:
+        # In particular, fsync/rename EIO and ESTALE may follow a successful NFS
+        # mutation. Never turn them into an ordinary completed rejection.
+        sys.stderr.write("native_storage_uncertain\n" if mutating else "native_preservation_failed\n")
+        sys.exit(UNCERTAIN_EXIT if mutating else 1)

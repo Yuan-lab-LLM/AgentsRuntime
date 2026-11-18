@@ -52,7 +52,7 @@ w=Path(p["workspace"]);data=w/"home/.local/share/opencode";data.mkdir(parents=Tr
 config=w/"home/.opencode";config.mkdir(mode=0o700);(config/"opencode.json").write_text("{}")
 db=sqlite3.connect(data/"opencode.db");db.executescript("\n".join(p["schema"]["sql"]))
 db.execute("PRAGMA journal_mode=WAL");db.execute("PRAGMA wal_autocheckpoint=0")
-db.execute("CREATE TABLE migration(id TEXT PRIMARY KEY,time_completed INTEGER NOT NULL)")
+db.execute(p["schema"]["journal_sql"])
 db.executemany("INSERT INTO migration VALUES(?,1)",[(x,) for x in p["schema"]["migrations"]]);db.commit()
 request=dict(rollout_id="uid-preserve",instance_id=7,user_id=3,generation=2,uid=os.geteuid(),gid=os.getegid())
 op=dict(action="migrate",workspace=p["workspace"],capsule=p["capsule"],request=request,schema=p["schema"])

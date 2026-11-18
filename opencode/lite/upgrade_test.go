@@ -2,6 +2,7 @@ package opencode
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"strings"
@@ -71,5 +72,31 @@ func TestOpenCodeNativeSQLitePreservation(t *testing.T) {
 	cmd := exec.Command("/usr/bin/python3", "-I", "-B", "upgrade_helper_test.py")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("native SQLite regression: %v\n%s", err, output)
+	}
+}
+
+func TestOpenCodeNativeHelperFailuresRetainUncertainFence(t *testing.T) {
+	for _, tc := range []struct {
+		name, script, stderr string
+		uncertain            bool
+	}{
+		{"nfs uncertain exit", "import sys;sys.exit(75)", "native_storage_uncertain", true},
+		{"abnormal child death", "import os,signal;os.kill(os.getpid(),signal.SIGKILL)", "", true},
+		{"unexpected interpreter failure", "import sys;sys.exit(1)", "Traceback: user-controlled-path", true},
+		{"confirmed schema rejection", "import sys;sys.exit(1)", "native_rejected_unsupported_database_schema", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := exec.Command("/usr/bin/python3", "-I", "-B", "-c", tc.script).Run()
+			if err == nil {
+				t.Fatal("failure fixture unexpectedly succeeded")
+			}
+			got := preservationProcessError(context.Background(), err, tc.stderr, true)
+			if errors.Is(got, gateway.ErrNativeStorageUncertain) != tc.uncertain {
+				t.Fatal(got)
+			}
+			if strings.Contains(got.Error(), "user-controlled-path") {
+				t.Fatal("helper diagnostic leaked")
+			}
+		})
 	}
 }

@@ -84,5 +84,6 @@
     "CREATE INDEX `session_workspace_idx` ON `session` (`workspace_id`);",
     "CREATE INDEX `session_parent_idx` ON `session` (`parent_id`);",
     "CREATE INDEX `todo_session_idx` ON `todo` (`session_id`);"
-  ]
+  ],
+  "journal_sql": "CREATE TABLE \"migration\" (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL)"
 }

@@ -165,12 +165,7 @@ func (s *upgradeService) run(ctx context.Context, action string, req gateway.Wor
 	cmd.Stderr = &stderr
 	output, err := cmd.Output()
 	if err != nil {
-		if ctx.Err() != nil || errors.Is(err, syscall.EIO) || errors.Is(err, syscall.ESTALE) {
-			return nil, errors.Join(gateway.ErrNativeStorageUncertain, err)
-		}
-		// The helper emits fixed codes only. Do not expose Python diagnostics,
-		// SQLite values, native output, or user-controlled paths.
-		return nil, errors.New("OpenCode native preservation failed: " + safePreservationCode(stderr.String()))
+		return nil, preservationProcessError(ctx, err, stderr.String(), mutates)
 	}
 	if len(output) == 0 || len(output) > 1<<20 || !json.Valid(output) {
 		return nil, gateway.ErrNativeStorageUncertain
@@ -181,6 +176,23 @@ func (s *upgradeService) run(ctx context.Context, action string, req gateway.Wor
 		}
 	}
 	return output, nil
+}
+
+func preservationProcessError(ctx context.Context, err error, stderr string, mutates bool) error {
+	if ctx.Err() != nil || errors.Is(err, syscall.EIO) || errors.Is(err, syscall.ESTALE) {
+		return errors.Join(gateway.ErrNativeStorageUncertain, err)
+	}
+	code := safePreservationCode(stderr)
+	var exited *exec.ExitError
+	if errors.As(err, &exited) && (exited.ExitCode() == 75 || mutates && (exited.ExitCode() != 1 || !strings.HasPrefix(code, "native_rejected_"))) {
+		return errors.Join(gateway.ErrNativeStorageUncertain, err)
+	}
+	if mutates && !errors.As(err, &exited) {
+		return errors.Join(gateway.ErrNativeStorageUncertain, err)
+	}
+	// The helper emits fixed codes only. Do not expose Python diagnostics,
+	// SQLite values, native output, or user-controlled paths.
+	return errors.New("OpenCode native preservation failed: " + code)
 }
 
 func safePreservationCode(raw string) string {
