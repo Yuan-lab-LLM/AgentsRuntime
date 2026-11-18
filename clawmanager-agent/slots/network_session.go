@@ -12,6 +12,8 @@ import (
 	"github.com/iamlovingit/clawmanager-agent/gateway"
 )
 
+var errAuxiliaryWriterUnconfirmed = fmt.Errorf("%w: auxiliary writer stop unconfirmed", gateway.ErrGatewayStopFailed)
+
 type networkOwner struct {
 	mu     sync.Mutex
 	active *networkSession
@@ -30,6 +32,7 @@ type networkSession struct {
 	fenceIngress               func()
 	mu                         sync.Mutex
 	closing, closed, uncertain bool
+	auxiliaryExitPrepared      bool
 	aux                        sync.WaitGroup
 	closeMu                    sync.Mutex
 }
@@ -154,7 +157,7 @@ func (s *networkSession) close(ctx context.Context) error {
 	uncertain := s.uncertain
 	s.mu.Unlock()
 	if uncertain {
-		return fmt.Errorf("%w: auxiliary writer stop unconfirmed", gateway.ErrGatewayStopFailed)
+		return errAuxiliaryWriterUnconfirmed
 	}
 	if s.release != nil {
 		if err := s.release(ctx); err != nil {

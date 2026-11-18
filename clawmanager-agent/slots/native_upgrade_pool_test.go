@@ -63,6 +63,11 @@ func TestNativeUncertainProofKeepsParentFences(t *testing.T) {
 	released := false
 	session := &nativeUpgradeSession{record: &nativeUpgradeRecord{Intent: &intent, Phase: "held", Operation: gateway.NativeUpgradeOperation{Action: "migrate"}}, path: filepath.Join(t.TempDir(), "record.json"), writer: file, unlock: func() { released = true }}
 	p.maintenance = map[string]*nativeUpgradeSession{intent.OperationID: session}
+	hybrid := proof
+	hybrid.AuxiliaryExitPending = true
+	if _, err = p.finishNativeMaintenance(context.Background(), hybrid); err == nil || session.record.Phase != "held" {
+		t.Fatal("ordinary auxiliary fallback entered native maintenance reconciliation")
+	}
 	if _, err = p.finishNativeMaintenance(context.Background(), proof); !errors.Is(err, gateway.ErrNativeStorageUncertain) {
 		t.Fatalf("uncertain completion accepted: %v", err)
 	}

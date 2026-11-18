@@ -192,6 +192,7 @@ func (w *Worker) reconcileSlotReset(p slotResetProof, release bool) error {
 		// graceful completion to a delayed ordinary reconciliation.
 		if b.TerminationProof == nil && b.FaultRecovery == nil {
 			next.StopIntent = nil
+			next.AuxiliaryExitCommitment = ""
 			old.IdleStop = false
 		}
 		next.Assignment = &old
