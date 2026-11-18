@@ -126,7 +126,7 @@ func TestOpenCodeActualPinnedNativePayloadProof(t *testing.T) {
 	defer func() { deliveredNativePayload = originalPaths }()
 	t.Setenv("CLAWMANAGER_OPENCODE_UPGRADE_PROTOCOL", OpenCodeUpgradeProtocol)
 	metadata := NewProfile("opencode").RegistrationMetadata(gateway.Config{})
-	if metadata.ProtocolVersion != OpenCodeUpgradeProtocol || len(metadata.Capabilities) != 5 || metadata.Capabilities[4] != "opencode.native-payload-poduid-v1" {
+	if metadata.ProtocolVersion != OpenCodeUpgradeProtocol || len(metadata.Capabilities) != 6 || metadata.Capabilities[4] != "opencode.native-payload-poduid-v1" {
 		t.Fatalf("actual verified native payload did not advertise the complete contract: %+v", metadata)
 	}
 	os.WriteFile(path, []byte(`{"native_version":"forged"}`), 0o600)

@@ -12,9 +12,27 @@ import (
 	"time"
 )
 
+// NativeUpgradeParentProof is launcher-produced evidence from the same pinned
+// O_PATH grants audited before bwrap. It is never part of a public request.
+type NativeUpgradeRootProof struct {
+	Path     string `json:"path"`
+	Device   uint64 `json:"device"`
+	Inode    uint64 `json:"inode"`
+	OwnerUID uint32 `json:"owner_uid"`
+	OwnerGID uint32 `json:"owner_gid"`
+	Mode     uint32 `json:"mode"`
+}
+
+type NativeUpgradeParentProof struct {
+	ActorUID int                      `json:"actor_uid"`
+	ActorGID int                      `json:"actor_gid"`
+	Roots    []NativeUpgradeRootProof `json:"roots"`
+}
+
 type NativeUpgradeHelperRequest struct {
-	Config    NativeStorageConfig    `json:"config"`
-	Operation NativeUpgradeOperation `json:"operation"`
+	ParentProof *NativeUpgradeParentProof `json:"parent_proof,omitempty"`
+	Config      NativeStorageConfig       `json:"config"`
+	Operation   NativeUpgradeOperation    `json:"operation"`
 }
 type NativeUpgradeFrame struct {
 	Kind      string          `json:"kind"`
@@ -26,12 +44,23 @@ type NativeUpgradeFrame struct {
 }
 
 type scopedUpgradeHost struct {
-	op       NativeUpgradeOperation
-	cfg      Config
-	input    *json.Decoder
-	output   *json.Encoder
-	mu       sync.Mutex
-	sequence uint64
+	parentProof *NativeUpgradeParentProof
+	op          NativeUpgradeOperation
+	cfg         Config
+	input       *json.Decoder
+	output      *json.Encoder
+	mu          sync.Mutex
+	sequence    uint64
+}
+
+// Optional scoped-provider capability; legacy providers keep their interface.
+func (h *scopedUpgradeHost) NativeUpgradeProof() *NativeUpgradeParentProof {
+	if h.parentProof == nil {
+		return nil
+	}
+	proof := *h.parentProof
+	proof.Roots = append([]NativeUpgradeRootProof(nil), proof.Roots...)
+	return &proof
 }
 
 func (h *scopedUpgradeHost) matches(r WorkspaceUpgradeRequest) bool {
@@ -149,7 +178,7 @@ func runNativeUpgradeHelper(profile RuntimeProfile, in io.Reader, out io.Writer)
 	cfg.IsolatedLifecycle = true
 	cfg.GatewayBaseEnv = append([]string{}, os.Environ()...)
 	encoder := json.NewEncoder(out)
-	host := &scopedUpgradeHost{op: op, cfg: cfg, input: decoder, output: encoder}
+	host := &scopedUpgradeHost{op: op, cfg: cfg, input: decoder, output: encoder, parentProof: payload.ParentProof}
 	result, err := provider.RunScopedNativeUpgrade(context.Background(), cfg, op, host)
 	frame := NativeUpgradeFrame{Kind: "result", Result: result, Uncertain: errors.Is(err, ErrNativeStorageUncertain)}
 	if err != nil {

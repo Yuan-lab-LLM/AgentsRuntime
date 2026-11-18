@@ -51,9 +51,11 @@ class PreserveTests(unittest.TestCase):
         db.commit()
         return db
 
-    def call(self, action, ok=True, fault=None, **extra):
+    def call(self, action, ok=True, fault=None, grants=None, **extra):
         payload = dict(action=action, workspace=str(self.workspace), capsule=str(self.capsule),
                        request={**self.req, **extra}, schema=json.loads((HERE / "upgrade_schema.json").read_text()))
+        if grants is not None:
+            payload["grant_roots"] = grants
         command = ["/usr/bin/python3", "-I", "-B", str(HERE / "upgrade_helper.py")]
         if fault:
             script = "import errno,os,runpy\n"
@@ -73,6 +75,23 @@ class PreserveTests(unittest.TestCase):
         self.assertNotEqual(0, p.returncode, p.stdout)
         self.assertNotIn("last WAL commit", p.stderr)
         return p
+
+    def test_exact_grant_witness_does_not_widen_descendant_ownership(self):
+        self.fixture()
+        grants = []
+        for path in (self.workspace, self.capsule):
+            st = path.stat()
+            grants.append(dict(path=str(path), device=st.st_dev, inode=st.st_ino,
+                               owner_uid=st.st_uid, owner_gid=st.st_gid, mode=st.st_mode))
+        self.call("compatibility", grants=grants)
+        for field, value in (("inode", grants[0]["inode"] + 1),
+                             ("path", str(self.workspace) + "-other"), ("owner_uid", 12345)):
+            altered = json.loads(json.dumps(grants))
+            altered[0][field] = value
+            self.call("compatibility", ok=False, grants=altered)
+        if os.geteuid() == 0:
+            os.chown(self.workspace / "home/.opencode/opencode.json", 10001, 10001)
+            self.call("compatibility", ok=False, grants=grants)
 
     def test_wal_backup_preserves_native_history_and_projects_are_out_of_scope(self):
         db = self.fixture()

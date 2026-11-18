@@ -50,13 +50,13 @@ func TestOpenCodePreserveCapabilityIsDeliveredImageOnly(t *testing.T) {
 		if metadata.ProtocolVersion != "" || metadata.SessionStore != "" || len(metadata.Capabilities) != 0 {
 			t.Fatalf("ENV advertised an unverified native payload: %+v", metadata)
 		}
-	} else if metadata.ProtocolVersion != "opencode-preserve-v1" || metadata.SessionStore != "sqlite" || len(metadata.Capabilities) != 5 || metadata.OpenClawVersion != "" {
+	} else if metadata.ProtocolVersion != "opencode-preserve-v1" || metadata.SessionStore != "sqlite" || len(metadata.Capabilities) != 6 || metadata.OpenClawVersion != "" {
 		t.Fatalf("verified native payload lost delivery metadata: %+v", metadata)
 	}
 }
 
 func TestOpenCodeNativePayloadAndPodUIDCapabilityDistinguishesLegacyTarget(t *testing.T) {
-	if len(OpenCodeUpgradeCapabilities) != 5 || OpenCodeUpgradeCapabilities[4] != "opencode.native-payload-poduid-v1" {
+	if len(OpenCodeUpgradeCapabilities) != 6 || OpenCodeUpgradeCapabilities[4] != "opencode.native-payload-poduid-v1" || OpenCodeUpgradeCapabilities[5] != "opencode.scoped-payload-grants-v1" {
 		t.Fatalf("target cannot distinguish legacy ENV-only four-capability images: %v", OpenCodeUpgradeCapabilities)
 	}
 }

@@ -31,7 +31,7 @@ const (
 var OpenCodeUpgradeCapabilities = []string{
 	"opencode.native-preserve-v1", "opencode.workspace.writer-lease",
 	"opencode.session-continuity-v1", "opencode.runtime-standby-v1",
-	"opencode.native-payload-poduid-v1",
+	"opencode.native-payload-poduid-v1", "opencode.scoped-payload-grants-v1",
 }
 
 // These reviewed upstream inputs are tied to their immutable revision and
@@ -42,6 +42,9 @@ var upgradeSchema json.RawMessage
 
 //go:embed upgrade_helper.py
 var upgradePython string
+
+//go:embed upgrade_attestation.json
+var upgradeAttestation []byte
 
 type upgradeService struct {
 	cfg    gateway.Config
@@ -98,6 +101,9 @@ func validateOpenCodeNativePayloadFiles(ctx context.Context, paths nativePayload
 	if err != nil || len(raw) > 1<<20 {
 		return errors.New("OpenCode native revision is unavailable")
 	}
+	if paths.scopedUID != 0 && !bytes.Equal(raw, upgradeAttestation) {
+		return errors.New("OpenCode scoped native attestation differs from the delivered image")
+	}
 	var manifest struct {
 		Version      string `json:"native_version"`
 		Revision     string `json:"official_source_reference"`
@@ -141,9 +147,6 @@ func (s *upgradeService) run(ctx context.Context, action string, req gateway.Wor
 	if req.ResumeGeneration != 0 && (action != "restore" && action != "restore-status" || req.ResumeGeneration < 1 || (req.Generation != req.ResumeGeneration && req.Generation != req.ResumeGeneration+1)) {
 		return nil, errors.New("OpenCode restore generation does not match its original capsule")
 	}
-	if err := validateOpenCodeNativePayload(ctx); err != nil {
-		return nil, err
-	}
 	workspace, err := s.host.WorkspaceForUpgrade(req)
 	if err != nil {
 		return nil, err
@@ -152,6 +155,16 @@ func (s *upgradeService) run(ctx context.Context, action string, req gateway.Wor
 		return nil, err
 	}
 	capsule := filepath.Join(s.host.UpgradeRoot(), "rollout-"+req.RolloutID, fmt.Sprintf("instance-%d", req.InstanceID))
+	proofHost, ok := s.host.(interface {
+		NativeUpgradeProof() *gateway.NativeUpgradeParentProof
+	})
+	if !ok {
+		return nil, errors.New("OpenCode scoped payload requires trusted parent grant proof")
+	}
+	proof := proofHost.NativeUpgradeProof()
+	if err := validateScopedOpenCodeNativePayload(ctx, req.UID, req.GID, proof, [2]string{workspace, capsule}); err != nil {
+		return nil, err
+	}
 	for _, path := range []string{workspace, capsule} {
 		root, openErr := workspaceio.OpenAt(s.cfg.WorkspaceRoot, path)
 		if openErr != nil {
@@ -168,7 +181,7 @@ func (s *upgradeService) run(ctx context.Context, action string, req gateway.Wor
 			return nil, err
 		}
 	}
-	body, err := json.Marshal(map[string]any{"action": action, "workspace": workspace, "capsule": capsule, "request": req, "schema": upgradeSchema})
+	body, err := json.Marshal(map[string]any{"action": action, "workspace": workspace, "capsule": capsule, "request": req, "schema": upgradeSchema, "grant_roots": proof.Roots})
 	if err != nil {
 		return nil, err
 	}

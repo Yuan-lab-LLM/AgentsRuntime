@@ -56,13 +56,23 @@ def safe_parts(relative):
 
 class Tree:
     """Descriptor relative traversal: never follow a workspace-controlled link."""
-    def __init__(self, path, uid, capsule=False):
+    def __init__(self, path, uid, capsule=False, grant=None):
         self.uid = uid
         self.path = Path(path)
         self.fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         st = os.fstat(self.fd)
-        require(st.st_uid == uid or capsule and st.st_uid == 10001 and st.st_gid == uid,
-                "unsafe_tree_owner")
+        if grant is not None:
+            # Only these two exact, parent-audited grant roots may have an
+            # unmapped management owner. Descendants retain the strict UID rule.
+            expected_owner = uid if grant["owner_uid"] == uid else 65534
+            require(grant["path"] == str(self.path) and grant["owner_uid"] in (uid, 10001)
+                    and grant["owner_gid"] == uid and st.st_uid == expected_owner
+                    and st.st_gid == uid and st.st_dev == grant["device"]
+                    and st.st_ino == grant["inode"] and st.st_mode == grant["mode"],
+                    "unsafe_grant_root")
+        else:
+            require(st.st_uid == uid or capsule and st.st_uid == 10001 and st.st_gid == uid,
+                    "unsafe_tree_owner")
 
     def close(self):
         os.close(self.fd)
@@ -595,8 +605,12 @@ def main(payload):
     require(schema["revision"] == "a105350812f05f914c768e468559dbd6bd508d8e" and
             schema["version"] == "1.18.13" and len(schema["migrations"]) == 38,
             "unsupported_native_revision")
-    workspace = Tree(payload["workspace"], req["uid"])
-    capsule = Tree(payload["capsule"], req["uid"], capsule=True)
+    grants = payload.get("grant_roots")
+    if grants is not None:
+        require(len(grants) == 2 and [g["path"] for g in grants] ==
+                [payload["workspace"], payload["capsule"]], "invalid_grant_scope")
+    workspace = Tree(payload["workspace"], req["uid"], grant=grants[0] if grants else None)
+    capsule = Tree(payload["capsule"], req["uid"], capsule=True, grant=grants[1] if grants else None)
     try:
         action = payload["action"]
         if action == "migrate":

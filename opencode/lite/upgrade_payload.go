@@ -3,12 +3,20 @@ package opencode
 import (
 	"context"
 	"errors"
+	"github.com/iamlovingit/clawmanager-agent/gateway"
 	"os"
 	"sync"
 	"time"
 )
 
-type nativePayloadPaths struct{ binary, attestation, python string }
+type nativePayloadPaths struct {
+	binary, attestation, python string
+	// Only the scoped maintenance entry supplies an actor. Registration always
+	// measures root-owned image files in the outer namespace.
+	scopedUID, scopedGID int
+	scopedProof          *gateway.NativeUpgradeParentProof
+	scopedRoots          [2]string
+}
 
 var deliveredNativePayload = nativePayloadPaths{
 	binary: "/usr/local/bin/opencode", attestation: "/usr/local/share/clawmanager/opencode-native-preserve-attestation.json", python: "/usr/bin/python3",
@@ -20,6 +28,11 @@ type nativePayloadKey struct {
 }
 
 func readNativePayloadKey(paths nativePayloadPaths) (key nativePayloadKey, err error) {
+	if paths.scopedUID != 0 {
+		if err = validateNativePayloadNamespace(paths.scopedUID, paths.scopedGID, paths.scopedProof, paths.scopedRoots); err != nil {
+			return key, err
+		}
+	}
 	key.binary, err = os.Lstat(paths.binary)
 	if err != nil {
 		return key, err
@@ -28,11 +41,11 @@ func readNativePayloadKey(paths nativePayloadPaths) (key nativePayloadKey, err e
 	if err != nil {
 		return key, err
 	}
-	key.binaryChange, err = trustedNativePayloadChange(key.binary)
+	key.binaryChange, err = paths.change(paths.binary, key.binary)
 	if err != nil {
 		return key, err
 	}
-	key.attestationChange, err = trustedNativePayloadChange(key.attestation)
+	key.attestationChange, err = paths.change(paths.attestation, key.attestation)
 	return key, err
 }
 
@@ -91,5 +104,26 @@ var deliveredNativeProof nativePayloadProofCache
 func validateOpenCodeNativePayload(ctx context.Context) error {
 	return deliveredNativeProof.check(ctx, deliveredNativePayload, func(ctx context.Context) error {
 		return validateOpenCodeNativePayloadFiles(ctx, deliveredNativePayload)
+	})
+}
+
+func (paths nativePayloadPaths) change(path string, info os.FileInfo) (string, error) {
+	if paths.scopedUID != 0 {
+		return scopedNativePayloadChange(path, info)
+	}
+	return trustedNativePayloadChange(info)
+}
+
+var scopedNativeProof nativePayloadProofCache
+
+func validateScopedOpenCodeNativePayload(ctx context.Context, uid, gid int, proof *gateway.NativeUpgradeParentProof, roots [2]string) error {
+	if err := validateNativePayloadNamespace(uid, gid, proof, roots); err != nil {
+		return err
+	}
+	paths := deliveredNativePayload
+	paths.scopedUID, paths.scopedGID = uid, gid
+	paths.scopedProof, paths.scopedRoots = proof, roots
+	return scopedNativeProof.check(ctx, paths, func(ctx context.Context) error {
+		return validateOpenCodeNativePayloadFiles(ctx, paths)
 	})
 }

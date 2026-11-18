@@ -15,6 +15,10 @@ func trustedNativePayloadChange(info os.FileInfo) (string, error) {
 	if !ok || stat.Uid != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o022 != 0 || info.Mode()&(os.ModeSetuid|os.ModeSetgid) != 0 {
 		return "", errors.New("OpenCode native payload must be an immutable root-owned regular file")
 	}
+	return nativePayloadChangeTime(stat)
+}
+
+func nativePayloadChangeTime(stat *syscall.Stat_t) (string, error) {
 	// ctime also invalidates a cached proof after chmod/write/mtime restoration.
 	value := reflect.ValueOf(stat).Elem()
 	for _, name := range []string{"Ctim", "Ctimespec"} {
