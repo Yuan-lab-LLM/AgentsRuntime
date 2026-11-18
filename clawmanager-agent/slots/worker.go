@@ -120,7 +120,7 @@ func (w *Worker) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/v1/slot-state" && r.Method == http.MethodGet {
 		w.mu.Lock()
 		defer w.mu.Unlock()
-		snapshot := Snapshot{PodUID: w.cfg.PodUID, IdleConfirmed: w.idleConfirmed(), WorkerEpoch: w.workerEpoch, Digest: w.book.Digest, Gateways: w.manager.GatewayStates(), Assignment: w.book.Assignment, Quarantined: w.book.quarantined || w.book.StopIntent != nil && w.book.Assignment != nil && w.book.Assignment.State != "stopped" || w.manager.Health() != nil || w.network.unavailable()}
+		snapshot := Snapshot{NFSWriterOwned: w.currentNFSWriter(), PodUID: w.cfg.PodUID, IdleConfirmed: w.idleConfirmed(), WorkerEpoch: w.workerEpoch, Digest: w.book.Digest, Gateways: w.manager.GatewayStates(), Assignment: w.book.Assignment, Quarantined: w.book.quarantined || w.book.StopIntent != nil && w.book.Assignment != nil && w.book.Assignment.State != "stopped" || w.manager.Health() != nil || w.network.unavailable()}
 		if w.book.Maintenance != nil {
 			snapshot.MaintenanceOperationID = w.book.Maintenance.OperationID
 		}
