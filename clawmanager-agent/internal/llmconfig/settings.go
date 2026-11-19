@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/iamlovingit/clawmanager-agent/internal/gateway"
@@ -28,6 +29,11 @@ type ResolveOptions struct {
 }
 
 type Settings struct {
+	ModelNames       map[string]string
+	CatalogSynced    bool
+	CatalogOwnerID   int
+	ContextWindows   map[string]int
+	ContextWindow    int
 	Vision           map[string]bool
 	BaseURL          string
 	APIKey           string
@@ -52,6 +58,10 @@ type ProviderModels struct {
 }
 
 type Canonical struct {
+	ModelNames       map[string]string `json:"model_names,omitempty"`
+	CatalogSynced    bool              `json:"catalog_synced,omitempty"`
+	ContextWindows   map[string]int    `json:"context_windows,omitempty"`
+	ContextWindow    int               `json:"context_window,omitempty"`
 	Vision           map[string]bool   `json:"vision,omitempty"`
 	BaseURL          string            `json:"base_url,omitempty"`
 	APIKeySet        bool              `json:"api_key_set"`
@@ -71,6 +81,9 @@ type envLookup func(names ...string) (name, value string, ok bool)
 
 func FromGatewayConfig(cfg gateway.Config) Settings {
 	return Settings{
+		ModelNames: cloneStringMap(cfg.LLMModelNames), CatalogSynced: cfg.LLMCatalogSynced,
+		ContextWindows:   cloneContextWindows(cfg.LLMContextWindows),
+		ContextWindow:    cfg.LLMContextWindow,
 		BaseURL:          strings.TrimRight(strings.TrimSpace(cfg.LLMBaseURL), "/"),
 		APIKey:           cfg.LLMAPIKey,
 		APIKeySet:        cfg.LLMAPIKeySet,
@@ -84,6 +97,10 @@ func FromGatewayConfig(cfg gateway.Config) Settings {
 }
 
 func (settings Settings) ApplyTo(cfg gateway.Config) gateway.Config {
+	cfg.LLMModelNames = cloneStringMap(settings.ModelNames)
+	cfg.LLMCatalogSynced = settings.CatalogSynced
+	cfg.LLMContextWindows = cloneContextWindows(settings.ContextWindows)
+	cfg.LLMContextWindow = settings.ContextWindow
 	cfg.LLMBaseURL = settings.BaseURL
 	cfg.LLMAPIKey = settings.APIKey
 	cfg.LLMAPIKeySet = settings.APIKeySet
@@ -97,9 +114,16 @@ func (settings Settings) ApplyTo(cfg gateway.Config) gateway.Config {
 }
 
 func ResolveGateway(cfg gateway.Config, req gateway.CreateGatewayRequest, options ResolveOptions) (Settings, error) {
-	return resolve(FromGatewayConfig(cfg), func(names ...string) (string, string, bool) {
+	settings, err := resolve(FromGatewayConfig(cfg), func(names ...string) (string, string, bool) {
+		if len(names) == 1 && names[0] == "CLAWMANAGER_GATEWAY_GENERATION" {
+			return names[0], strconv.Itoa(req.Generation), true
+		}
 		return gateway.RequestEnvEntry(req, names...)
 	}, options, true)
+	if err == nil && settings.CatalogSynced && req.UserID > 0 && settings.CatalogOwnerID != req.UserID {
+		return Settings{}, fmt.Errorf("MODEL_CATALOG_SYNC_FAILED: model directory owner mismatch")
+	}
+	return settings, err
 }
 
 func LoadFromEnv(options ResolveOptions) (Settings, error) {
@@ -115,6 +139,25 @@ func LoadFromEnv(options ResolveOptions) (Settings, error) {
 
 func resolve(initial Settings, lookup envLookup, options ResolveOptions, emptyAPIKeyIsSet bool) (Settings, error) {
 	resolved := initial
+	if _, raw, ok := lookup("CLAWMANAGER_LLM_CONTEXT_WINDOW"); ok {
+		value, err := strconv.Atoi(strings.TrimSpace(raw))
+		if err != nil || value < 0 || int64(value) > 2147483647 {
+			return Settings{}, fmt.Errorf("invalid managed context window")
+		}
+		resolved.ContextWindow = value
+	}
+	if _, raw, ok := lookup("CLAWMANAGER_LLM_CONTEXT_WINDOWS"); ok {
+		var values map[string]int
+		if err := json.Unmarshal([]byte(raw), &values); err != nil || values == nil {
+			return Settings{}, fmt.Errorf("invalid managed context window catalog")
+		}
+		for id, value := range values {
+			if strings.TrimSpace(id) == "" || value < 0 || int64(value) > 2147483647 {
+				return Settings{}, fmt.Errorf("invalid managed model context window")
+			}
+		}
+		resolved.ContextWindows = values
+	}
 
 	if _, value, ok := firstNonBlank(lookup, baseURLEnvNames...); ok {
 		resolved.BaseURL = strings.TrimRight(strings.TrimSpace(value), "/")
@@ -180,6 +223,20 @@ func resolve(initial Settings, lookup envLookup, options ResolveOptions, emptyAP
 		resolved.ModelIDs = prependUnique(options.LegacyModelPrefix, resolved.ModelIDs)
 	}
 
+	if _, enabled, ok := lookup("CLAWMANAGER_MODEL_CATALOG_SYNC"); ok && enabled == "1" {
+		generation := 0
+		if _, raw, found := lookup("CLAWMANAGER_GATEWAY_GENERATION"); found {
+			var err error
+			generation, err = strconv.Atoi(raw)
+			if err != nil || generation < 0 {
+				return Settings{}, fmt.Errorf("invalid model catalog generation")
+			}
+		}
+		if _, raw, present := lookup("CLAWMANAGER_MODEL_CATALOG_JSON"); present {
+			return decodeStartupCatalog(resolved, generation, []byte(raw))
+		}
+		return RefreshStartupCatalog(resolved, generation)
+	}
 	return resolved, nil
 }
 
@@ -202,6 +259,9 @@ func parseModelIDs(raw, source string) ([]string, error) {
 		}
 		modelIDs := uniqueModelIDs(parsed)
 		if len(modelIDs) == 0 {
+			if len(parsed) == 0 {
+				return nil, nil
+			}
 			return nil, fmt.Errorf("parse %s array: no model ids found", source)
 		}
 		return modelIDs, nil
@@ -226,6 +286,9 @@ func parseReasoningControl(raw, source string) (map[string]string, error) {
 }
 
 func (settings Settings) ModelRefs(fallbackProvider string) []ModelRef {
+	if settings.CatalogSynced && !settings.ModelsQualified {
+		fallbackProvider = "clawmanager"
+	}
 	fallbackProvider = strings.TrimSpace(fallbackProvider)
 	if fallbackProvider == "" {
 		fallbackProvider = "auto"
@@ -276,10 +339,13 @@ func GroupModelRefs(refs []ModelRef) []ProviderModels {
 func (settings Settings) Canonical(fallbackProvider string) Canonical {
 	refs := settings.ModelRefs(fallbackProvider)
 	canonical := Canonical{
+		ModelNames: cloneStringMap(settings.ModelNames), CatalogSynced: settings.CatalogSynced,
+		ContextWindow:    settings.ContextWindow,
+		ContextWindows:   cloneContextWindows(settings.ContextWindows),
 		BaseURL:          settings.BaseURL,
 		APIKeySet:        settings.APIKeySet,
 		APIKeySource:     settings.APIKeySource,
-		ModelIDs:         append([]string(nil), settings.ModelIDs...),
+		ModelIDs:         append([]string{}, settings.ModelIDs...),
 		ModelsQualified:  settings.ModelsQualified,
 		Vision:           cloneBoolMap(settings.Vision),
 		ModelSource:      settings.ModelSource,

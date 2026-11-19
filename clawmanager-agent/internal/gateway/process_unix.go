@@ -19,6 +19,34 @@ func configureGatewayCommand(cmd *exec.Cmd, uid, gid int) {
 	cmd.SysProcAttr = attr
 }
 
+// Kill inherited tool processes in the private group created at gateway start.
+// This does not prove that descendants which detached into other groups exited.
+func cleanupExitedGatewayGroup(cmd *exec.Cmd) error {
+	if cmd.Process == nil || cmd.Process.Pid <= 1 || cmd.SysProcAttr == nil ||
+		!cmd.SysProcAttr.Setpgid || cmd.SysProcAttr.Pgid != 0 {
+		return errors.New("gateway has no private process group")
+	}
+	err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	if errors.Is(err, syscall.ESRCH) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		probe := syscall.Kill(-cmd.Process.Pid, 0)
+		if errors.Is(probe, syscall.ESRCH) {
+			return nil
+		}
+		if probe != nil {
+			return probe
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	return errors.New("gateway process group still exists after kill")
+}
+
 func stopGatewayCommand(ctx context.Context, cmd *exec.Cmd, done <-chan error, timeout time.Duration) error {
 	if cmd.Process == nil {
 		return nil

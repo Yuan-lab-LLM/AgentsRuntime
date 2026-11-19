@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 
 	"github.com/iamlovingit/clawmanager-agent/internal/llmconfig"
@@ -21,6 +22,7 @@ func runLLMConfigCommand(args []string, output io.Writer) error {
 	format := flags.String("format", llmConfigFormatCanonical, "output format: canonical or opencode")
 	fallbackProvider := flags.String("fallback-provider", "auto", "provider for legacy unqualified model ids")
 	defaultModel := flags.String("default-model", "", "model used when no model environment variable is set")
+	mergeFile := flags.String("merge-file", "", "existing OpenCode JSON config to preserve non-managed settings from")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -30,9 +32,12 @@ func runLLMConfigCommand(args []string, output io.Writer) error {
 
 	switch strings.ToLower(strings.TrimSpace(*format)) {
 	case llmConfigFormatCanonical:
+		if *mergeFile != "" {
+			return fmt.Errorf("merge-file requires opencode format")
+		}
 		return writeCanonicalLLMConfig(output, *fallbackProvider, *defaultModel)
 	case llmConfigFormatOpenCode:
-		return writeOpenCodeLLMConfig(output)
+		return writeOpenCodeLLMConfig(output, *mergeFile)
 	default:
 		return fmt.Errorf("unsupported LLM config format %q", *format)
 	}
@@ -43,7 +48,7 @@ func writeCanonicalLLMConfig(output io.Writer, fallbackProvider, defaultModel st
 	if err != nil {
 		return err
 	}
-	if len(settings.ModelIDs) == 0 && strings.TrimSpace(defaultModel) != "" {
+	if len(settings.ModelIDs) == 0 && !settings.CatalogSynced && strings.TrimSpace(defaultModel) != "" {
 		settings.ModelIDs = []string{strings.TrimSpace(defaultModel)}
 	}
 
@@ -52,14 +57,20 @@ func writeCanonicalLLMConfig(output io.Writer, fallbackProvider, defaultModel st
 	return encoder.Encode(settings.Canonical(fallbackProvider))
 }
 
-func writeOpenCodeLLMConfig(output io.Writer) error {
+func writeOpenCodeLLMConfig(output io.Writer, mergePaths ...string) error {
 	settings, err := opencode.LoadLLMSettingsFromEnv()
 	if err != nil {
 		return err
 	}
-	raw, err := opencode.RenderConfig(settings)
+	raw, err := opencode.RenderManagedConfig(settings, os.Getenv("OPENCODE_CONFIG_CONTENT"))
 	if err != nil {
 		return err
+	}
+	if len(mergePaths) > 0 && mergePaths[0] != "" {
+		raw, err = opencode.MergeManagedFile(mergePaths[0], raw, settings)
+		if err != nil {
+			return err
+		}
 	}
 	_, err = output.Write(raw)
 	return err

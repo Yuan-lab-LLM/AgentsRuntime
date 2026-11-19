@@ -461,6 +461,8 @@ settings:
 func TestDesktopWebQualifiedProvidersUseManagedCustomNamespace(t *testing.T) {
 	before := []byte(`providers:
   clawmanager-auto:
+    base_url: http://gateway.platform.svc/v1
+    key_env: OPENAI_API_KEY
     enabled: false
     api: https://stale-api.example/v1
     url: https://stale-url.example/v1

@@ -17,24 +17,28 @@ import (
 )
 
 type gatewayRecord struct {
-	stopOperation   string
-	stopBusy        bool
-	stopConfirmed   bool
-	deletePending   bool
-	deleteBusy      bool
-	state           GatewayState
-	process         ManagedProcess
-	cancel          context.CancelFunc
-	finished        chan struct{}
-	reserved        bool
-	stopMu          sync.Mutex
-	startSpec       GatewayStartSpec
-	request         CreateGatewayRequest
-	restartAttempts int
-	readyAt         time.Time
+	shutdownProof         *shutdownProof
+	shutdownProofErr      error
+	shutdownProofCaptured bool
+	stopOperation         string
+	stopBusy              bool
+	stopConfirmed         bool
+	deletePending         bool
+	deleteBusy            bool
+	state                 GatewayState
+	process               ManagedProcess
+	cancel                context.CancelFunc
+	finished              chan struct{}
+	reserved              bool
+	stopMu                sync.Mutex
+	startSpec             GatewayStartSpec
+	request               CreateGatewayRequest
+	restartAttempts       int
+	readyAt               time.Time
 }
 
 type GatewayManager struct {
+	shutdownSink func(GatewayState) error
 	stopEpoch    string
 	cfg          Config
 	starter      ProcessStarter
@@ -221,9 +225,11 @@ func (m *GatewayManager) CreateGateway(_ context.Context, req CreateGatewayReque
 }
 
 func (m *GatewayManager) startGatewayInBackground(gatewayID string, req CreateGatewayRequest, workspacePath string, port int) {
+	m.recordModelCatalogSync(gatewayID, req, "syncing")
 	startedAt := time.Now()
 	phaseStartedAt := startedAt
 	if err := m.profile().PrepareWorkspace(m.cfg, req, workspacePath); err != nil {
+		m.recordModelCatalogSync(gatewayID, req, "failed")
 		log.Printf("runtime-agent gateway startup failed: gateway_id=%s instance_id=%d phase=prepare_workspace phase_ms=%d total_ms=%d error=%v", gatewayID, req.InstanceID, time.Since(phaseStartedAt).Milliseconds(), time.Since(startedAt).Milliseconds(), err)
 		m.markGatewayError(gatewayID, 0, err)
 		return
@@ -231,11 +237,13 @@ func (m *GatewayManager) startGatewayInBackground(gatewayID string, req CreateGa
 	prepareDuration := time.Since(phaseStartedAt)
 	phaseStartedAt = time.Now()
 	if err := m.profile().WriteGatewayConfig(m.cfg, req, workspacePath, port); err != nil {
+		m.recordModelCatalogSync(gatewayID, req, "failed")
 		log.Printf("runtime-agent gateway startup failed: gateway_id=%s instance_id=%d phase=write_config phase_ms=%d total_ms=%d error=%v", gatewayID, req.InstanceID, time.Since(phaseStartedAt).Milliseconds(), time.Since(startedAt).Milliseconds(), err)
 		m.markGatewayError(gatewayID, 0, err)
 		return
 	}
 	configDuration := time.Since(phaseStartedAt)
+	m.recordModelCatalogSync(gatewayID, req, "applied")
 
 	spec := GatewayStartSpec{
 		GatewayID:     gatewayID,
@@ -254,6 +262,13 @@ func (m *GatewayManager) startGatewayInBackground(gatewayID string, req CreateGa
 		Env:           m.profile().GatewayEnv(os.Environ(), m.cfg, req, workspacePath, port),
 	}
 	phaseStartedAt = time.Now()
+	switch m.profile().Type() {
+	case "openclaw", "openclaw-shell":
+		if err := CheckOpenClawRuntimeActivation(context.Background(), spec.Env); err != nil {
+			m.markGatewayError(gatewayID, 0, err)
+			return
+		}
+	}
 	process, err := m.starter.StartGateway(context.Background(), spec)
 	if err != nil {
 		log.Printf("runtime-agent gateway startup failed: gateway_id=%s instance_id=%d phase=start_process phase_ms=%d total_ms=%d error=%v", gatewayID, req.InstanceID, time.Since(phaseStartedAt).Milliseconds(), time.Since(startedAt).Milliseconds(), err)
@@ -310,6 +325,7 @@ func (m *GatewayManager) startGatewayInBackground(gatewayID string, req CreateGa
 		}
 	}
 	healthDuration := time.Since(phaseStartedAt)
+	m.recordNativeModelCatalogSync(gatewayID, req, spec, startedAt)
 	scheduledRaw := m.scheduledTasksRaw(req)
 	m.markGatewayRunning(gatewayID, req, process.PID)
 	log.Printf("runtime-agent gateway ready: gateway_id=%s instance_id=%d port=%d pid=%d total_ms=%d prepare_ms=%d config_ms=%d process_ms=%d health_ms=%d", gatewayID, req.InstanceID, port, process.PID, time.Since(startedAt).Milliseconds(), prepareDuration.Milliseconds(), configDuration.Milliseconds(), processStartDuration.Milliseconds(), healthDuration.Milliseconds())
@@ -425,6 +441,11 @@ func (m *GatewayManager) StopGatewayConfirmed(ctx context.Context, gatewayID str
 		return fmt.Errorf("%w: gateway %s is already stopping", ErrGatewayStopFailed, gatewayID)
 	}
 	record.deletePending, record.deleteBusy = true, true
+	auditRequired := (m.cfg.RuntimeType == "openclaw" || m.cfg.RuntimeType == "openclaw-shell") && capabilityHealthRequired(record.startSpec.Env)
+	if auditRequired && !record.shutdownProofCaptured {
+		record.shutdownProof, record.shutdownProofErr = captureShutdownProof(record.startSpec.Env)
+		record.shutdownProofCaptured = true
+	}
 	record.state.State = "stopping"
 	record.state.UpdatedAt = time.Now().UTC()
 	process := record.process
@@ -440,7 +461,7 @@ func (m *GatewayManager) StopGatewayConfirmed(ctx context.Context, gatewayID str
 	}
 	if err := stopErr; err != nil {
 		m.mu.Lock()
-		if current, exists := m.gateways[gatewayID]; exists && current.process.PID == pid && current.state.State == "stopped" {
+		if current, exists := m.gateways[gatewayID]; exists && !auditRequired && current.process.PID == pid && current.state.State == "stopped" {
 			m.ports.Release(current.state.Port)
 			delete(m.gateways, gatewayID)
 			m.notifyGatewayStateChangedLocked()
@@ -450,6 +471,15 @@ func (m *GatewayManager) StopGatewayConfirmed(ctx context.Context, gatewayID str
 		if current, exists := m.gateways[gatewayID]; exists && current.process.PID == pid {
 			current.deleteBusy = false
 			current.state.State = "stop_error"
+			if auditRequired {
+				current.state.ShutdownAudit = "cleanup_unconfirmed"
+				if record.shutdownProofErr == nil && record.shutdownProof != nil {
+					current.state.ShutdownObservation = &ShutdownObservation{Generation: record.shutdownProof.generation, ClaimID: record.shutdownProof.claim, Outcome: current.state.ShutdownAudit}
+					if m.shutdownSink != nil {
+						_ = m.shutdownSink(current.state)
+					}
+				}
+			}
 			current.state.ErrorMessage = err.Error()
 			current.state.UpdatedAt = time.Now().UTC()
 			m.notifyGatewayStateChangedLocked()
@@ -466,6 +496,36 @@ func (m *GatewayManager) StopGatewayConfirmed(ctx context.Context, gatewayID str
 	}
 	if current.process.PID != pid && current.state.State != "stopped" {
 		return fmt.Errorf("%w: gateway process changed during stop", ErrGatewayStopFailed)
+	}
+	if auditRequired {
+		if current != record || current.process.PID != pid {
+			return ErrGatewayStopConflict
+		}
+		outcome := "cleanup_unconfirmed"
+		if record.shutdownProofErr == nil && record.shutdownProof != nil {
+			outcome = record.shutdownProof.verify()
+		}
+		current.state.ShutdownAudit = outcome
+		if record.shutdownProofErr == nil && record.shutdownProof != nil {
+			current.state.ShutdownObservation = &ShutdownObservation{Generation: record.shutdownProof.generation, ClaimID: record.shutdownProof.claim, Outcome: outcome}
+		}
+		log.Printf("runtime-agent shutdown audit: instance_id=%d generation=%d pid=%d outcome=%s", current.state.InstanceID, current.state.Generation, pid, outcome)
+		if current.state.ShutdownObservation != nil && m.shutdownSink != nil && m.shutdownSink(current.state) != nil {
+			current.deleteBusy = false
+			current.state.State = "stop_error"
+			current.state.ErrorMessage = "shutdown observation persistence pending"
+			current.state.UpdatedAt = time.Now().UTC()
+			m.notifyGatewayStateChangedLocked()
+			return fmt.Errorf("%w: shutdown observation persistence pending", ErrGatewayStopFailed)
+		}
+		if outcome != "cleanup_confirmed_release_observed" {
+			current.deleteBusy = false
+			current.state.State = "stop_error"
+			current.state.ErrorMessage = errShutdownUnconfirmed.Error()
+			current.state.UpdatedAt = time.Now().UTC()
+			m.notifyGatewayStateChangedLocked()
+			return fmt.Errorf("%w: %w", ErrGatewayStopFailed, errShutdownUnconfirmed)
+		}
 	}
 	m.ports.Release(current.state.Port)
 	delete(m.gateways, gatewayID)
@@ -538,6 +598,10 @@ func (m *GatewayManager) GatewayStates() []GatewayState {
 	states := make([]GatewayState, 0, len(m.gateways))
 	for _, record := range m.gateways {
 		state := record.state
+		if state.ShutdownObservation != nil {
+			value := *state.ShutdownObservation
+			state.ShutdownObservation = &value
+		}
 		if m.clockRequired && m.clockIssue != "" && (state.State == "running" || state.State == "starting") {
 			state.State, state.ErrorMessage = "unhealthy", m.clockIssue
 		}
@@ -721,12 +785,19 @@ func (m *GatewayManager) RegisterPayload() RegisterPayload {
 }
 
 func (m *GatewayManager) GatewayReportPayload(podID int) GatewayReportPayload {
+	// Historical deliveries use a separate endpoint, never fake live gateways.
 	return GatewayReportPayload{
 		PodID:     podID,
 		Namespace: m.cfg.Namespace,
 		PodName:   m.cfg.PodName,
 		Gateways:  m.GatewayStates(),
 	}
+}
+
+func (m *GatewayManager) ConfigureShutdownObservationSink(sink func(GatewayState) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.shutdownSink = sink
 }
 
 func (m *GatewayManager) stopGatewayLocked(ctx context.Context, id string) {
@@ -833,13 +904,45 @@ func (m *GatewayManager) watchGatewayProcess(id string, pid int, done <-chan err
 		m.mu.Unlock()
 		return
 	}
+	if (m.cfg.RuntimeType == "openclaw" || m.cfg.RuntimeType == "openclaw-shell") && capabilityHealthRequired(record.startSpec.Env) {
+		// An exit is not a native-cleanup receipt. Retain process identity,
+		// placement and port until explicit audit/reconciliation; never retry
+		// into another writer merely because the old process disappeared.
+		record.deletePending = true
+		record.state.State = "stop_error"
+		record.state.ShutdownAudit = "cleanup_unconfirmed"
+		record.state.ErrorMessage = errShutdownUnconfirmed.Error()
+		record.state.FailureClass = "unexpected_process_exit"
+		record.state.ExitCode = processExitCode(err)
+		retryable := false
+		record.state.Retryable = &retryable
+		record.state.UpdatedAt = now
+		record.state.HealthAt = now
+		m.notifyGatewayStateChangedLocked()
+		m.mu.Unlock()
+		return
+	}
 	if err == nil {
 		err = errors.New("gateway process exited unexpectedly")
+	}
+	if errors.Is(err, ErrGatewayStopFailed) {
+		record.deletePending = true
+		record.state.State = "stop_error"
+		record.state.ShutdownAudit = "cleanup_unconfirmed"
+		record.state.ErrorMessage = "revocation cleanup unconfirmed; automatic restart blocked"
+		record.state.FailureClass = "revocation_cleanup_unconfirmed"
+		record.state.ExitCode = processExitCode(err)
+		retryable := false
+		record.state.Retryable = &retryable
+		record.state.UpdatedAt, record.state.HealthAt = now, now
+		m.notifyGatewayStateChangedLocked()
+		m.mu.Unlock()
+		return
 	}
 	if !record.readyAt.IsZero() && now.Sub(record.readyAt) >= 5*time.Minute {
 		record.restartAttempts = 0
 	}
-	if m.automaticGatewayRecoveryEnabled() && len(m.restartDelays) > 0 && record.restartAttempts < len(m.restartDelays) {
+	if (m.automaticGatewayRecoveryEnabled() || revocationExitRequiresCleanup(record.startSpec, err)) && len(m.restartDelays) > 0 && record.restartAttempts < len(m.restartDelays) {
 		record.restartAttempts++
 		attempt := record.restartAttempts
 		delay := m.restartDelays[attempt-1]
@@ -1155,6 +1258,17 @@ func (m *GatewayManager) stopTimeout() time.Duration {
 func OpenClawGatewayEnv(base []string, cfg Config, req CreateGatewayRequest, workspacePath string, port int) []string {
 	env := append([]string(nil), base...)
 	env = ApplyRequestEnvironment(env, req)
+	env = unsetEnv(env, TaskReceiptRootEnv)
+	if root := envValue(base, TaskReceiptRootEnv); root != "" {
+		env = unsetEnv(env, "CLAWMANAGER_TASK_RECEIPT_DIR")
+		if directory, err := ReceiptDirectoryPath(root, cfg.WorkspaceRoot, req); err == nil {
+			env = setEnv(env, "CLAWMANAGER_TASK_RECEIPT_DIR", directory)
+		}
+	}
+	// The lifecycle request owns the generation; never reuse an inherited or
+	// stale serialized environment value after an instance restart/upgrade.
+	env = unsetEnv(env, "CLAWMANAGER_GATEWAY_GENERATION")
+	env = setEnv(env, "CLAWMANAGER_GATEWAY_GENERATION", strconv.Itoa(req.Generation))
 	// Control-plane policy always overrides untrusted instance environment.
 	env = unsetEnv(env, "CLAWMANAGER_PROXY_POLICY_FILE")
 	env = unsetEnv(env, "CLAWMANAGER_PROXY_POLICY_NAMESPACE")
@@ -1195,6 +1309,8 @@ func OpenClawGatewayEnv(base []string, cfg Config, req CreateGatewayRequest, wor
 func GenericGatewayEnv(base []string, cfg Config, req CreateGatewayRequest, workspacePath string, port int) []string {
 	env := append([]string(nil), base...)
 	env = ApplyRequestEnvironment(env, req)
+	env = unsetEnv(env, "CLAWMANAGER_GATEWAY_GENERATION")
+	env = setEnv(env, "CLAWMANAGER_GATEWAY_GENERATION", strconv.Itoa(req.Generation))
 	env = ApplyLiteTeamConfigEnvironment(env, req, workspacePath)
 	env = setEnv(env, "CLAWMANAGER_INSTANCE_ID", strconv.Itoa(req.InstanceID))
 	env = setEnv(env, "CLAWMANAGER_USER_ID", strconv.Itoa(req.UserID))
@@ -1306,8 +1422,13 @@ func (s *ExecProcessStarter) StartGateway(ctx context.Context, spec GatewayStart
 	done := make(chan error, 1)
 	notifyDone := make(chan error, 1)
 	exited := make(chan struct{})
+	var revocationCleanupErr error
 	go func() {
 		err := cmd.Wait()
+		err = cleanupRevocationExit(spec, cmd, err)
+		if errors.Is(err, ErrGatewayStopFailed) {
+			revocationCleanupErr = err
+		}
 		close(exited)
 		done <- err
 		notifyDone <- err
@@ -1334,12 +1455,15 @@ func (s *ExecProcessStarter) StartGateway(ctx context.Context, spec GatewayStart
 			var err error
 			select {
 			case <-exited:
+				if revocationCleanupErr != nil {
+					return revocationCleanupErr
+				}
 			default:
 				err = stopGatewayCommand(stopCtx, cmd, done, timeout)
 			}
 			select {
 			case <-exited:
-				err = nil
+				err = revocationCleanupErr
 			default:
 			}
 			if err == nil {

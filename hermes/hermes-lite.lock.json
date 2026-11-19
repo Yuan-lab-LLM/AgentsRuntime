@@ -33,9 +33,11 @@
   "verified_at": "2026-09-07",
   "desktop_web_accepted": false,
   "patch_sha256": {
+    "apply_managed_model_catalog.py": "8eb5ae0f644b93ca8c9571fde73301f52178eb8d2cf255f03e3de1da61045a96",
+    "managed_model_catalog.py": "dbc9852f3be68056dafe946b0bc2a229a33a6c45da1389938fedf00a2ae07d43",
     "apply_lite_gateway_boundary.py": "d0c14033470fca76171d37621b9f411dad96b9acb5e3010745c52c0088a65194",
     "apply_lite_non_native.py": "a7f7421cdfce468d69c2e8ff3e01a11ed58e34a8c1878060997f7f39c631d3ad",
-    "apply_lite_tool_executor.py": "ca1e4fa39710712dfa87a383ad3e8a943789b424808154a0b5545433aaeb8d2a",
+    "apply_lite_tool_executor.py": "c552a101facf4245b3afa264761336c770b5cd355d89863a1ace82aa4e59e07d",
     "lite_environment.py": "b3ac25e2f81dc4f3efae8f5ef7627116becd72447264ff74f29f06b9898ea3d3",
     "lite_gateway_boundary.py": "4e476836bc1aa01f7aca1adbe7a56aa994ef9895fc14a3f862a0da4f7f1eabdd",
     "lite_non_native.py": "2aca8c57abaef4c9e7a97c87c7fcd13b1c15148364c4a8094fe28d9a75880b94",

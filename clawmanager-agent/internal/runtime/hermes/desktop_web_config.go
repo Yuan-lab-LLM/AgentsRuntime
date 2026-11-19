@@ -214,23 +214,34 @@ func mergeDesktopWebYAML(existing []byte, cfg gateway.Config, publicURL string, 
 	if err != nil {
 		return nil, err
 	}
-	refs := llmconfig.FromGatewayConfig(cfg).ModelRefs("clawmanager")
-	if len(refs) == 0 {
+	settings := llmconfig.FromGatewayConfig(cfg)
+	refs := settings.ModelRefs("clawmanager")
+	if len(refs) == 0 && !cfg.LLMCatalogSynced {
 		refs = []llmconfig.ModelRef{{ProviderID: "clawmanager", ModelID: "auto"}}
 	}
-	if cfg.LLMModelsQualified {
-		for index := range refs {
+	contextWindows := make(map[string]int, len(refs))
+	for index := range refs {
+		ref := &refs[index]
+		// Resolve provider-qualified metadata before adding the native alias.
+		// The alias is a routing identity, not a key in the incoming catalog.
+		window := settings.ContextFor(ref.ProviderID, ref.ModelID)
+		if cfg.LLMModelsQualified {
 			// Pinned upstream reserves auto and builtin vendor IDs before its
 			// custom-runtime resolver. A managed namespace always selects the
 			// configured OpenAI-compatible endpoint and its instance key_env.
-			refs[index].ProviderID = "clawmanager-" + strings.ToLower(refs[index].ProviderID)
+			ref.ProviderID = "clawmanager-" + strings.ToLower(ref.ProviderID)
 		}
+		contextWindows[ref.ProviderID+"/"+ref.ModelID] = window
 	}
 	providers := map[string]any{}
 	for _, group := range llmconfig.GroupModelRefs(refs) {
 		models := map[string]any{}
 		for _, model := range group.ModelIDs {
-			models[model] = map[string]any{}
+			entry := map[string]any{}
+			if window := contextWindows[group.ProviderID+"/"+model]; window > 0 {
+				entry["context_length"] = window
+			}
+			models[model] = entry
 		}
 		providers[group.ProviderID] = map[string]any{
 			"name": group.ProviderID, "base_url": cfg.LLMBaseURL,
@@ -240,8 +251,12 @@ func mergeDesktopWebYAML(existing []byte, cfg gateway.Config, publicURL string, 
 			"api_key": "", "api_key_env": "OPENAI_API_KEY", "models": models,
 		}
 	}
+	defaultID, defaultProvider := "", ""
+	if len(refs) > 0 {
+		defaultID, defaultProvider = refs[0].ModelID, refs[0].ProviderID
+	}
 	managed := map[string]any{
-		"model":     map[string]any{"default": refs[0].ModelID, "provider": refs[0].ProviderID, "base_url": cfg.LLMBaseURL, "key_env": "OPENAI_API_KEY", "api_key": ""},
+		"model":     map[string]any{"default": defaultID, "provider": defaultProvider, "base_url": cfg.LLMBaseURL, "key_env": "OPENAI_API_KEY", "api_key": ""},
 		"providers": providers,
 		"dashboard": map[string]any{
 			"public_url": publicURL, "trusted_proxies": proxies,
@@ -251,9 +266,15 @@ func mergeDesktopWebYAML(existing []byte, cfg gateway.Config, publicURL string, 
 			"basic_auth": map[string]any{"password": "", "password_hash": ""},
 		},
 	}
+	if err := reconcileHermesModelCatalog(document.Content[0], providers, cfg); err != nil {
+		return nil, err
+	}
 	var overlay yaml.Node
 	if err := overlay.Encode(managed); err != nil {
 		return nil, fmt.Errorf("workspace_unavailable: encode managed Hermes YAML")
+	}
+	if cfg.LLMCatalogSynced {
+		preserveForeignDefaultModel(document.Content[0], &overlay, cfg)
 	}
 	mergeDesktopWebYAMLNode(document.Content[0], &overlay)
 	enableDesktopWebBasicAuth(document.Content[0])
@@ -299,7 +320,7 @@ func enableDesktopWebBasicAuth(mapping *yaml.Node) {
 }
 
 func desktopWebYAMLMappingValue(mapping *yaml.Node, key string) *yaml.Node {
-	if mapping.Kind != yaml.MappingNode {
+	if mapping == nil || mapping.Kind != yaml.MappingNode {
 		return nil
 	}
 	for index := 0; index < len(mapping.Content); index += 2 {

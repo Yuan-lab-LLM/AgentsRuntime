@@ -15,6 +15,9 @@ import (
 // no-ops. This keeps local development flows (manually invoking the agent
 // as a non-root user) working.
 func Run(cfg appconfig.Config) error {
+	if err := prepareTaskReceiptStorage(cfg); err != nil {
+		return fmt.Errorf("prepare Pro receipt storage: %w", err)
+	}
 	if err := syncDefaults(cfg); err != nil {
 		return fmt.Errorf("sync defaults: %w", err)
 	}

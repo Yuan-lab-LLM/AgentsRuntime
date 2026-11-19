@@ -3,6 +3,8 @@ Type=Application
 Version=1.0
 Name=DeepSeek Harness Web UI
 Comment=Open the managed DeepSeek Harness workspace
-Exec=/usr/bin/bash -lc "sleep 8 && xdg-open http://127.0.0.1:3080"
+Exec=/usr/bin/bash -lc "xdg-open http://127.0.0.1:3080"
+# The supervisor opens its readiness page; do not also launch via XDG autostart.
+Hidden=true
 Terminal=false
 StartupNotify=false

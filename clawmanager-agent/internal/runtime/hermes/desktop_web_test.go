@@ -28,6 +28,7 @@ func TestDesktopWebEnvironmentWhitelistAndAuthoritativeIdentity(t *testing.T) {
 	req.Environment["NODE_OPTIONS"] = "--require /tmp/inject.js"
 	req.Environment["RUNTIME_AGENT_CONTROL_TOKEN"] = "request-control-secret"
 	req.Environment["UNDEFINED_ENV"] = "ignored"
+	req.Environment["CLAWMANAGER_MODEL_REFERENCE_PROTOCOL"] = "1"
 	req.Environment["CLAWMANAGER_HERMES_BACKEND_MODE"] = "dashboard"
 	cfg := gateway.Config{RuntimeType: "hermes", PublicOrigin: "https://manager.example", TrustedProxies: []string{"10.1.2.0/24"}, LLMAPIKey: "pod-llm-secret", GatewayToken: "pod-gateway-secret"}
 	env := p.GatewayEnv([]string{"PATH=/usr/bin:/bin", "RUNTIME_AGENT_REPORT_TOKEN=report-secret", "ANTHROPIC_API_KEY=pod-provider-secret", "HERMES_DASHBOARD_SESSION_TOKEN=pod-session-secret", "PYTHONPATH=/tmp/inject"}, cfg, req, req.WorkspacePath, 20000)
@@ -42,6 +43,9 @@ func TestDesktopWebEnvironmentWhitelistAndAuthoritativeIdentity(t *testing.T) {
 		}
 	}
 	if got := p.GatewayCommand(""); len(got) != 1 || got[0] != "start-hermes-lite-runtime" {
+		t.Fatal(got)
+	}
+	if got := envValue(env, "CLAWMANAGER_MODEL_REFERENCE_PROTOCOL"); got != "1" {
 		t.Fatal(got)
 	}
 }

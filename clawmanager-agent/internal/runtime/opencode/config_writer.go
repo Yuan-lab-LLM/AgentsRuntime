@@ -41,11 +41,16 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 	}
 
 	configPath := filepath.Join(opencodeHome, "opencode.json")
-	raw, err := RenderConfig(settings)
+	content, _ := gateway.RequestEnvValue(req, "OPENCODE_CONFIG_CONTENT")
+	raw, err := RenderManagedConfig(settings, content)
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(configPath, raw, 0o640); err != nil {
+	raw, err = MergeManagedFile(configPath, raw, settings)
+	if err != nil {
+		return err
+	}
+	if err := writeConfigAtomic(configPath, raw, req.UID, req.GID); err != nil {
 		return fmt.Errorf("write opencode config: %w", err)
 	}
 	if err := chownTree(opencodeHome, req.UID, req.GID); err != nil {
@@ -76,7 +81,7 @@ func normalizeLLMSettings(settings llmconfig.Settings) (llmconfig.Settings, erro
 	if !settings.APIKeySet || strings.TrimSpace(settings.APIKey) == "" {
 		return llmconfig.Settings{}, fmt.Errorf("missing OpenCode LLM API key")
 	}
-	if len(settings.ModelIDs) == 0 {
+	if len(settings.ModelIDs) == 0 && !settings.CatalogSynced {
 		settings.ModelIDs = []string{defaultModelID}
 		settings.ModelsQualified = false
 	}
@@ -89,6 +94,9 @@ func RenderConfig(settings llmconfig.Settings) ([]byte, error) {
 		return nil, err
 	}
 
+	if settings.CatalogSynced && len(settings.ModelIDs) == 0 {
+		return json.MarshalIndent(map[string]any{"provider": map[string]any{clawmanagerProviderID: providerConfig(clawmanagerProviderName, settings.BaseURL, "CLAWMANAGER_LLM_API_KEY", nil)}, "enabled_providers": []string{clawmanagerProviderID}}, "", "  ")
+	}
 	modelID := clawmanagerProviderID + "/" + settings.ModelIDs[0]
 	apiKeyEnv := strings.TrimSpace(settings.APIKeySource)
 	if apiKeyEnv == "" {
@@ -106,6 +114,14 @@ func RenderConfig(settings llmconfig.Settings) ([]byte, error) {
 		providers, enabledProviders = qualifiedProviderConfig(settings.BaseURL, apiKeyEnv, llmconfig.GroupModelRefs(refs))
 	}
 	for _, ref := range refs {
+		if name := settings.ModelNames[ref.ModelID]; name != "" {
+			providers[ref.ProviderID].(map[string]any)["models"].(map[string]any)[ref.ModelID].(map[string]any)["name"] = name
+		}
+		if window := settings.ContextFor(ref.ProviderID, ref.ModelID); window > 0 {
+			provider := providers[ref.ProviderID].(map[string]any)
+			model := provider["models"].(map[string]any)[ref.ModelID].(map[string]any)
+			model["limit"] = map[string]any{"context": window}
+		}
 		enabled, managed := settings.Vision[ref.Qualified]
 		if !managed {
 			enabled, managed = settings.Vision[ref.ModelID]

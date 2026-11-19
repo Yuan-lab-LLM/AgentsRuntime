@@ -98,11 +98,16 @@ func (h *HTTPGatewayHealthChecker) probeOnce(ctx context.Context, spec GatewaySt
 	}
 	// 10.2 can serve the Control UI before Agent database admission settles.
 	// Native startup/readiness, not an HTTP UI response, is the task boundary.
-	if h.cfg.RuntimeType == "openclaw" && IsOpenClawAtLeast(h.cfg.OpenClawVersion, "2026.10.2") {
+	if (h.cfg.RuntimeType == "openclaw" || h.cfg.RuntimeType == "openclaw-shell") && IsOpenClawAtLeast(h.cfg.OpenClawVersion, "2026.10.2") {
 		if err := h.probeOpenClawAdmission(ctx, baseURL+"/startupz", "ok"); err != nil {
 			return err
 		}
-		return h.probeOpenClawAdmission(ctx, baseURL+"/readyz", "ready")
+		if err := h.probeOpenClawAdmission(ctx, baseURL+"/readyz", "ready"); err != nil {
+			return err
+		}
+	}
+	if h.cfg.RuntimeType == "openclaw" || h.cfg.RuntimeType == "openclaw-shell" {
+		return checkCapabilityHealth(ctx, spec.Env)
 	}
 	return nil
 }

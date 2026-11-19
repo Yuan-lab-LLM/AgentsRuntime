@@ -104,6 +104,13 @@ func writeHermesConfigYAML(path string, cfg gateway.Config) error {
 		return err
 	}
 	block := buildManagedYAML(cfg)
+	if cfg.LLMCatalogSynced {
+		content, err := mergeHermesStartupYAML(base, block, cfg)
+		if err != nil {
+			return err
+		}
+		return writeFileAtomic(path, content, 0o600)
+	}
 	content := strings.TrimRight(base, "\r\n")
 	if content != "" {
 		content += "\n\n"
@@ -136,7 +143,7 @@ func buildManagedYAML(cfg gateway.Config) string {
 					builder.WriteString("  ")
 					builder.WriteString(yamlScalar(group.ProviderID))
 					builder.WriteString(":\n")
-					writeManagedProviderYAML(&builder, group.ProviderID, cfg.LLMBaseURL, group.ModelIDs[0], group.ModelIDs)
+					writeManagedProviderYAML(&builder, group.ProviderID, cfg.LLMBaseURL, group.ModelIDs[0], group.ModelIDs, llmconfig.FromGatewayConfig(cfg))
 				}
 			}
 		}
@@ -153,16 +160,16 @@ func buildManagedYAML(cfg gateway.Config) string {
 		builder.WriteString("  provider: clawmanager\n")
 		builder.WriteString("providers:\n")
 		builder.WriteString("  clawmanager:\n")
-		writeManagedProviderYAML(&builder, "ClawManager", cfg.LLMBaseURL, defaultModel, cfg.LLMModelIDs)
+		writeManagedProviderYAML(&builder, "ClawManager", cfg.LLMBaseURL, defaultModel, cfg.LLMModelIDs, llmconfig.FromGatewayConfig(cfg))
 		builder.WriteString("  custom:\n")
-		writeManagedProviderYAML(&builder, "custom", cfg.LLMBaseURL, defaultModel, cfg.LLMModelIDs)
+		writeManagedProviderYAML(&builder, "custom", cfg.LLMBaseURL, defaultModel, cfg.LLMModelIDs, llmconfig.FromGatewayConfig(cfg))
 	}
 	builder.WriteString(managedConfigEnd)
 	builder.WriteString("\n")
 	return builder.String()
 }
 
-func writeManagedProviderYAML(builder *strings.Builder, name, baseURL, defaultModel string, modelIDs []string) {
+func writeManagedProviderYAML(builder *strings.Builder, name, baseURL, defaultModel string, modelIDs []string, contexts ...llmconfig.Settings) {
 	builder.WriteString("    name: ")
 	builder.WriteString(yamlScalar(name))
 	builder.WriteString("\n")
@@ -181,7 +188,15 @@ func writeManagedProviderYAML(builder *strings.Builder, name, baseURL, defaultMo
 		for _, modelID := range modelIDs {
 			builder.WriteString("      ")
 			builder.WriteString(yamlScalar(modelID))
-			builder.WriteString(": {}\n")
+			window := 0
+			if len(contexts) > 0 {
+				window = contexts[0].ContextFor(name, modelID)
+			}
+			if window > 0 {
+				builder.WriteString(fmt.Sprintf(":\n        context_length: %d\n", window))
+			} else {
+				builder.WriteString(": {}\n")
+			}
 		}
 	}
 }

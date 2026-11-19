@@ -12,6 +12,10 @@ import (
 func configureGatewayCommand(*exec.Cmd, int, int) {
 }
 
+func cleanupExitedGatewayGroup(*exec.Cmd) error {
+	return errors.New("revocation process tree cleanup is unavailable on Windows")
+}
+
 func stopGatewayCommand(ctx context.Context, cmd *exec.Cmd, done <-chan error, timeout time.Duration) error {
 	if cmd.Process == nil {
 		return nil

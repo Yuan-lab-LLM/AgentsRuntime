@@ -105,6 +105,8 @@ RUN set -eux; \
     hermes --help >/dev/null
 
 COPY hermes/patches/hermes-agent/apply_team_completion_stop.py /tmp/apply_team_completion_stop.py
+COPY hermes/patches/hermes-agent/apply_managed_model_catalog.py hermes/patches/hermes-agent/managed_model_catalog.py /tmp/model-catalog-patch/
+RUN /usr/local/lib/hermes-agent/venv/bin/python /tmp/model-catalog-patch/apply_managed_model_catalog.py /usr/local/lib/hermes-agent
 
 RUN set -eux; \
     /usr/local/lib/hermes-agent/venv/bin/python /tmp/apply_team_completion_stop.py \

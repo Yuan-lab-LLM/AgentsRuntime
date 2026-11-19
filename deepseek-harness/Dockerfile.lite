@@ -16,11 +16,13 @@ RUN set -eux; \
       go build -trimpath -ldflags="-s -w -X main.version=${AGENT_VERSION}" \
       -o /out/clawmanager-agent ./cmd/clawmanager-agent
 
-FROM node:22-bookworm-slim@sha256:53ada149d435c38b14476cb57e4a7da73c15595aba79bd6971b547ceb6d018bf
+FROM node:24.21.0-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20
 
-ARG DSH_VERSION=0.1.2-alpha.3
+ARG DSH_VERSION=0.2.1-rc.3
 ARG PNPM_VERSION=11.25.0
 ARG DEBIAN_FRONTEND=noninteractive
+
+LABEL io.clawmanager.deepseek-harness.version="${DSH_VERSION}"
 
 ENV CLAWMANAGER_RUNTIME_TYPE=deepseek-harness \
     RUNTIME_WORKSPACE_ROOT=/workspaces \
@@ -56,8 +58,12 @@ RUN set -eux; \
     npm cache clean --force
 
 COPY --from=clawmanager-agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent
+COPY deepseek-harness/scripts/patch-model-reference.mjs deepseek-harness/scripts/managed-model-reference.mjs /usr/local/share/deepseek-harness/
+RUN node /usr/local/share/deepseek-harness/patch-model-reference.mjs /usr/local/lib/node_modules/@deepseek-ai/dsh \
+    && node /usr/local/share/deepseek-harness/patch-model-reference.mjs /usr/local/lib/node_modules/@deepseek-ai/dsh --verify
 COPY --from=clawmanager-agent-builder /out/clawmanager-agent /usr/local/libexec/clawmanager-agent-image
 COPY deepseek-harness/config/managed.cordis.patch.yml /usr/local/share/deepseek-harness/managed.cordis.patch.yml
+COPY deepseek-harness/scripts/prepare-managed-config.mjs /usr/local/share/deepseek-harness/prepare-managed-config.mjs
 COPY deepseek-harness/scripts/prepare-deepseek-harness-resources /usr/local/bin/prepare-deepseek-harness-resources
 COPY deepseek-harness/scripts/start-deepseek-harness-gateway /usr/local/bin/start-deepseek-harness-gateway
 COPY deepseek-harness/scripts/deepseek-harness-lite-entrypoint /usr/local/bin/deepseek-harness-lite-entrypoint

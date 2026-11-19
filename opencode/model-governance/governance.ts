@@ -2,6 +2,7 @@
 import { randomUUID } from "node:crypto"
 import { Context, Effect } from "effect"
 import { Model } from "@opencode/schema/model"
+import { Provider } from "@opencode/schema/provider"
 
 export class GovernanceError extends Error {
   constructor(readonly revoked = false) {
@@ -10,7 +11,7 @@ export class GovernanceError extends Error {
 }
 
 export type Task = { sessionID: string; taskID: string; revoked: boolean; settled: boolean; primary: boolean }
-type CatalogEntry = { id: string; context_window: number; tools: boolean; reasoning: boolean; vision?: boolean }
+type CatalogEntry = { id: string; stable_id?: string; legacy_name_unavailable?: boolean; aliases?: string[]; provider_refs?: { provider_id: string; model_id: string }[]; context_window: number; tools: boolean; reasoning: boolean; vision?: boolean }
 const base = (process.env.CLAWMANAGER_LLM_BASE_URL ?? "").replace(/\/+$/, "")
 const key = process.env.CLAWMANAGER_LLM_API_KEY ?? ""
 export const enabled = process.env.CLAWMANAGER_MODEL_GOVERNANCE_PROTOCOL === "1" && Boolean(base && key)
@@ -220,24 +221,47 @@ export async function catalog() {
         !("context_window" in entry) || typeof entry.context_window !== "number" || !Number.isSafeInteger(entry.context_window) || entry.context_window < 0 ||
         !("tools" in entry) || typeof entry.tools !== "boolean" || !("reasoning" in entry) || typeof entry.reasoning !== "boolean") throw new GovernanceError()
       if ("vision" in entry && typeof entry.vision !== "boolean") throw new GovernanceError()
-      return { id: entry.id, context_window: entry.context_window, tools: entry.tools, reasoning: entry.reasoning, vision: "vision" in entry ? entry.vision as boolean : undefined }
+      if ("stable_id" in entry && typeof entry.stable_id !== "string") throw new GovernanceError()
+      if ("legacy_name_unavailable" in entry && typeof entry.legacy_name_unavailable !== "boolean") throw new GovernanceError()
+      if ("aliases" in entry && (!Array.isArray(entry.aliases) || entry.aliases.some((alias: unknown) => typeof alias !== "string" || !alias))) throw new GovernanceError()
+      if ("provider_refs" in entry && (!Array.isArray(entry.provider_refs) || entry.provider_refs.some((ref: unknown) => !ref || typeof ref !== "object" || !("provider_id" in ref) || typeof ref.provider_id !== "string" || !ref.provider_id || !("model_id" in ref) || typeof ref.model_id !== "string" || !ref.model_id))) throw new GovernanceError()
+      return { id: entry.id, stable_id: "stable_id" in entry ? entry.stable_id as string : undefined,
+        legacy_name_unavailable: "legacy_name_unavailable" in entry ? entry.legacy_name_unavailable as boolean : undefined,
+        provider_refs: "provider_refs" in entry ? entry.provider_refs as CatalogEntry["provider_refs"] : undefined,
+        aliases: "aliases" in entry ? entry.aliases as string[] : undefined,
+        context_window: entry.context_window, tools: entry.tools, reasoning: entry.reasoning, vision: "vision" in entry ? entry.vision as boolean : undefined }
     })
     cached = entries; catalogAt = Date.now(); return entries
   }).finally(() => { catalogPending = undefined })
   return catalogPending
 }
 
+function managedModel(item: Model.Info) {
+  if (item.providerID === "clawmanager") return true
+  // A matching provider name alone is never ownership evidence. Retain custom
+  // providers, including ones that use the same model name at a different URL.
+  const endpoint = item.settings?.baseURL
+  const credential = item.settings?.apiKey
+  return (endpoint === "{env:CLAWMANAGER_LLM_BASE_URL}" || (typeof endpoint === "string" && endpoint.replace(/\/+$/, "") === base)) &&
+    (credential === "{env:CLAWMANAGER_LLM_API_KEY}" || credential === key)
+}
+
 export async function projectCatalog(existing: readonly Model.Info[]): Promise<readonly Model.Info[]> {
   if (!enabled) return existing
-  const unmanaged = existing.filter((item) => item.providerID !== "clawmanager")
-  const managed = existing.filter((item) => item.providerID === "clawmanager")
-  const template = managed.find((item) => item.id === "auto") ?? managed[0]
+  const unmanaged = existing.filter((item) => !managedModel(item))
+  const managed = existing.filter(managedModel)
+  const template = managed.find((item) => item.providerID === "clawmanager" && item.id === "auto") ?? managed.find((item) => item.providerID === "clawmanager") ?? managed[0]
   if (!template) return unmanaged
-  const entries = await catalog().catch(() => undefined)
-  if (!entries) return unmanaged
+  // An unavailable authorization service is not an authoritative empty catalog.
+  // Propagate the error: never erase session model identities or authorize from
+  // stale entries merely because a refresh failed.
+  const entries = await catalog()
   return [...unmanaged, ...entries.map((entry) => {
-    const old = managed.find((item) => item.id === entry.id) ?? template
-    return { ...old, id: Model.ID.make(entry.id), modelID: Model.ID.make(entry.id), name: entry.id, enabled: true,
+    const old = managed.find((item) => item.id === (entry.stable_id || entry.id)) ??
+      (!entry.legacy_name_unavailable ? managed.find((item) => item.id === entry.id) : undefined) ?? template
+    return { ...old, providerID: Provider.ID.make("clawmanager"),
+      ...(old.providerID === "clawmanager" ? {} : { canonical: undefined, package: "@opencode/ai/providers/openai-compatible" }),
+      id: Model.ID.make(entry.stable_id || entry.id), modelID: Model.ID.make(entry.stable_id || entry.id), name: entry.id, enabled: true,
       capabilities: { ...old.capabilities, tools: entry.tools,
         input: entry.vision === undefined ? old.capabilities.input : entry.vision
           ? [...new Set([...old.capabilities.input, "image" as const])]
@@ -249,7 +273,37 @@ export async function projectCatalog(existing: readonly Model.Info[]): Promise<r
 }
 
 export const hasPrimaryTask = (sessionID: string) => primary.has(sessionID)
+
+// Resolve old managed references at lookup time only. Do not add historical
+// aliases to the picker or rewrite persisted messages. Other providers are not
+// candidates, even if their model IDs happen to match a managed alias.
+export async function resolveCatalogModel(existing: readonly Model.Info[], providerID: string, modelID: string, required = false): Promise<Model.Info | undefined> {
+  const direct = existing.find((item) => item.providerID === providerID && item.id === modelID)
+  if (!enabled) return direct
+  if (direct && !managedModel(direct)) return direct
+  // A live custom provider owns its namespace, even if a historical managed
+  // reference has the same name. Never redirect its missing model to Gateway.
+  if (providerID !== "clawmanager" && existing.some((item) => item.providerID === providerID && !managedModel(item))) {
+    if (required) throw new GovernanceError(true)
+    return undefined
+  }
+  const projected = await projectCatalog(existing)
+  const entries = await catalog()
+  const ref = modelID.trim().toLowerCase()
+  const matches = entries.filter((entry) => {
+    if (providerID === "clawmanager" || (direct && managedModel(direct))) return (!entry.legacy_name_unavailable && entry.id.toLowerCase() === ref) || entry.stable_id?.toLowerCase() === ref || entry.aliases?.some((alias) => alias.toLowerCase() === ref)
+    return (providerID === "auto" && modelID === "auto" && entry.id === "auto") || entry.provider_refs?.some((old) => old.provider_id.toLowerCase() === providerID.trim().toLowerCase() && old.model_id.toLowerCase() === ref)
+  })
+  if (matches.length === 0 && !required && providerID !== "clawmanager" && !direct) return undefined
+  if (matches.length !== 1) throw new GovernanceError(true)
+  const wireID = matches[0].stable_id || matches[0].id
+  const model = projected.find((item) => item.providerID === "clawmanager" && item.id === wireID)
+  if (!model) throw new GovernanceError(true)
+  // Keep the caller's reference while sending the authorized current ID to the
+  // gateway. Both still pass the normal owner/key-group/task checks there.
+  return { ...model, id: Model.ID.make(providerID === "clawmanager" ? modelID : wireID), modelID: Model.ID.make(wireID) }
+}
 export function beforeTool<A, E, R>(provider: string, operation: Effect.Effect<A, E, R>) {
   return enabled && provider === "clawmanager" ? headers.pipe(Effect.andThen(operation)) : operation
 }
-export const Governance = { enabled, headers, withPrimary, withAuxiliary, guardSession, settleSession, projectCatalog, catalog, hasPrimaryTask, beforeTool, pollMaintenance, admit, jobStarted }
+export const Governance = { enabled, headers, withPrimary, withAuxiliary, guardSession, settleSession, projectCatalog, resolveCatalogModel, catalog, hasPrimaryTask, beforeTool, pollMaintenance, admit, jobStarted }

@@ -1743,6 +1743,48 @@ def apply_redis_team_config(hermes_home, data):
     return record
 
 
+def reconcile_managed_providers(previous, desired, base_url, api_key, authoritative=True):
+    """Refresh only the instance Gateway catalog; do not rewrite user providers."""
+    if previous is None:
+        previous = {}
+    if not isinstance(previous, dict):
+        raise ValueError("invalid Hermes provider catalog; preserving configuration")
+    result = json.loads(json.dumps(previous))
+    for name, entry in previous.items():
+        entry = entry if isinstance(entry, dict) else {}
+        endpoint = entry.get("base_url")
+        same_endpoint = isinstance(endpoint, str) and bool(base_url) and endpoint.rstrip("/") == base_url.rstrip("/")
+        same_credential = entry.get("key_env") in {"OPENAI_API_KEY", "CLAWMANAGER_LLM_API_KEY"} or bool(api_key) and entry.get("api_key") == api_key
+        owned = same_endpoint and same_credential
+        legacy = name in {"clawmanager", "custom"} and endpoint is None
+        if name in desired and not owned and not legacy:
+            raise ValueError("Hermes provider conflicts with user configuration: " + name)
+        if authoritative and owned and name not in desired:
+            del result[name]
+    for name, incoming in desired.items():
+        entry = result.get(name, {})
+        if not isinstance(entry, dict):
+            raise ValueError("invalid existing Hermes provider: " + name)
+        old_models = entry.get("models", {})
+        if not isinstance(old_models, dict):
+            raise ValueError("invalid existing Hermes model catalog: " + name)
+        current_models = {}
+        for model, settings in incoming.get("models", {}).items():
+            metadata = old_models.get(model, {})
+            metadata = dict(metadata) if isinstance(metadata, dict) else {}
+            metadata.update(settings)
+            current_models[model] = metadata
+        entry.update(incoming)
+        # Saved credentials/alternate endpoints must not outrank the current
+        # instance environment after merging otherwise harmless user metadata.
+        if incoming.get("key_env") in {"OPENAI_API_KEY", "CLAWMANAGER_LLM_API_KEY"}:
+            entry.update({"api_key": "", "api": "", "url": "", "key_cmd": "",
+                          "api_key_env": incoming["key_env"], "enabled": True})
+        entry["models"] = current_models
+        result[name] = entry
+    return result
+
+
 def normalize_provider(provider, base_url):
     provider = (provider or "").strip().lower()
     aliases = {
@@ -1927,11 +1969,13 @@ else:
 base_url = base_url.rstrip("/") if base_url else ""
 
 if config_path.exists():
-    data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    if data is None:
+        data = {}
 else:
     data = {}
 if not isinstance(data, dict):
-    data = {}
+    raise ValueError("Hermes config must be a mapping; preserving configuration")
 apply_approval_defaults(data)
 
 provider_key = ""
@@ -1963,7 +2007,7 @@ if has_llm_config:
             if api_key:
                 provider_entry["key_env"] = "OPENAI_API_KEY"
             providers_cfg[provider_id] = provider_entry
-        data["providers"] = providers_cfg
+        data["providers"] = reconcile_managed_providers(data.get("providers"), providers_cfg, base_url, api_key)
     else:
         if provider == "custom" and base_url:
             provider_key = os.environ.get("CLAWMANAGER_LLM_PROVIDER_ID", "").strip()
@@ -1982,10 +2026,13 @@ if has_llm_config:
                 model_cfg["base_url"] = base_url
 
         if provider_key:
-            providers_cfg = data.get("providers")
-            if not isinstance(providers_cfg, dict):
-                providers_cfg = {}
-            provider_entry = providers_cfg.get(provider_key)
+            previous_providers = data.get("providers")
+            if previous_providers is None:
+                previous_providers = {}
+            if not isinstance(previous_providers, dict):
+                raise ValueError("invalid Hermes provider catalog; preserving configuration")
+            providers_cfg = {}
+            provider_entry = json.loads(json.dumps(previous_providers.get(provider_key)))
             if not isinstance(provider_entry, dict):
                 provider_entry = {}
 
@@ -2010,11 +2057,13 @@ if has_llm_config:
             if api_key:
                 provider_entry["key_env"] = "OPENAI_API_KEY"
 
-            provider_models = provider_entry.get("models")
-            if not isinstance(provider_models, dict):
-                provider_models = {}
+            previous_models = provider_entry.get("models") or {}
+            if not isinstance(previous_models, dict):
+                raise ValueError("invalid Hermes model catalog; preserving configuration")
+            catalog_supplied = bool(models or model_src or default_model_src)
+            provider_models = {} if catalog_supplied else dict(previous_models)
             for model_name in models:
-                existing = provider_models.get(model_name)
+                existing = previous_models.get(model_name)
                 provider_models[model_name] = existing if isinstance(existing, dict) else {}
             provider_entry["models"] = provider_models
 
@@ -2023,7 +2072,7 @@ if has_llm_config:
                 custom_entry = dict(provider_entry)
                 custom_entry["name"] = "custom"
                 providers_cfg["custom"] = custom_entry
-            data["providers"] = providers_cfg
+            data["providers"] = reconcile_managed_providers(previous_providers, providers_cfg, base_url, api_key, authoritative=catalog_supplied)
 
     if api_mode:
         model_cfg["api_mode"] = api_mode
@@ -2031,6 +2080,26 @@ if has_llm_config:
     data["model"] = model_cfg
 
 # Managed image analysis must use the same owner-authenticated Gateway.
+# Context settings are managed per model; unrelated providers remain untouched.
+def apply_managed_context_windows(providers, windows, fallback, endpoint):
+    if not isinstance(windows, dict) or type(fallback) is not int or not 0 <= fallback <= 2147483647:
+        raise ValueError("invalid managed context settings")
+    for key, value in windows.items():
+        if not isinstance(key, str) or not key.strip() or type(value) is not int or not 0 <= value <= 2147483647:
+            raise ValueError("invalid managed context window")
+    for provider_id, block in (providers or {}).items():
+        if not isinstance(block, dict) or str(block.get("base_url", "")).rstrip("/") != endpoint.rstrip("/") or block.get("key_env") != "OPENAI_API_KEY":
+            continue
+        for model_id, metadata in block.get("models", {}).items():
+            if not isinstance(metadata, dict):
+                raise ValueError("invalid managed model metadata")
+            value = windows.get(provider_id + "/" + model_id, windows.get(model_id, fallback))
+            if value > 0:
+                metadata["context_length"] = value
+
+if "CLAWMANAGER_LLM_CONTEXT_WINDOWS" in os.environ or "CLAWMANAGER_LLM_CONTEXT_WINDOW" in os.environ:
+    apply_managed_context_windows(data.get("providers"), json.loads(os.environ.get("CLAWMANAGER_LLM_CONTEXT_WINDOWS", "{}")), int(os.environ.get("CLAWMANAGER_LLM_CONTEXT_WINDOW", "0")), base_url)
+
 if "CLAWMANAGER_LLM_VISION" in os.environ:
     vision_flags = json.loads(os.environ["CLAWMANAGER_LLM_VISION"])
     if not isinstance(vision_flags, dict) or any(type(v) is not bool for v in vision_flags.values()):

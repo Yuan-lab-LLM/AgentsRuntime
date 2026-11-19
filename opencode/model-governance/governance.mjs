@@ -108,18 +108,37 @@ export function createGovernance({ env = process.env, fetcher = globalThis.fetch
     const managed = existing.filter((item) => item.providerID === "clawmanager")
     const template = managed.find((item) => item.id === "auto") || managed[0]
     if (!template) return unmanaged
-    let entries
-    try { entries = await catalog() } catch { return unmanaged } // Never serve stale grants on failure.
+    // Fail the lookup explicitly instead of reporting that every managed model
+    // has disappeared. Cached display state must never authorize a request.
+    const entries = await catalog()
     return [...unmanaged, ...entries.map((entry) => {
-      const old = managed.find((item) => item.id === entry.id) || template
-      return { ...old, id: entry.id, name: entry.id, enabled: true,
-        api: { ...old.api, id: entry.id },
+      const old = managed.find((item) => item.id === (entry.stable_id || entry.id)) ||
+        (!entry.legacy_name_unavailable && managed.find((item) => item.id === entry.id)) || template
+      return { ...old, id: entry.stable_id || entry.id, name: entry.id, enabled: true,
+        api: { ...old.api, id: entry.stable_id || entry.id },
         capabilities: { ...old.capabilities, tools: entry.tools },
         limit: { ...old.limit, context: entry.context_window > 0 ? entry.context_window : old.limit.context },
       }
     })]
   }
-  return { enabled, begin, check, headers, finish, finishSession, flushReceipts, catalog, projectCatalog }
+  async function resolveCatalogModel(existing, providerID, modelID) {
+    if (!enabled || providerID !== "clawmanager") return existing.find((item) => item.providerID === providerID && item.id === modelID)
+    const projected = await projectCatalog(existing)
+    const entries = await catalog()
+    const ref = modelID.trim().toLowerCase()
+    for (const entry of entries) {
+      if (entry.stable_id !== undefined && typeof entry.stable_id !== "string") throw new GovernanceUnavailable()
+      if (entry.legacy_name_unavailable !== undefined && typeof entry.legacy_name_unavailable !== "boolean") throw new GovernanceUnavailable()
+      if (entry.aliases !== undefined && (!Array.isArray(entry.aliases) || entry.aliases.some((alias) => typeof alias !== "string" || !alias))) throw new GovernanceUnavailable()
+    }
+    const matches = entries.filter((entry) => (!entry.legacy_name_unavailable && entry.id.toLowerCase() === ref) || entry.stable_id?.toLowerCase() === ref || entry.aliases?.some((alias) => alias.toLowerCase() === ref))
+    if (matches.length !== 1) throw new ModelUnavailable()
+    const wireID = matches[0].stable_id || matches[0].id
+    const model = projected.find((item) => item.providerID === providerID && item.id === wireID)
+    if (!model) throw new ModelUnavailable()
+    return { ...model, id: modelID, api: { ...model.api, id: wireID } }
+  }
+  return { enabled, begin, check, headers, finish, finishSession, flushReceipts, catalog, projectCatalog, resolveCatalogModel }
 }
 
 export const governance = createGovernance()

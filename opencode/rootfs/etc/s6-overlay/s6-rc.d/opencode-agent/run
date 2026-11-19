@@ -25,7 +25,7 @@ mkdir -p \
   "${XDG_CONFIG_HOME}" \
   "${XDG_DATA_HOME}"
 
-/usr/local/bin/opencode-apply-runtime-config || true
+/usr/local/bin/opencode-apply-runtime-config
 
 # A Pro desktop runs OpenCode and its terminal as abc.  The agent launches
 # OpenCode Web as a child, so keeping this service as root leaves root-owned

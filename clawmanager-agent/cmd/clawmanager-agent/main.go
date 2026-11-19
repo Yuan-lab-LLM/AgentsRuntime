@@ -48,7 +48,7 @@ func main() {
 		defer stop()
 		if err := dshproxy.RunCommand(ctx, os.Args[2:], os.Stdout, os.Stderr); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("run DSH web proxy: %v", err)
-			os.Exit(1)
+			os.Exit(dshproxy.CommandExitCode(err))
 		}
 		return
 	}

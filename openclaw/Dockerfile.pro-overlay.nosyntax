@@ -33,6 +33,9 @@ RUN set -eux; \
       -o /out/openclaw-agent ./cmd/openclaw-agent
 
 FROM ${BASE_IMAGE}
+COPY openclaw/patches/ /usr/local/share/openclaw/patches/
+RUN node /usr/local/share/openclaw/patches/patch_managed_model_reference_102.mjs --patch --allow-legacy \
+    && node /usr/local/share/openclaw/patches/patch_managed_model_reference_102.mjs --verify --allow-legacy
 COPY --from=agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent
 COPY --from=agent-builder /out/openclaw-agent /usr/local/bin/openclaw-agent
 RUN chmod 755 /usr/local/bin/clawmanager-agent /usr/local/bin/openclaw-agent

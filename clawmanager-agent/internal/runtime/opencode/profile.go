@@ -2,7 +2,6 @@ package opencode
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"path"
 	"path/filepath"
@@ -16,6 +15,8 @@ import (
 type Profile struct {
 	runtimeType string
 }
+
+func (p Profile) WritesStartupModelCatalog() bool { return true }
 
 func NewProfile(runtimeType string) Profile {
 	return Profile{runtimeType: strings.ToLower(strings.TrimSpace(runtimeType))}
@@ -49,22 +50,13 @@ func (p Profile) GatewayCommand(string) []string {
 func (p Profile) GatewayEnv(base []string, cfg gateway.Config, req gateway.CreateGatewayRequest, workspacePath string, port int) []string {
 	env := append([]string(nil), base...)
 	env = gateway.ApplyRequestEnvironment(env, req)
-	projectPath, projectRelativePath, fallbackReason := resolveOpenCodeProjectPath(req, workspacePath)
-	if fallbackReason != "" {
-		log.Printf("runtime-agent OpenCode default project fallback: instance_id=%d workspace_path=%q project_relative_path=%q reason=%s", req.InstanceID, workspacePath, req.ProjectRelativePath, fallbackReason)
-	}
+	env = unsetEnv(env, "CLAWMANAGER_DEFAULT_PROJECT_PATH", "CLAWMANAGER_DEFAULT_PROJECT_RELATIVE_PATH")
 	env = setEnv(env, "CLAWMANAGER_INSTANCE_ID", strconv.Itoa(req.InstanceID))
 	env = setEnv(env, "CLAWMANAGER_GATEWAY_GENERATION", strconv.Itoa(req.Generation))
 	env = setEnv(env, "CLAWMANAGER_USER_ID", strconv.Itoa(req.UserID))
 	env = setEnv(env, "CLAWMANAGER_RUNTIME_TYPE", cfg.RuntimeType)
 	env = setEnv(env, "CLAWMANAGER_WORKSPACE_PATH", workspacePath)
-	env = setEnv(env, "CLAWMANAGER_PROJECT_PATH", projectPath)
-	env = setEnv(env, "CLAWMANAGER_DEFAULT_PROJECT_PATH", projectPath)
-	if projectRelativePath == "" {
-		env = unsetEnv(env, "CLAWMANAGER_DEFAULT_PROJECT_RELATIVE_PATH")
-	} else {
-		env = setEnv(env, "CLAWMANAGER_DEFAULT_PROJECT_RELATIVE_PATH", projectRelativePath)
-	}
+	env = setEnv(env, "CLAWMANAGER_PROJECT_PATH", workspacePath)
 	env = setEnv(env, "CLAWMANAGER_GATEWAY_PORT", strconv.Itoa(port))
 	// ClawManager's workspace browser exposes workspacePath as its root. Keep
 	// OpenCode's idea of the user's home aligned with that root as well, or a
@@ -109,109 +101,6 @@ func (p Profile) GatewayEnv(base []string, cfg gateway.Config, req gateway.Creat
 	return env
 }
 
-func resolveOpenCodeProjectPath(req gateway.CreateGatewayRequest, workspacePath string) (string, string, string) {
-	workspacePath = cleanRuntimeWorkspacePath(workspacePath)
-	rawPath, absolute, supplied := requestedOpenCodeProjectPath(req)
-
-	var candidate string
-	var relativePath string
-	if !supplied {
-		candidate = filepath.Join(workspacePath, "project")
-		if info, err := os.Stat(candidate); err != nil || !info.IsDir() {
-			return workspacePath, "", ""
-		}
-	} else if absolute {
-		candidate = filepath.Clean(rawPath)
-		relative, err := filepath.Rel(workspacePath, candidate)
-		if err != nil || !pathWithinWorkspace(workspacePath, candidate) {
-			return workspacePath, "", "absolute compatibility path is outside the instance workspace"
-		}
-		if relative == "." {
-			return workspacePath, "", ""
-		}
-		relativePath = filepath.ToSlash(relative)
-	} else {
-		normalized, err := normalizeProjectRelativePath(rawPath)
-		if err != nil {
-			return workspacePath, "", err.Error()
-		}
-		relativePath = normalized
-		candidate = filepath.Join(workspacePath, filepath.FromSlash(normalized))
-		if !pathWithinWorkspace(workspacePath, candidate) {
-			return workspacePath, "", "resolved project path is outside the instance workspace"
-		}
-	}
-
-	workspaceRealPath, err := filepath.EvalSymlinks(workspacePath)
-	if err != nil {
-		return workspacePath, "", fmt.Sprintf("resolve workspace path: %v", err)
-	}
-	info, err := os.Stat(candidate)
-	if err != nil {
-		return workspacePath, "", fmt.Sprintf("project directory is unavailable: %v", err)
-	}
-	if !info.IsDir() {
-		return workspacePath, "", "project path is not a directory"
-	}
-	projectRealPath, err := filepath.EvalSymlinks(candidate)
-	if err != nil {
-		return workspacePath, "", fmt.Sprintf("resolve project path: %v", err)
-	}
-	if !pathWithinWorkspace(workspaceRealPath, projectRealPath) {
-		return workspacePath, "", "project symbolic link escapes the instance workspace"
-	}
-	return filepath.Clean(candidate), relativePath, ""
-}
-
-func cleanRuntimeWorkspacePath(value string) string {
-	value = strings.TrimSpace(value)
-	if filepath.VolumeName(value) == "" && strings.HasPrefix(value, "/") {
-		return path.Clean(value)
-	}
-	return filepath.Clean(value)
-}
-
-func requestedOpenCodeProjectPath(req gateway.CreateGatewayRequest) (string, bool, bool) {
-	if value := strings.TrimSpace(req.ProjectRelativePath); value != "" {
-		return value, false, true
-	}
-	if value, ok := requestEnvValue(req, "CLAWMANAGER_DEFAULT_PROJECT_RELATIVE_PATH"); ok && strings.TrimSpace(value) != "" {
-		return strings.TrimSpace(value), false, true
-	}
-	if value, ok := requestEnvValue(req, "CLAWMANAGER_DEFAULT_PROJECT_PATH"); ok && strings.TrimSpace(value) != "" {
-		return strings.TrimSpace(value), true, true
-	}
-	return "", false, false
-}
-
-func normalizeProjectRelativePath(value string) (string, error) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return "", fmt.Errorf("project relative path is empty")
-	}
-	if strings.ContainsRune(value, '\x00') || strings.Contains(value, "\\") {
-		return "", fmt.Errorf("project relative path contains unsupported characters")
-	}
-	if path.IsAbs(value) || filepath.IsAbs(value) || filepath.VolumeName(value) != "" {
-		return "", fmt.Errorf("project relative path must not be absolute")
-	}
-	normalized := path.Clean(value)
-	if normalized == "." || normalized == ".." || strings.HasPrefix(normalized, "../") {
-		return "", fmt.Errorf("project relative path escapes the instance workspace")
-	}
-	return normalized, nil
-}
-
-func pathWithinWorkspace(root, candidate string) bool {
-	root = filepath.Clean(root)
-	candidate = filepath.Clean(candidate)
-	if root == candidate {
-		return true
-	}
-	relative, err := filepath.Rel(root, candidate)
-	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
-}
-
 func (p Profile) PrepareWorkspace(cfg gateway.Config, req gateway.CreateGatewayRequest, workspacePath string) error {
 	prepared, err := gateway.PrepareWorkspace(cfg.WorkspaceRoot, cfg.RuntimeType, req)
 	if err != nil {
@@ -220,53 +109,12 @@ func (p Profile) PrepareWorkspace(cfg gateway.Config, req gateway.CreateGatewayR
 	if prepared != workspacePath {
 		return fmt.Errorf("%w: prepared %s want %s", gateway.ErrWorkspacePath, prepared, workspacePath)
 	}
-	if err := prepareOpenCodeProjectDirectory(req, workspacePath); err != nil {
-		return err
-	}
 	opencodeHome := filepath.Join(workspacePath, "home", ".opencode")
 	if err := os.MkdirAll(opencodeHome, 0o750); err != nil {
 		return fmt.Errorf("create opencode home: %w", err)
 	}
 	if err := gateway.ChownWorkspace(opencodeHome, req.UID, req.GID); err != nil {
 		return fmt.Errorf("chown opencode home: %w", err)
-	}
-	return nil
-}
-
-func prepareOpenCodeProjectDirectory(req gateway.CreateGatewayRequest, workspacePath string) error {
-	if strings.TrimSpace(req.ProjectRelativePath) == "" {
-		return nil
-	}
-	relativePath, err := normalizeProjectRelativePath(req.ProjectRelativePath)
-	if err != nil {
-		return fmt.Errorf("prepare OpenCode default project: %w", err)
-	}
-
-	current := filepath.Clean(workspacePath)
-	for _, segment := range strings.Split(relativePath, "/") {
-		current = filepath.Join(current, segment)
-		if !pathWithinWorkspace(workspacePath, current) {
-			return fmt.Errorf("prepare OpenCode default project: path escaped the instance workspace")
-		}
-		info, statErr := os.Lstat(current)
-		switch {
-		case statErr == nil:
-			if info.Mode()&os.ModeSymlink != 0 {
-				return fmt.Errorf("prepare OpenCode default project: %s is a symbolic link", current)
-			}
-			if !info.IsDir() {
-				return fmt.Errorf("prepare OpenCode default project: %s is not a directory", current)
-			}
-		case os.IsNotExist(statErr):
-			if mkdirErr := os.Mkdir(current, 0o750); mkdirErr != nil {
-				return fmt.Errorf("prepare OpenCode default project: create %s: %w", current, mkdirErr)
-			}
-		default:
-			return fmt.Errorf("prepare OpenCode default project: inspect %s: %w", current, statErr)
-		}
-	}
-	if err := gateway.ChownWorkspace(current, req.UID, req.GID); err != nil {
-		return fmt.Errorf("chown OpenCode default project: %w", err)
 	}
 	return nil
 }

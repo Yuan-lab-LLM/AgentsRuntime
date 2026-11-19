@@ -184,6 +184,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Check OpenCode Lite startup
+        if: matrix.runtime == 'opencode' || matrix.runtime == 'opencode-lite'
+        run: node opencode/tests/start-opencode-web.test.mjs
+
       - name: Resolve reproducible build timestamp
         id: stamp
         shell: bash

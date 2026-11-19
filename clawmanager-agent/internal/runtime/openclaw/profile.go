@@ -1,7 +1,9 @@
 package openclaw
 
 import (
+	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -11,6 +13,8 @@ import (
 type Profile struct {
 	runtimeType string
 }
+
+func (p Profile) WritesStartupModelCatalog() bool { return true }
 
 func NewProfile(runtimeType string) Profile {
 	return Profile{runtimeType: strings.ToLower(strings.TrimSpace(runtimeType))}
@@ -51,6 +55,12 @@ func (p Profile) GatewayEnv(base []string, cfg gateway.Config, req gateway.Creat
 }
 
 func (p Profile) PrepareWorkspace(cfg gateway.Config, req gateway.CreateGatewayRequest, workspacePath string) error {
+	if err := gateway.CheckOpenClawTaskActivation(context.Background(), gateway.ApplyRequestEnvironment(os.Environ(), req)); err != nil {
+		return err
+	}
+	if err := gateway.PrepareOpenClawReceiptDirectory(cfg, req); err != nil {
+		return err
+	}
 	prepared, err := gateway.PrepareWorkspace(cfg.WorkspaceRoot, cfg.RuntimeType, req)
 	if err != nil {
 		return err

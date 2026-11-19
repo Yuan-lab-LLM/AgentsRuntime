@@ -24,6 +24,7 @@ type AgentMetadata struct {
 }
 
 type RegisterResponse struct {
+	OwnerUserID                int       `json:"owner_user_id"`
 	SessionToken               string    `json:"session_token"`
 	SessionExpiresAt           time.Time `json:"session_expires_at"`
 	HeartbeatIntervalSeconds   int       `json:"heartbeat_interval_seconds"`
@@ -46,11 +47,17 @@ type HeartbeatResponse struct {
 	DesiredConfigRevisionID *int      `json:"desired_config_revision_id,omitempty"`
 }
 
+type RuntimeShutdownObservation struct {
+	Generation int    `json:"generation"`
+	ClaimID    string `json:"claim_id"`
+	Outcome    string `json:"outcome"`
+}
 type RuntimePayload struct {
-	OpenClawStatus          string `json:"openclaw_status"`
-	OpenClawPID             *int   `json:"openclaw_pid,omitempty"`
-	OpenClawVersion         string `json:"openclaw_version,omitempty"`
-	CurrentConfigRevisionID *int   `json:"current_config_revision_id,omitempty"`
+	ShutdownObservation     *RuntimeShutdownObservation `json:"shutdown_observation,omitempty"`
+	OpenClawStatus          string                      `json:"openclaw_status"`
+	OpenClawPID             *int                        `json:"openclaw_pid,omitempty"`
+	OpenClawVersion         string                      `json:"openclaw_version,omitempty"`
+	CurrentConfigRevisionID *int                        `json:"current_config_revision_id,omitempty"`
 }
 
 type StateReportRequest struct {

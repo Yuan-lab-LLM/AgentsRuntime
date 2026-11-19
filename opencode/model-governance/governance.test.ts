@@ -5,6 +5,7 @@ import type { Prepared } from "../src/session/model-request.js"
 const calls: { path: string; body: Record<string, unknown> }[] = []
 const revoked = new Set<string>()
 let catalogFails = false
+let catalogEntries = [{ id: "auto", context_window: 8192, tools: true, reasoning: false, vision: true }] as { id: string; context_window: number; tools: boolean; reasoning: boolean; vision?: boolean; stable_id?: string; legacy_name_unavailable?: boolean; aliases?: string[]; provider_refs?: { provider_id: string; model_id: string }[] }[]
 let maintenanceFails = false
 let maintenance = { operation_id: "", draining: false, generation: 4 }
 const server = Bun.serve({
@@ -21,7 +22,7 @@ const server = Bun.serve({
     }
     if (path.endsWith("catalog")) {
       if (catalogFails) return new Response(null, { status: 503 })
-      return Response.json({ models: [{ id: "auto", context_window: 8192, tools: true, reasoning: false, vision: true }] })
+      return Response.json({ models: catalogEntries })
     }
     if (path.endsWith("check") && revoked.has(String(body.task_id))) return new Response(null, { status: 403 })
     return Response.json({ revoked: false, finished: false, runtime_acknowledged: false })
@@ -163,7 +164,85 @@ test("catalog refresh rejects stale grants on failure", async () => {
   // An empty original provider catalog cannot synthesize unauthorized templates.
   expect(await projectCatalog([])).toEqual([])
   await expect(Governance.catalog()).rejects.toBeInstanceOf(GovernanceError)
+  const managed = { id: "auto", providerID: "clawmanager", capabilities: { tools: true, input: ["text"], output: ["text"] }, limit: { context: 8192 } } as never
+  await expect(projectCatalog([managed])).rejects.toBeInstanceOf(GovernanceError)
   catalogFails = false
+})
+
+test("historical managed model lookup preserves the session reference and fails closed after revocation", async () => {
+  const original = catalogEntries
+  const managed = { id: "auto", providerID: "clawmanager", capabilities: { tools: true, input: ["text"], output: ["text"] }, limit: { context: 8192 } } as never
+  const custom = { id: "old model", providerID: "custom" } as never
+  try {
+    catalogEntries = [{ id: "renamed", stable_id: "cm-deploy-v1-test", aliases: ["old model"], provider_refs: [{ provider_id: "old vendor", model_id: "old model" }, { provider_id: "vendor", model_id: "org/model" }], context_window: 4096, tools: false, reasoning: false }]
+    await Bun.sleep(3100)
+    for (const ref of ["old model", "OLD MODEL", "cm-deploy-v1-test", "renamed"]) {
+      const result = await Governance.resolveCatalogModel([managed, custom], "clawmanager", ref)
+      expect(String(result?.id)).toBe(ref)
+      expect(String(result?.modelID)).toBe("cm-deploy-v1-test")
+      expect(String(result?.providerID)).toBe("clawmanager")
+      expect(result?.limit.context).toBe(4096)
+    }
+    expect((await projectCatalog([managed, custom])).map((item) => String(item.id))).toEqual(["old model", "cm-deploy-v1-test"])
+    expect(await Governance.resolveCatalogModel([managed, custom], "custom", "old model")).toBe(custom)
+    for (const [providerID, id] of [["old vendor", "old model"], ["vendor", "org/model"]]) {
+      const resolved = await Governance.resolveCatalogModel([managed], providerID, id, true)
+      expect(String(resolved?.providerID)).toBe("clawmanager")
+      expect(String(resolved?.modelID)).toBe("cm-deploy-v1-test")
+    }
+    await expect(Governance.resolveCatalogModel([managed], "wrong-vendor", "org/model", true)).rejects.toBeInstanceOf(GovernanceError)
+    const collision = { id: "old model", providerID: "old vendor", settings: { baseURL: "https://custom.invalid", apiKey: "user-key" } } as never
+    expect(await Governance.resolveCatalogModel([managed, collision], "old vendor", "old model", true)).toBe(collision)
+    await expect(Governance.resolveCatalogModel([managed, collision], "old vendor", "missing", true)).rejects.toBeInstanceOf(GovernanceError)
+    const legacy = { id: "old model", providerID: "old vendor", settings: { baseURL: process.env.CLAWMANAGER_LLM_BASE_URL, apiKey: "{env:CLAWMANAGER_LLM_API_KEY}" }, capabilities: { tools: true, input: ["text"], output: ["text"] }, limit: { context: 8192 } } as never
+    const migrated = await projectCatalog([legacy, custom])
+    expect(migrated.length).toBe(2)
+    expect(String(migrated[1].providerID)).toBe("clawmanager")
+    expect(migrated[1].package).toBe("@opencode/ai/providers/openai-compatible")
+    await expect(Governance.resolveCatalogModel([managed], "clawmanager", "unknown")).rejects.toBeInstanceOf(GovernanceError)
+    const { Layer } = await import("effect")
+    const { LayerNode } = await import("@opencode/util/effect/layer-node")
+    const { ModelResolver } = await import("../src/model-resolver.js")
+    const { SessionRunnerModel } = await import("../src/session/runner/model.js")
+    const { LanguageModel } = await import("@opencode/ai")
+    const { OpenAIChat } = await import("@opencode/ai/protocols")
+    let resolvedCalls = 0
+    const resolver = Layer.succeed(ModelResolver.Service, {
+      resolve: () => Effect.die("must not fall back to a default model"),
+      resolveModel: (selected) => Effect.sync(() => {
+        resolvedCalls++
+        expect(["old model", "renamed", "cm-deploy-v1-test"]).toContain(String(selected.id))
+        expect(String(selected.modelID)).toBe("cm-deploy-v1-test")
+        return SessionRunnerModel.resolved(LanguageModel.make({ id: selected.modelID, provider: selected.providerID, route: OpenAIChat.route }), {
+          capabilities: selected.capabilities, cost: [], limit: selected.limit,
+        })
+      }),
+    })
+    const layer = LayerNode.compile(SessionRunnerModel.node, { replacements: [ModelResolver.node.replace(resolver)] })
+    const resolveOldSession = Effect.gen(function* () {
+      const runner = yield* SessionRunnerModel.Service
+      return yield* runner.resolve({ model: { providerID: "clawmanager", id: "old model" } } as never,
+        () => Effect.promise(() => projectCatalog([managed])))
+    }).pipe(Effect.provide(layer))
+    expect(String((await Effect.runPromise(resolveOldSession)).model.id)).toBe("cm-deploy-v1-test")
+    expect(resolvedCalls).toBe(1)
+    const resolveLegacySession = Effect.gen(function* () {
+      const runner = yield* SessionRunnerModel.Service
+      return yield* runner.resolve({ model: { providerID: "old vendor", id: "old model" } } as never,
+        () => Effect.promise(() => projectCatalog([managed])))
+    }).pipe(Effect.provide(layer))
+    expect(String((await Effect.runPromise(resolveLegacySession)).ref.providerID)).toBe("clawmanager")
+    expect(resolvedCalls).toBe(2)
+    catalogEntries = []
+    await Bun.sleep(3100)
+    await expect(Governance.resolveCatalogModel([managed], "clawmanager", "old model")).rejects.toMatchObject({ revoked: true })
+    expect((await Effect.runPromiseExit(resolveOldSession))._tag).toBe("Failure")
+    expect((await Effect.runPromiseExit(resolveLegacySession))._tag).toBe("Failure")
+    expect(resolvedCalls).toBe(2)
+  } finally {
+    catalogEntries = original
+    await Bun.sleep(3100)
+  }
 })
 
 test("native request preparation attaches identity to primary, compaction, title and generate", async () => {
@@ -206,4 +285,21 @@ test("native request preparation attaches identity to primary, compaction, title
     }
   }).pipe(Effect.provideService(SessionModelTransport.Service, transport), Effect.provide(PluginTestLayer), Effect.scoped))
   await settleSession(session.id)
+})
+
+test("recreated display name is listed with its new identity and cannot revive an old selection", async () => {
+  const original = catalogEntries
+  const managed = { id: "auto", providerID: "clawmanager", capabilities: { tools: true, input: ["text"], output: ["text"] }, limit: { context: 8192 } } as never
+  try {
+    catalogEntries = [{ id: "old model", stable_id: "cm-deploy-v1-new", legacy_name_unavailable: true, context_window: 256000, tools: true, reasoning: false }]
+    await Bun.sleep(3100)
+    const models = await projectCatalog([managed])
+    expect(models.map(model => String(model.id))).toEqual(["cm-deploy-v1-new"])
+    expect(models[0]?.name).toBe("old model")
+    await expect(Governance.resolveCatalogModel([managed], "clawmanager", "old model")).rejects.toBeInstanceOf(GovernanceError)
+    expect(String((await Governance.resolveCatalogModel([managed], "clawmanager", "cm-deploy-v1-new"))?.modelID)).toBe("cm-deploy-v1-new")
+  } finally {
+    catalogEntries = original
+    await Bun.sleep(3100)
+  }
 })

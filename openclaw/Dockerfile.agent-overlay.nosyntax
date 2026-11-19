@@ -33,6 +33,8 @@ RUN set -eux; \
 FROM ${BASE_IMAGE}
 
 COPY openclaw/patches/ /usr/local/share/openclaw/patches/
+RUN node /usr/local/share/openclaw/patches/patch_managed_model_reference_102.mjs --patch --allow-legacy \
+    && node /usr/local/share/openclaw/patches/patch_managed_model_reference_102.mjs --verify --allow-legacy
 RUN node /usr/local/share/openclaw/patches/test_managed_proxy_policy.mjs \
     && node /usr/local/share/openclaw/patches/patch_managed_proxy_policy.mjs --patch --allow-legacy --install-marker \
     && node /usr/local/share/openclaw/patches/test_managed_proxy_metadata.mjs --allow-legacy

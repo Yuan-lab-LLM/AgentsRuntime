@@ -31,19 +31,27 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /out/opencla
 
 FROM ${WEBTOP_RUNTIME_BASE_IMAGE}
 
-ARG DSH_VERSION=0.1.0-rc.6
+ARG DSH_VERSION=0.2.1-rc.3
+ARG PNPM_VERSION=11.25.0
+LABEL io.clawmanager.deepseek-harness.version="${DSH_VERSION}"
 RUN set -eux; \
-    npm install --global "@deepseek-ai/dsh@${DSH_VERSION}"; \
+    node -e 'const [major, minor] = process.versions.node.split(".").map(Number); if (!(major >= 24 || (major === 22 && minor >= 19))) process.exit(1)'; \
+    npm install --global "@deepseek-ai/dsh@${DSH_VERSION}" "pnpm@${PNPM_VERSION}"; \
     dsh --version; \
     npm cache clean --force
 
 COPY deepseek-harness/config/managed.cordis.patch.yml /usr/local/share/deepseek-harness/managed.cordis.patch.yml
+COPY deepseek-harness/scripts/patch-model-reference.mjs deepseek-harness/scripts/managed-model-reference.mjs /usr/local/share/deepseek-harness/
+RUN node /usr/local/share/deepseek-harness/patch-model-reference.mjs /usr/local/lib/node_modules/@deepseek-ai/dsh \
+    && node /usr/local/share/deepseek-harness/patch-model-reference.mjs /usr/local/lib/node_modules/@deepseek-ai/dsh --verify
+COPY deepseek-harness/scripts/prepare-managed-config.mjs /usr/local/share/deepseek-harness/prepare-managed-config.mjs
 COPY deepseek-harness/scripts/prepare-deepseek-harness-resources /usr/local/bin/prepare-deepseek-harness-resources
 COPY deepseek-harness/scripts/start-deepseek-harness-pro /usr/local/bin/start-deepseek-harness-pro
 COPY deepseek-harness/config/pro-agent-config.yaml /defaults/openclaw-agent/config.yaml
 COPY deepseek-harness/config/deepseek-harness-browser.desktop /defaults/.config/autostart/deepseek-harness-browser.desktop
 COPY --from=agent-builder /out/openclaw-agent /usr/local/bin/openclaw-agent
 COPY --from=clawmanager-agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent
+COPY --from=clawmanager-agent-builder /out/clawmanager-agent /usr/local/libexec/clawmanager-agent-image
 
 RUN set -eux; \
     sed -i 's/\r$//' /usr/local/bin/prepare-deepseek-harness-resources; \
