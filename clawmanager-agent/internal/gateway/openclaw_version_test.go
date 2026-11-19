@@ -1,17 +1,28 @@
 package gateway
 
-import "testing"
+import (
+	"reflect"
+	"runtime"
+	"testing"
+)
 
 func TestOpenClawVersionCapabilities(t *testing.T) {
 	if IsOpenClawAtLeast("2026.7.1-2", OpenClaw81Version) {
 		t.Fatal("2026.7.1-2 must remain on the legacy compatibility path")
 	}
-	for _, version := range []string{"2026.8.1", "v2026.8.1", "2026.9.0"} {
+	for _, version := range []string{"2026.8.1", "v2026.8.1", "2026.9.0", "2026.10.2", "v2026.10.2"} {
 		if !IsOpenClawAtLeast(version, OpenClaw81Version) {
 			t.Fatalf("%s must use the 8.1 compatibility path", version)
 		}
-		if got := len(OpenClawCapabilities(version)); got != len(openClaw81Capabilities) {
-			t.Fatalf("capability count for %s = %d, want %d", version, got, len(openClaw81Capabilities))
+		want := append([]string(nil), openClaw81Capabilities...)
+		if runtime.GOOS == "linux" {
+			want = append(want, "openclaw.upgrade-operation-fence-v1", "openclaw.rebuild-preserve-v1", "openclaw.rebuild-preserve-v2")
+			if version == "2026.10.2" {
+				want = append(want, "openclaw.managed-plugin-convergence-v1")
+			}
+		}
+		if got := OpenClawCapabilities(version); !reflect.DeepEqual(got, want) {
+			t.Fatalf("capabilities for %s on %s = %#v, want %#v", version, runtime.GOOS, got, want)
 		}
 	}
 	if got := OpenClawCapabilities("2026.7.1-2"); got != nil {

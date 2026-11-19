@@ -11,7 +11,13 @@ import (
 )
 
 func strictTestRequest(root string) gateway.CreateGatewayRequest {
-	return gateway.CreateGatewayRequest{InstanceID: 42, UserID: 7, Generation: 1, UID: 1000, GID: 1000, AgentType: "hermes", GatewayPort: 20000,
+	// Root can prepare the fixture identity; ordinary Unix runners must use
+	// their own identity so chown exercises the same-user contract.
+	uid, gid := os.Getuid(), os.Getgid()
+	if uid <= 0 || gid <= 0 {
+		uid, gid = 1000, 1000
+	}
+	return gateway.CreateGatewayRequest{InstanceID: 42, UserID: 7, Generation: 1, UID: uid, GID: gid, AgentType: "hermes", GatewayPort: 20000,
 		WorkspacePath: filepath.Join(root, "hermes", "user-7", "instance-42"), Environment: map[string]string{
 			"CLAWMANAGER_INSTANCE_TOKEN": "managed-auth", "CLAWMANAGER_LLM_API_KEY": "instance-model-key", "CLAWMANAGER_LLM_BASE_URL": "http://gateway.ns.svc.cluster.local:9001/v1",
 		}}

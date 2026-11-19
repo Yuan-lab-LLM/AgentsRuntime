@@ -19,7 +19,12 @@ func shutdownNodeFixture(t *testing.T) ([]string, *shutdownProof) {
 	if err != nil {
 		t.Skip("Node required for cross-language fixture")
 	}
-	root := t.TempDir()
+	// Go's t.TempDir subdirectory uses the process umask. Match the private
+	// receipt directory required by the production writer on Unix.
+	root := filepath.Join(t.TempDir(), "receipts")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	module, err := filepath.Abs("../../patches/shutdown_receipt_store.mjs")
 	if err != nil {
 		t.Fatal(err)
