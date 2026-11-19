@@ -1,0 +1,32 @@
+name: Lite image contracts
+
+"on":
+  pull_request:
+    paths:
+      - ".github/workflows/lite-contracts.yml"
+      - ".github/workflows/docker-ghcr.yml"
+      - ".dockerignore"
+      - "clawmanager-agent/**"
+      - "legacy-agent/**"
+      - "deepseek-harness/**"
+      - "hermes/**"
+      - "openclaw/**"
+      - "opencode/**"
+      - "tests/lite/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lite-contracts:
+    name: Verify Lite build contracts and entrypoints
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Verify Lite image build contracts
+        run: python3 tests/lite/check_build_contract.py
+      - name: Verify Lite entrypoints
+        run: python3 tests/lite/check_entrypoints.py

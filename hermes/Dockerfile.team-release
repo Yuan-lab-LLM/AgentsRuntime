@@ -1,0 +1,12 @@
+# Retain the exact deployed native payload/Agent; patch only the Team adapter
+# and the explicit active-agent reader. The native busy-input policy is intact.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG RUNTIME_REVISION
+COPY plugins/hermes-redis-team/ /opt/hermes-agent/plugins/platforms/redis_team/
+COPY hermes/patches/hermes-agent/apply_team_context_reader.py /usr/local/share/clawmanager/team-context/apply_team_context_reader.py
+RUN python /usr/local/share/clawmanager/team-context/apply_team_context_reader.py /opt/hermes-agent/gateway/run.py \
+ && python -m py_compile /opt/hermes-agent/gateway/run.py /opt/hermes-agent/plugins/platforms/redis_team/adapter.py \
+ && python /usr/local/share/hermes-lite/verify_lite_release.py --lock /usr/local/share/hermes-lite/source-lock.json --generate-release --verify-release
+LABEL org.opencontainers.image.revision="${RUNTIME_REVISION}" \
+      io.clawmanager.team-context="active-steer-v1"

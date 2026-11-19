@@ -1,0 +1,42 @@
+# Preserve the proven TEAM OpenClaw core/data adapters when only the transport
+# changes. BASE_IMAGE must be an immutable Team-compatible serving image;
+# personal serving/upgrade images have a different control-plane contract.
+ARG BASE_IMAGE
+ARG GO_BUILDER_IMAGE=golang:1.26.8-bookworm@sha256:9fdc884aacc3bec89b20ffc69f4bb369c78210e3e4f600387b5128b12c199f81
+FROM ${GO_BUILDER_IMAGE} AS agent-builder
+COPY clawmanager-agent/ /src/clawmanager-agent/
+COPY openclaw/ /src/openclaw/
+WORKDIR /src/openclaw
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/clawmanager-agent ./cmd/openclaw-lite-agent
+RUN apt-get -o Acquire::Retries=3 update \
+ && apt-get -o Acquire::Retries=3 install -y --no-install-recommends tini
+FROM ${BASE_IMAGE}
+ARG RUNTIME_REVISION
+COPY --from=agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent
+COPY --from=agent-builder /usr/bin/tini /usr/bin/tini
+COPY openclaw/scripts/openclaw-lite-entrypoint /usr/local/bin/openclaw-lite-entrypoint
+COPY plugins/openclaw-redis-team/ /tmp/clawmanager-team-overlay/
+RUN set -eu; \
+    core="$(dirname "$(readlink -f "$(command -v openclaw)")")"; \
+    test -f "$core/package.json"; \
+    test -d "$core/dist/extensions/redis-team"; \
+    cp -a /tmp/clawmanager-team-overlay/. "$core/dist/extensions/redis-team/"; \
+    mkdir -p /defaults/.openclaw/extensions/redis-team; \
+    cp -a /tmp/clawmanager-team-overlay/. /defaults/.openclaw/extensions/redis-team/; \
+    mkdir -p /defaults/.openclaw/extensions/redis-team/node_modules; \
+    ln -sfn "$core" /defaults/.openclaw/extensions/redis-team/node_modules/openclaw; \
+    node --check /defaults/.openclaw/extensions/redis-team/dist/index.js; \
+    node --input-type=module -e 'const m=await import("/defaults/.openclaw/extensions/redis-team/dist/index.js");if(!m.default)process.exit(1)'; \
+    openclaw --version | grep '2026.10.2'; \
+    sed -i 's/\r$//' /usr/local/bin/openclaw-lite-entrypoint; \
+    chmod 0755 /usr/local/bin/openclaw-lite-entrypoint; \
+    /usr/bin/tini --version; \
+    rm -rf /tmp/clawmanager-team-overlay
+ENV CLAWMANAGER_REDIS_TEAM_PLUGIN_VERSION=0.3.1 \
+    CLAWMANAGER_RUNTIME_TYPE=openclaw \
+    CLAWMANAGER_OPENCLAW_VERSION=2026.10.2 \
+    RUNTIME_WORKSPACE_ROOT=/workspaces \
+    RUNTIME_AGENT_DATA_DIR=/var/lib/clawmanager-agent
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/openclaw-lite-entrypoint"]
+LABEL io.clawmanager.team-source-revision="${RUNTIME_REVISION}"

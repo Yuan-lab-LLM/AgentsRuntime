@@ -66,4 +66,7 @@ cd "${project_path}"
 # The validated, merged file is authoritative. Do not reapply the raw control
 # plane document on top of preserved user settings inside the CLI.
 unset OPENCODE_CONFIG_CONTENT
+if [ "${CLAWMANAGER_TEAM_ENABLED:-false}" = "true" ]; then
+  exec /usr/local/bin/node /usr/local/share/clawmanager/opencode-team/main.mjs --hostname "${host}" --port "${port}"
+fi
 exec /usr/local/bin/opencode serve --hostname "${host}" --port "${port}"

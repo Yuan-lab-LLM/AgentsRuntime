@@ -13,8 +13,10 @@ import re
 import ssl
 import stat
 import time
+import threading
 import unicodedata
 import uuid
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +46,7 @@ PROTOCOL_CAPABILITIES = [
     "assignment_lifecycle_v1",
     "assignment_heartbeat_v1",
     "assignment_activity_v2",
+    "active_context_delivery_v1",
     "durable_turn_facts_v1",
     "terminal_tool_stop_v1",
     "team_artifact_preview_v1",
@@ -307,6 +310,27 @@ def presence_key(settings: RedisTeamSettings) -> str:
     return f"{_key_prefix(settings)}:presence"
 
 
+async def _team_maintenance_enabled(redis, settings: RedisTeamSettings) -> bool:
+    """Use the existing maintenance key; never claim a complete backup ACK.
+
+    Pausing dispatch does not prove that model/tool callbacks, presence or
+    subprocess writers have drained. The backup coordinator must establish
+    those separate conditions before it can certify a consistent checkpoint.
+    """
+    raw = await redis.command("GET", f"{_key_prefix(settings)}:maintenance")
+    if not raw:
+        return False
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    try:
+        value = json.loads(str(raw))
+        if isinstance(value, dict):
+            return value.get("enabled") is True
+    except (TypeError, ValueError):
+        pass
+    return str(raw).strip().lower() in {"1", "true", "on"}
+
+
 def dlq_key(settings: RedisTeamSettings) -> str:
     return f"{_key_prefix(settings)}:dlq"
 
@@ -501,7 +525,42 @@ def _update_turn_observation_from_hook(
         logger.debug("Redis Team: Hermes hook observation skipped: %s", exc)
 
 
+_CONTEXT_NOTICE_LOCK = threading.RLock()
+
+
+def _context_notice_path(settings: RedisTeamSettings) -> Path:
+    return settings.shared_path / ".hermes-redis-team" / f"context-{_safe_name(settings.member_id)}.json"
+
+
+def _write_online_status(settings: RedisTeamSettings, patch: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    # A new connected publisher cannot inherit a previous process's offline
+    # marker. Business progress remains unchanged and is never inferred here.
+    return write_local_status(settings, {**(patch or {}), "liveness":"online", "generation":settings.generation})
+
+
+def _record_context_request(settings: RedisTeamSettings, kwargs: dict[str, Any]) -> None:
+    # Observe the actual prepared request, not a Redis ACK. Retain no request
+    # body, tool output or reasoning in the delivery journal.
+    with _CONTEXT_NOTICE_LOCK:
+        entries = _read_json(_context_notice_path(settings)) or {}
+        request = json.dumps(kwargs.get("request_messages") or [], ensure_ascii=False)
+        changed = False
+        for item in entries.values():
+            if item.get("state") in {"queued", "submitted"} and item.get("marker") in request:
+                item.update(state="request_included", includedAt=_now_iso(), apiRequestId=_trim(kwargs.get("api_request_id")), nativeSessionId=_trim(kwargs.get("session_id")))
+                item.pop("text", None)
+                changed = True
+        if changed:
+            _atomic_write_json(_context_notice_path(settings), entries)
+
+
 def _hook_pre_api_request(**kwargs: Any) -> None:
+    settings = load_settings(None)
+    if settings.enabled:
+        try:
+            _record_context_request(settings, kwargs)
+        except Exception:
+            logger.warning("Redis Team: context request observation unavailable")
     _update_turn_observation_from_hook(
         phase="pre_api",
         task_id=_trim(kwargs.get("task_id")),
@@ -521,6 +580,26 @@ def _hook_post_api_request(**kwargs: Any) -> None:
         duration_ms=int(float(kwargs.get("api_duration") or 0) * 1000),
         finish_reason=_trim(kwargs.get("finish_reason")),
     )
+
+
+def _hook_api_request_error(**kwargs: Any) -> None:
+    # Diagnosis only: a provider failure is neither a business failure receipt
+    # nor permission to start another execution. Never retain provider bodies.
+    settings = load_settings(None)
+    if not settings.enabled:
+        return
+    try:
+        value = _read_json(_turn_observation_path(settings)) or {}
+        task = _trim(kwargs.get("task_id"))
+        if task and task != _trim(value.get("rootTaskId") or value.get("taskId")):
+            return
+        code = kwargs.get("status_code")
+        kind = re.sub(r"[^a-zA-Z0-9_.-]", "", _trim(kwargs.get("error_type")))[:80]
+        category = "authorization" if code in (401, 403) else "provider_server" if isinstance(code, int) and code >= 500 else "timeout" if "timeout" in kind.lower() else "transport_or_provider"
+        value["lastRuntimeFault"] = {"category":category,"statusCode":code if isinstance(code,int) else None,"errorType":kind,"apiRequestId":_trim(kwargs.get("api_request_id")),"observedAt":_now_iso()}
+        _atomic_write_json(_turn_observation_path(settings),value)
+    except Exception:
+        logger.warning("Redis Team: runtime error observation unavailable")
 
 
 def _hook_pre_tool_call(**kwargs: Any) -> None:
@@ -1086,7 +1165,60 @@ async def _tool_team_artifact_mkdir(args: dict[str, Any], **_kwargs) -> str:
         return _team_tool_json_result(settings, "team_artifact_mkdir", {"ok": False, "error": str(exc)})
 
 
+class _NoPreviewRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _managed_preview_url(relative: str, mode: str) -> str:
+    try:
+        body = json.dumps({"path": relative, "mode": mode}).encode("utf-8")
+        if len(body) > 4096:
+            raise ValueError("request too large")
+        request = urllib.request.Request(
+            "http://clawmanager-local-services.invalid:31282/team/preview-sign",
+            data=body, headers={"Content-Type": "application/json"}, method="POST",
+        )
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoPreviewRedirect())
+        deadline = time.monotonic() + 5
+        with opener.open(request, timeout=5) as response:
+            chunks = []
+            size = 0
+            while True:
+                if time.monotonic() >= deadline:
+                    raise ValueError("response timeout")
+                # read1 performs at most one socket read; a drip feed cannot
+                # extend an unbounded read-all. Each socket wait is <=5s.
+                chunk = response.read1(8193 - size)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+                if size > 8192:
+                    raise ValueError("invalid response")
+            raw = b"".join(chunks)
+            if response.status != 200:
+                raise ValueError("invalid response")
+        grant = json.loads(raw)
+        parsed = urlparse(grant["url"])
+        labels = (parsed.hostname or "").split(".")
+        expires = datetime.fromisoformat(grant["expiresAt"].replace("Z", "+00:00")).timestamp()
+        if (parsed.scheme != "http" or len(labels) < 3 or labels[0] != "clawmanager-egress-proxy"
+                or not labels[1] or labels[2] != "svc" or parsed.username or parsed.password
+                or parsed.query or parsed.fragment or not parsed.path.startswith(f"/v3/{mode}/")
+                or grant["mode"] != mode or not time.time() < expires <= time.time() + 300):
+            raise ValueError("invalid grant")
+        return grant["url"]
+    except Exception:
+        # Do not expose response grants or transport internals through tool errors.
+        raise ValueError("Managed Team preview is unavailable") from None
+
+
 def _preview_url(settings: RedisTeamSettings, target: Path) -> str:
+    if (os.environ.get("CLAWMANAGER_NETWORK_ISOLATED") == "1"
+            or os.environ.get("CLAWMANAGER_MANAGED_SERVICES_URL", "").rstrip("/") == "http://clawmanager-local-services.invalid:31282"):
+        relative = canonical_artifact_ref(settings, target)[len("/team/"):]
+        return _managed_preview_url(relative, "interactive" if target.suffix.lower() == ".html" else "static")
     origin = settings.preview_origin.rstrip("/")
     parsed = urlparse(origin)
     hostname = (parsed.hostname or "").lower().rstrip(".")
@@ -2597,6 +2729,7 @@ class RedisTeamAdapter(BasePlatformAdapter):
         self._turn_responses: Dict[str, str] = {}
         self._approval_session_by_key: Dict[str, str] = {}
         self._latest_approval_session_key = ""
+        self._team_agent_reader = None
 
     @property
     def name(self) -> str:
@@ -2722,7 +2855,7 @@ class RedisTeamAdapter(BasePlatformAdapter):
             except RespError as exc:
                 if "BUSYGROUP" not in str(exc):
                     raise
-            status = write_local_status(self.settings, status_patch or {"availability": "idle"})
+            status = _write_online_status(self.settings, status_patch or {"availability": "idle"})
             await presence.command(
                 "HSET",
                 presence_key(self.settings),
@@ -3548,9 +3681,10 @@ class RedisTeamAdapter(BasePlatformAdapter):
             try:
                 if self._redis is not None:
                     await _reconcile_pending_completion(self._redis, self.settings)
+                    await self._flush_context_notices()
                 for identity in list(self._active_assignments):
                     self._retire_terminal_assignment(identity)
-                status = write_local_status(self.settings)
+                status = _write_online_status(self.settings)
                 if self._active_assignments:
                     runtime_status = _trim(status.get("runtimeStatus")).lower()
                     availability = _trim(status.get("availability")).lower()
@@ -3667,6 +3801,9 @@ class RedisTeamAdapter(BasePlatformAdapter):
         pending_batches = 0
         while self.is_connected:
             try:
+                if await _team_maintenance_enabled(redis, self.settings):
+                    await asyncio.sleep(0.2)
+                    continue
                 command = [
                     "XREADGROUP",
                     "GROUP",
@@ -3680,6 +3817,10 @@ class RedisTeamAdapter(BasePlatformAdapter):
                 command.extend(["STREAMS", inbox_key(self.settings), read_id])
                 response = await redis.command(*command)
                 messages = _parse_stream_response(response)
+                if await _team_maintenance_enabled(redis, self.settings):
+                    read_id = "0"
+                    pending_batches = 0
+                    continue
                 if read_id != ">":
                     if not messages:
                         read_id = ">"
@@ -3692,6 +3833,10 @@ class RedisTeamAdapter(BasePlatformAdapter):
                                 "Redis Team: pending drain batch limit reached; switching to new messages"
                             )
                 for raw in messages:
+                    if await _team_maintenance_enabled(redis, self.settings):
+                        read_id = "0"
+                        pending_batches = 0
+                        break
                     await self._handle_redis_message(raw)
             except asyncio.CancelledError:
                 raise
@@ -4046,7 +4191,110 @@ class RedisTeamAdapter(BasePlatformAdapter):
         )
         return True
 
+    def set_clawmanager_team_agent_reader(self, reader) -> None:
+        # Installed by the pinned native gateway, never by message text.
+        self._team_agent_reader = reader
+
+    def _context_source(self, active: dict[str, Any]) -> SessionSource:
+        return SessionSource(platform=Platform("redis_team"), chat_id=str(active["taskId"]),
+            chat_name=f"Team {self.settings.team_id}", chat_type="dm", user_id=str(active.get("from") or ""),
+            user_name=str(active.get("role") or active.get("from") or ""),
+            thread_id=str(active.get("conversationId") or active["taskId"]), message_id=str(active.get("messageId") or ""))
+
+    async def _accept_active_context(self, envelope: dict[str, Any]) -> bool:
+        active = _load_active_envelope(self.settings)
+        if not active:
+            return False  # idle ordinary context retains the existing dispatch
+        root, assignment = _assignment_identity(active)
+        incoming_root, incoming_assignment = _assignment_identity(envelope)
+        sender = _trim(envelope.get("from"))
+        system_notice = sender in {"clawmanager", "clawmanager-monitor"}
+        # Keep ordinary peer messages and long context on their original path.
+        # This is a busy-execution reminder adapter, not a replacement inbox.
+        if not sender or not (system_notice or sender == _trim(active.get("from"))):
+            return False
+        text = _trim(envelope.get("text"))
+        if not text or len(text) > 16000:
+            return False
+        revision = int(active.get("revision") or 1)
+        try:
+            incoming_revision = int(envelope.get("revision") or revision)
+        except (TypeError, ValueError):
+            incoming_revision = revision  # inherit the uniquely owned execution
+        reason = ""
+        if incoming_root != root or (incoming_assignment and incoming_assignment != assignment): reason = "stale_identity"
+        elif incoming_revision != revision: reason = "stale_revision"
+        elif self._redis and await _root_task_is_terminal(self._redis,self.settings,active): reason = "root_already_terminal"
+        elif active.get("terminal") or active.get("explicitCompletionSubmitted"):
+            if not system_notice:
+                return False  # legitimate Leader clarification uses normal context
+            reason = "work_already_delivered"
+        if not reason:
+            # None means native idle: the existing recovery turn must run, not
+            # be parked forever in a queue that needs that very turn to drain.
+            # A non-None initialization sentinel is busy and can wait safely.
+            if not self._team_agent_reader or self._team_agent_reader(self._context_source(active)) is None:
+                return False
+        message_id = _trim(envelope.get("messageId"))
+        if not message_id:
+            return False
+        with _CONTEXT_NOTICE_LOCK:
+            path = _context_notice_path(self.settings)
+            entries = _read_json(path) or {}
+            if message_id not in entries:
+                finished = sorted((k for k,v in entries.items() if v.get("state") in {"request_included","ignored"}),key=lambda k:entries[k].get("receivedAt", ""))
+                while len(entries)>=64 and finished: entries.pop(finished.pop(0))
+                if len(entries)>=64:
+                    raise RuntimeError("Team context observation capacity reached; original work retained")
+                marker = "[Team context " + hashlib.sha256(message_id.encode()).hexdigest() + "]"
+                entries[message_id] = {"marker":marker,"text":text,"envelope":envelope,"activeMessageId":active.get("messageId"),"identity":[root,assignment],"revision":revision,"generation":self.settings.generation,"receivedAt":_now_iso(),"state":"ignored" if reason else "queued","reason":reason}
+                _atomic_write_json(path,entries)
+        await self._flush_context_notices()
+        return True
+
+    async def _flush_context_notices(self) -> None:
+        active = _load_active_envelope(self.settings)
+        terminal = bool(active.get("terminal") or active.get("explicitCompletionSubmitted"))
+        if self._redis and active:
+            terminal = terminal or await _root_task_is_terminal(self._redis,self.settings,active)
+        reader = self._team_agent_reader
+        agent = reader(self._context_source(active)) if reader and active and not terminal else None
+        with _CONTEXT_NOTICE_LOCK:
+            path = _context_notice_path(self.settings)
+            entries = _read_json(path) or {}
+            for message_id,item in entries.items():
+                if item.get("state") in {"queued","submitted"}:
+                    if terminal or item.get("identity") != list(_assignment_identity(active)) or item.get("revision") != int(active.get("revision") or 1) or item.get("generation") != self.settings.generation or item.get("activeMessageId") != active.get("messageId"):
+                        item.update(state="ignored",reason="execution_changed_or_delivered")
+                    elif agent is not None and callable(getattr(agent,"steer",None)):
+                        lifetime = str(os.getpid())+":"+str(id(agent))
+                        if item.get("agentLifetime") != lifetime and agent.steer(item["marker"]+"\n"+item["text"]):
+                            item.update(state="submitted",submittedAt=_now_iso(),agentLifetime=lifetime)
+                _atomic_write_json(path,entries)
+        # Publish without holding the thread-shared hook lock. A lost response
+        # retries the same event identity, never a second model execution.
+        for message_id,item in list(entries.items()):
+            state=item.get("state")
+            if not self._redis or item.get("reportedState")==state: continue
+            await xadd_json(self._redis,events_key(self.settings),_task_event(self.settings,"task_progress",item["envelope"],{
+                "eventId":"context-delivery:"+hashlib.sha256(message_id.encode()).hexdigest()+":"+str(state),"eventKind":"runtime_context_delivery","contextDeliveryState":state,"contextMessageId":message_id,"reason":item.get("reason") or None,
+                "nativeSessionId":item.get("nativeSessionId"),"apiRequestId":item.get("apiRequestId"),"summary":{"queued":"催促已接收，等待原执行可注入边界","submitted":"催促已提交原执行，等待进入模型请求","request_included":"催促已进入原执行的模型请求","ignored":"过期或不匹配的催促已忽略"}.get(state,"催促状态待核实"),
+                "nonAuthoritative":True,"stateEffect":"none","rootTaskTerminal":False,"visibleToChat":False,"chatPolicy":"hidden"}))
+            with _CONTEXT_NOTICE_LOCK:
+                current=_read_json(path) or {}
+                if current.get(message_id,{}).get("state")==state:
+                    current[message_id]["reportedState"]=state
+                    _atomic_write_json(path,current)
+
     async def _dispatch_envelope(self, envelope: dict[str, Any], *, context_only: bool = False) -> None:
+        # A cold restart may drain old result/recovery notifications. A proven
+        # terminal root must not inject context into a newer execution. Missing
+        # or unreadable projections retain the existing compatibility path.
+        if context_only and self._redis and await _root_task_is_terminal(self._redis, self.settings, envelope):
+            logger.info("Ignored context for terminal root task: %s", envelope.get("messageId"))
+            return
+        if context_only and await self._accept_active_context(envelope):
+            return
         source = SessionSource(
             platform=Platform("redis_team"),
             chat_id=str(envelope["taskId"]),
@@ -4286,6 +4534,7 @@ def register(ctx) -> None:
     # without making Runtime telemetry authoritative business state.
     ctx.register_hook("pre_api_request", _hook_pre_api_request)
     ctx.register_hook("post_api_request", _hook_post_api_request)
+    ctx.register_hook("api_request_error", _hook_api_request_error)
     ctx.register_hook("pre_tool_call", _hook_pre_tool_call)
     ctx.register_hook("post_tool_call", _hook_post_tool_call)
     artifact_path_properties = {

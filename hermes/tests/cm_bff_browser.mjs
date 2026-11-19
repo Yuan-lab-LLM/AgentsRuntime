@@ -112,8 +112,8 @@ async function openRPC(){
   await frame.evaluate(async()=>{
     const ticket=await window.hermesDesktop.getGatewayWsUrl();
     if(ticket.ok!==true)throw new Error('ticket');
-    const socket=new WebSocket(ticket.wsUrl), pending=new Map(),events=[];let n=0;
-    const state={socket,events,closed:false,packet(method,params={}){return new Promise((resolve,reject)=>{
+    const socket=new WebSocket(ticket.wsUrl), pending=new Map(),events=[],requests=[];let n=0;
+    const state={socket,events,requests,closed:false,reply(id,result){socket.send(JSON.stringify({jsonrpc:'2.0',id,result}));},packet(method,params={}){return new Promise((resolve,reject)=>{
       const id='acceptance-'+(++n),timer=setTimeout(()=>{pending.delete(id);reject(new Error('rpc_timeout'));},45000);
       pending.set(id,{resolve,reject,timer});socket.send(JSON.stringify({jsonrpc:'2.0',id,method,params}));
     });}};
@@ -121,16 +121,22 @@ async function openRPC(){
       let p;try{p=JSON.parse(line);}catch{socket.close();return;}
       if(p.id!==undefined&&pending.has(p.id)){const waiter=pending.get(p.id);pending.delete(p.id);clearTimeout(waiter.timer);waiter.resolve(p);}
       else if(p.method==='event'){if(events.length>=8192){socket.close();return;}events.push(p.params);}
+      else if(p.id!==undefined&&['clarify','approval'].includes(p.method)){if(requests.length>=8192){socket.close();return;}requests.push(p);}
     }});
     socket.addEventListener('close',()=>{state.closed=true;for(const p of pending.values()){clearTimeout(p.timer);p.reject(new Error('closed'));}pending.clear();});
     await new Promise((resolve,reject)=>{socket.addEventListener('open',resolve,{once:true});socket.addEventListener('error',()=>reject(new Error('open')),{once:true});setTimeout(()=>reject(new Error('timeout')),15000);});
     window.__hermesAcceptance=state;
+    const capability=await state.packet('client.capabilities',{server_requests:true});
+    if(capability.error||!('result'in capability))throw new Error('server_request_capability');
   });
 }
 async function packet(method,params={}){const value=await frame.evaluate(({method,params})=>window.__hermesAcceptance.packet(method,params),{method,params});audit(value);return value;}
 async function rpc(method,params={}){const p=await packet(method,params);check(p.jsonrpc==='2.0'&&'result'in p&&!p.error,'rpc_'+method.replaceAll('.','_')+'_failed');return p.result;}
 async function events(){return frame.evaluate(()=>window.__hermesAcceptance.events);}
 async function event(kind,sid,after=0){return waitFor(async()=>{const rows=await events();return rows.slice(after).find(e=>e.type===kind&&e.session_id===sid);},'event_'+kind.replaceAll('.','_')+'_timeout');}
+async function serverRequests(){return frame.evaluate(()=>window.__hermesAcceptance.requests);}
+async function serverRequest(method,sid,after=0){return waitFor(async()=>{const rows=await serverRequests();return rows.slice(after).find(p=>p.method===method&&p.params?.session_id===sid);},'server_request_timeout');}
+async function replyRequest(id,result){return frame.evaluate(({id,result})=>window.__hermesAcceptance.reply(id,result),{id,result});}
 async function bridgeAPI(pathname){const value=await frame.evaluate(path=>window.hermesDesktop.api({path}),pathname);audit(value);return assertHTTPContract(pathname,value);}
 const marker = kind => 'ACCEPTANCE_'+binding.run_id+'_'+kind;
 async function stubObservation(){const token=JSON.parse(fs.readFileSync(cfg.stub_observer_credentials_file)).token;const res=await request(cfg.stub_observation_url,{headers:{Authorization:'Bearer '+token}});check(res.status===200,'stub_observation_unavailable');const obj=json(res);check(obj.schema_version===1&&obj.run_id===binding.run_id&&obj.model_mode==='deterministic-stub'&&obj.external_requests===0,'stub_observation_identity_or_egress');return obj;}
@@ -181,7 +187,7 @@ async function main(){
   await run('cm_build_renderer_resources',async()=>{
     const v=json(await cm('/api/v1/version')).data;for(const k of ['version','commit','build_time'])check(v?.[k]===cfg.cm_identity[k],'cm_build_identity_mismatch');
     const info=json(await cm('/hermes-desktop-web/build-info.json'));
-    check(info.renderer_entry==='apps/desktop/src/main.tsx'&&info.acceptance==='not-asserted-by-build'&&info.hermes_commit==='29112bef099274229cadff79cdff7bf7b99c4b77'&&info.build_input_sha256===binding.renderer_build_input_sha256,'renderer_identity_mismatch');
+    check(info.renderer_entry==='apps/desktop/src/main.tsx'&&info.acceptance==='not-asserted-by-build'&&info.hermes_commit==='bf0203a794a07aac3ff764972ab9087baa4e4f4e'&&info.build_input_sha256===binding.renderer_build_input_sha256,'renderer_identity_mismatch');
     const manifestRaw=fs.readFileSync(cfg.renderer_asset_manifest_file);check(sha(manifestRaw)===binding.renderer_asset_manifest_sha256,'renderer_manifest_binding_mismatch');
     const manifest=JSON.parse(manifestRaw), entries=Object.entries(manifest);check(entries.length>=3&&entries.length<=1024,'renderer_manifest_shape');
     let cursor=0;await Promise.all(Array.from({length:6},async()=>{while(cursor<entries.length){const[p,h]=entries[cursor++];check(/^[A-Za-z0-9_.\/-]+$/.test(p)&&!p.startsWith('/')&&!p.split('/').some(x=>!x||x==='.'||x==='..')&&/^[a-f0-9]{64}$/.test(h),'renderer_manifest_entry');const r=await cm('/hermes-desktop-web/'+p);check(r.status===200&&sha(r.raw)===h,'renderer_resource_hash_mismatch');}}));
@@ -277,11 +283,11 @@ async function main(){
   });
   await run('interrupt',async()=>{const offset=(await events()).length;await rpc('prompt.submit',{session_id:sid,text:marker('SLOW')});await event('message.delta',sid,offset);await rpc('session.interrupt',{session_id:sid});const complete=await event('message.complete',sid,offset);check(complete.payload?.status==='interrupted','interrupt_not_observed');});
   for(const[name,kind,choice]of[['approval_once','ONCE','once'],['approval_deny','DENY','deny'],['clarify','CLARIFY','alpha']])await run(name,async()=>{
-    const offset=(await events()).length;await rpc('prompt.submit',{session_id:sid,text:marker(kind)});
-    const evt=await event(kind==='CLARIFY'?'clarify.request':'approval.request',sid,offset),p=evt.payload;
-    check(typeof p?.request_id==='string','interactive_request_id_missing');
-    if(kind==='CLARIFY'){const params={session_id:sid,request_id:p.request_id,answer:choice};if(p.questions?.[0]?.qid)params.question_id=p.questions[0].qid;await rpc('clarify.respond',params);}
-    else{check(Array.isArray(p.choices)&&p.choices.includes(choice)&&!p.choices.includes('always'),'approval_choices_unsafe');await rpc('approval.respond',{session_id:sid,request_id:p.request_id,choice});}
+    const offset=(await events()).length,requestOffset=(await serverRequests()).length;await rpc('prompt.submit',{session_id:sid,text:marker(kind)});
+    const req=await serverRequest(kind==='CLARIFY'?'clarify':'approval',sid,requestOffset),p=req.params;
+    check(typeof req.id==='string','interactive_request_id_missing');
+    if(kind==='CLARIFY'){check(Array.isArray(p.questions)&&p.questions.length>0,'clarify_questions_missing');await replyRequest(req.id,{answers:Object.fromEntries(p.questions.map(q=>[q.qid,choice])),outcome:'submitted'});}
+    else{check(Array.isArray(p.choices)&&p.choices.includes(choice)&&p.choices.includes('deny'),'approval_choices_missing');await replyRequest(req.id,{choice});}
     const complete=await event('message.complete',sid,offset);check(complete.payload?.status!=='error','interactive_completion_failed');
   });
   await run('three_replica_tickets',async()=>{

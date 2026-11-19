@@ -1311,7 +1311,7 @@ try {
 	assert.equal(new URL(preview.artifact.previewUrl).port, "3128", "interactive previews bootstrap through the resolvable managed proxy");
   assert.equal(new URL(preview.artifact.previewUrl).search, "", "preview links must not carry an expiry");
   process.env.CLAWMANAGER_TEAM_PREVIEW_ORIGIN = "http://clawmanager-team-preview.invalid";
-  const legacyPreviewUrl = pluginModule.previewUrlForTeamArtifact(
+  const legacyPreviewUrl = await pluginModule.previewUrlForTeamArtifact(
     { teamId: "75", sharedDir: shared },
     path.join(shared, "notes.txt"),
   );
@@ -1322,7 +1322,7 @@ try {
   );
   assert.equal(new URL(legacyPreviewUrl.url).port, "3128");
   process.env.CLAWMANAGER_TEAM_PREVIEW_ORIGIN = "http://attacker.example";
-  assert.throws(
+  await assert.rejects(
     () => pluginModule.previewUrlForTeamArtifact(
       { teamId: "75", sharedDir: shared },
       path.join(shared, "index.html"),

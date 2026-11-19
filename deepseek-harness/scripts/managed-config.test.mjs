@@ -53,3 +53,17 @@ test('startup receipt requires the resolved stable catalog and exact launch iden
   assert.throws(() => startupCatalogReceipt({ ...env, CLAWMANAGER_LLM_RESOLVED_CONFIG_JSON: '{}' }), /mismatch/);
   assert.equal(startupCatalogReceipt({ ...env, CLAWMANAGER_MODEL_CATALOG_JSON: JSON.stringify({ ...snapshot, models: [] }), CLAWMANAGER_LLM_RESOLVED_CONFIG_JSON: JSON.stringify({ catalog_synced: true, model_ids: [] }) }).model_count, 0);
 });
+
+test('unknown ClawManager context limits keep all provider models available', () => {
+  const unknown = providers({ CLAWMANAGER_LLM_CONTEXT_WINDOW: '0', CLAWMANAGER_LLM_CONTEXT_WINDOWS: '{"auto":0,"vision":0}' });
+  assert.equal(unknown.managed.models.length, 2);
+  assert.equal(unknown.managed.models[0].contextWindow, 128000);
+  assert.equal(unknown.managed.models[1].contextWindow, 128000);
+  const mixed = providers({ CLAWMANAGER_LLM_CONTEXT_WINDOW: '64000', CLAWMANAGER_LLM_CONTEXT_WINDOWS: '{"managed/auto":0,"auto":99999,"vision":32000}' });
+  assert.equal(mixed.managed.models[0].contextWindow, 64000);
+  assert.equal(mixed.managed.models[1].contextWindow, 32000);
+  for (const value of [-1, 1.5, 'bad']) {
+    assert.throws(() => providers({ CLAWMANAGER_LLM_CONTEXT_WINDOW: String(value) }), /Invalid managed context/);
+    assert.throws(() => providers({ CLAWMANAGER_LLM_CONTEXT_WINDOWS: JSON.stringify({ auto: value }) }), /Invalid model context/);
+  }
+});

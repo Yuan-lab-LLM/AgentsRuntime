@@ -11,7 +11,7 @@ const effectiveSnapshots = new WeakMap();
 
 export function withManagedProxyPolicy(config, env = process.env, now = Date.now()) {
   const file = env.CLAWMANAGER_PROXY_POLICY_FILE;
-  if (!file) return config;
+  if (!file && env.CLAWMANAGER_NETWORK_ISOLATED !== '1') return config;
   let proxies = [];
   try {
     const raw = fs.readFileSync(file, 'utf8');
@@ -23,18 +23,28 @@ export function withManagedProxyPolicy(config, env = process.env, now = Date.now
         policy.proxies.some(ip => typeof ip !== 'string' || !isIP(ip))) {
       throw new Error('invalid policy');
     }
-    proxies = [...new Set(policy.proxies)].sort();
+    proxies = env.CLAWMANAGER_NETWORK_ISOLATED === '1' ? ['127.0.0.1', '::1'] : [...new Set(policy.proxies)].sort();
   } catch {
     // Authentication and attribution stay enabled even when discovery is down.
   }
   const namespace = env.CLAWMANAGER_PROXY_POLICY_NAMESPACE ?? '';
-  const proxyKey = JSON.stringify(proxies);
+  const isolated = env.CLAWMANAGER_NETWORK_ISOLATED === '1';
+  const proxyKey = JSON.stringify([isolated, proxies]);
   const cacheable = config !== null && typeof config === 'object';
   const previous = cacheable ? effectiveSnapshots.get(config) : undefined;
-  if (previous?.file === file && previous.namespace === namespace && previous.proxyKey === proxyKey) {
+  if (previous && previous.file === file && previous.namespace === namespace && previous.proxyKey === proxyKey) {
     return previous.config;
   }
-  const effective = { ...config, gateway: { ...config?.gateway, trustedProxies: proxies, allowRealIpFallback: false } };
+  const gateway = { ...config?.gateway, trustedProxies: proxies, allowRealIpFallback: false };
+  if (isolated) {
+    // Protected ingress terminates only after the parent verified the current
+    // instance capability, then relays through this instance's private NET.
+    // 10.2 independently refuses loopback trusted-proxy authentication unless
+    // explicitly admitted. This overlay never changes the shared-NET path or
+    // persists the exception, and expires with the parent-owned policy lease.
+    gateway.auth = { ...gateway.auth, trustedProxy: { ...gateway.auth?.trustedProxy, allowLoopback: proxies.length > 0 } };
+  }
+  const effective = { ...config, gateway };
   if (cacheable) effectiveSnapshots.set(config, { file, namespace, proxyKey, config: effective });
   return effective;
 }
@@ -43,7 +53,7 @@ export function withManagedProxyPolicy(config, env = process.env, now = Date.now
 // Never persist ephemeral proxy addresses in the user's configuration.
 export function withManagedStartupPolicy(config, env = process.env, now = Date.now()) {
   const result = withManagedProxyPolicy(config, env, now);
-  if (env.CLAWMANAGER_PROXY_POLICY_FILE && result.gateway.trustedProxies.length === 0) {
+  if ((env.CLAWMANAGER_PROXY_POLICY_FILE || env.CLAWMANAGER_NETWORK_ISOLATED === '1') && result.gateway.trustedProxies.length === 0) {
     throw new Error('PROXY_POLICY_NOT_READY: a valid managed proxy policy is required before Gateway startup');
   }
   return result;

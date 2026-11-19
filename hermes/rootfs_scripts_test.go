@@ -29,7 +29,7 @@ func TestLiteDockerfilePackagesCanonicalTeamAdapterAndCoHostedSupervisor(t *test
 	dockerfile := string(data)
 	for _, want := range []string{
 		"COPY plugins/hermes-redis-team/ /opt/hermes-agent/plugins/platforms/redis_team/",
-		"apply_team_completion_stop.py /opt/hermes-agent/agent/conversation_loop.py",
+		"apply_lite_team_completion_stop.py /opt/hermes-agent/agent/turn_tool_round.py",
 		"start-hermes-lite-runtime /usr/local/bin/start-hermes-lite-runtime",
 		"hermes-apply-runtime-config /usr/local/bin/hermes-apply-runtime-config",
 	} {

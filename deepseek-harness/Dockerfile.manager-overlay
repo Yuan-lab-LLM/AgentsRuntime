@@ -1,0 +1,12 @@
+# Preserve the verified native payload and apply every upstream Lite delta.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG VCS_REF
+COPY --chmod=755 --from=manager-binaries /deepseek-harness-agent /usr/local/bin/clawmanager-agent
+COPY --chmod=755 --from=manager-binaries /deepseek-harness-agent /usr/local/libexec/clawmanager-agent-image
+COPY deepseek-harness/scripts/patch-managed-settings.py tests/lite/test_deepseek_settings.mjs /usr/local/share/deepseek-harness/
+RUN python3 /usr/local/share/deepseek-harness/patch-managed-settings.py \
+      /opt/clawmanager-dsh/node_modules/@deepseek-ai/dsh-client-ui-settings/lib/client.js \
+    && node /usr/local/share/deepseek-harness/test_deepseek_settings.mjs \
+      /opt/clawmanager-dsh/node_modules/@deepseek-ai/dsh-client-ui-settings/lib/client.js
+LABEL org.opencontainers.image.revision=$VCS_REF

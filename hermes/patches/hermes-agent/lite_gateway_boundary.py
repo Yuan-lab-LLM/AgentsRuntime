@@ -111,6 +111,7 @@ class LiteGatewayBoundary:
         self.origin_raw = os.environ.get("CLAWMANAGER_CONTROL_UI_ORIGIN", "")
         self.origin = canonical_origin(self.origin_raw)
         self.policy_file = os.environ.get("CLAWMANAGER_PROXY_POLICY_FILE", "")
+        self.network_isolated = os.environ.get("CLAWMANAGER_NETWORK_ISOLATED") == "1"
         self.policy_namespace = os.environ.get("CLAWMANAGER_PROXY_POLICY_NAMESPACE", "")
         raw = os.environ.get("CLAWMANAGER_TRUSTED_PROXY_CIDRS", "")
         self.proxies = []
@@ -119,7 +120,7 @@ class LiteGatewayBoundary:
                             for item in raw.split(",") if item.strip()]
         except ValueError:
             raise RuntimeError("invalid_trusted_proxy_config") from None
-        if not self.origin or (self.policy_file and not self.policy_namespace) or (not self.policy_file and (not self.proxies or any(network.prefixlen == 0 for network in self.proxies))):
+        if not self.origin or (self.network_isolated and not self.policy_file) or (self.policy_file and not self.policy_namespace) or (not self.policy_file and (not self.proxies or any(network.prefixlen == 0 for network in self.proxies))):
             raise RuntimeError("missing_lite_network_boundary")
 
     def effective_proxies(self):
@@ -143,6 +144,11 @@ class LiteGatewayBoundary:
             addresses = [ipaddress.ip_address(value) for value in values if isinstance(value, str)]
             if len(addresses) != len(values) or any(address.is_unspecified or address.is_loopback or address.is_multicast or address.is_link_local or getattr(address, "scope_id", None) for address in addresses):
                 return []
+            if self.network_isolated:
+                # The authenticated parent ingress relays only into this
+                # instance's private NET. Preserve native Origin/auth checks;
+                # shared-NET peers and expired policies never gain this path.
+                return [ipaddress.ip_network("127.0.0.1/32"), ipaddress.ip_network("::1/128")]
             return [ipaddress.ip_network(address) for address in addresses]
         except (OSError, ValueError, TypeError, AttributeError):
             return []

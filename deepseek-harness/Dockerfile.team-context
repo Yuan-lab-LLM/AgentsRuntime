@@ -1,0 +1,11 @@
+# syntax=docker/dockerfile:1.7
+# Narrow host overlay on the verified serving native/Agent image.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG RUNTIME_REVISION
+COPY plugins/openclaw-redis-team/dist/index.js /opt/clawmanager-dsh/adapter/plugins/openclaw-redis-team/dist/index.js
+COPY opencode/team/bridge.mjs opencode/team/native-client.mjs opencode/team/delivery-outbox.mjs opencode/team/build-protocol.mjs /opt/clawmanager-dsh/adapter/opencode/team/
+COPY deepseek-harness/team/host.mjs deepseek-harness/team/plugin.mjs deepseek-harness/team/build.mjs deepseek-harness/team/schema.mjs /opt/clawmanager-dsh/adapter/deepseek-harness/team/
+RUN node /opt/clawmanager-dsh/adapter/deepseek-harness/team/build.mjs /opt/clawmanager-dsh/adapter/deepseek-harness/team/protocol.mjs \
+ && node /opt/clawmanager-dsh/verify-native.mjs /opt/clawmanager-dsh/native-manifest.json --patched
+LABEL io.clawmanager.team-source-revision="${RUNTIME_REVISION}"

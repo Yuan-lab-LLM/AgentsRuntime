@@ -1,8 +1,18 @@
-# Preserve the accepted OpenClaw core/Agent/managed proxy and update only the
-# installed Team plugin. No upstream download or unrelated runtime migration.
-ARG BASE_IMAGE=10.130.14.23:5000/agentsruntime/openclaw-lite:team-idle-access-20261008-v1
+# Maintenance overlay for a pinned Team-compatible 2026.10.2 serving image.
+# Agent, workspace adapters, entrypoint and core are retained without migration.
+ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
-COPY --chown=abc:abc plugins/openclaw-redis-team/dist/index.js /defaults/.openclaw/extensions/redis-team/dist/index.js
-RUN node --check /defaults/.openclaw/extensions/redis-team/dist/index.js \
-    && node /usr/local/share/openclaw/patches/test_redis_team_plugin_hooks.mjs
-LABEL io.clawmanager.team.execution="single-member-v1"
+ARG RUNTIME_REVISION
+COPY plugins/openclaw-redis-team/dist/index.js /tmp/redis-team-index.js
+RUN set -eu; \
+    core="$(dirname "$(readlink -f "$(command -v openclaw)")")"; \
+    test -f "$core/package.json"; \
+    test -d "$core/dist/extensions/redis-team/dist"; \
+    cp /tmp/redis-team-index.js "$core/dist/extensions/redis-team/dist/index.js"; \
+    cp /tmp/redis-team-index.js /defaults/.openclaw/extensions/redis-team/dist/index.js; \
+    chown abc:abc /defaults/.openclaw/extensions/redis-team/dist/index.js; \
+    node --check /defaults/.openclaw/extensions/redis-team/dist/index.js; \
+    node --input-type=module -e 'const m=await import("/defaults/.openclaw/extensions/redis-team/dist/index.js");if(!m.default)process.exit(1)'; \
+    openclaw --version | grep '2026.10.2'; \
+    rm /tmp/redis-team-index.js
+LABEL io.clawmanager.team-source-revision="${RUNTIME_REVISION}"

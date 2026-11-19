@@ -8,11 +8,13 @@ import re
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PATCH = '/usr/local/share/deepseek-harness/managed.cordis.patch.yml'
@@ -59,6 +61,46 @@ def request(url, headers=None):
         return error.code, error.headers, error.read()
 
 
+def rpc(url, method, args, headers):
+    parameters = {} if method == 'session/modelCatalog' else {
+        '_request' if method == 'session/list' else 'request': args}
+    message = {'type': 'client-request', 'rpcId': str(uuid.uuid4()),
+               'method': method, 'payload': {'args': parameters}}
+    req = urllib.request.Request(url + '/api/' + method, data=json.dumps(message).encode(),
+                                 headers={**headers, 'Content-Type': 'application/json'})
+    with urllib.request.urlopen(req, timeout=60) as response:
+        result = json.load(response)['result']
+    assert result['ok'], (method, result)
+    return result['value']
+
+
+def check_web_model(url, headers, root):
+    catalog = rpc(url, 'session/modelCatalog', {}, headers)
+    routes = {(group['id'], model['id']) for group in catalog['groups'] for model in group['models']}
+    assert ('auto', 'auto') in routes, catalog
+    assert ('managed', 'demo') in routes, catalog
+    assert not catalog['failures'], catalog
+    session = rpc(url, 'session/create', {'cwd': str(root), 'agentPreset': 'standard'}, headers)
+    session_id = session['sessionId']
+    rpc(url, 'session/prompt', {'sessionId': session_id, 'requestId': str(uuid.uuid4()),
+        'mode': 'queue', 'content': [{'type': 'text', 'text': 'WEB_MODEL_FIXTURE: say hello.'}]}, headers)
+    deadline = time.monotonic() + 90
+    while time.monotonic() < deadline:
+        baseline = rpc(url, 'session/projections', {'sessionId': session_id}, headers)
+        page = rpc(url, 'session/page', {'address': {'kind': 'session', 'sessionId': session_id},
+                   'throughSeq': baseline['asOfSeq']}, headers)
+        sessions = rpc(url, 'session/list', {}, headers)['items']
+        if 'pong' in json.dumps(page['records']) and any(
+                item['sessionId'] == session_id and not item['running'] for item in sessions):
+            break
+        time.sleep(0.5)
+    else:
+        raise AssertionError('Web session did not persist a completed model reply: ' + session_id)
+    assert any(body['model'] == 'auto' and auth == 'Bearer fixture-model' and
+               any('WEB_MODEL_FIXTURE' in str(m.get('content', '')) for m in body['messages'])
+               for _, auth, body in REQUESTS), 'Web prompt did not reach managed model endpoint'
+
+
 def stop(process):
     if process.poll() is None:
         children = Path('/proc/%d/task/%d/children' % (process.pid, process.pid)).read_text().split()
@@ -103,6 +145,8 @@ def check_web(mode, env, root):
                     raise AssertionError('startup timeout: ' + log_path.read_text()[-6000:])
                 assert b'<html' in document.lower(), document[:200]
                 print(mode, attempt, 'authenticated index ready', flush=True)
+                check_web_model(url, headers, root)
+                print(mode, attempt, 'Web model catalog and completed reply OK', flush=True)
                 status, response_headers, _ = request(url + '/', headers)
                 assert 'dsh-auth-' not in str(response_headers)
                 if mode == 'lite':
@@ -151,8 +195,12 @@ def main():
                    CLAWMANAGER_LLM_API_KEY='fixture-model', CLAWMANAGER_LLM_MODEL='["auto"]',
                    CLAWMANAGER_LLM_BASE_URL='http://127.0.0.1:%d/v1' % fixture.server_port,
                    CLAWMANAGER_LLM_CONTEXT_WINDOW='64000', CLAWMANAGER_LLM_CONTEXT_WINDOWS='{"auto":64000}')
-        for mode in ['lite', 'pro']:
-            check_web(mode, env.copy(), root)
+        web_env = dict(env, CLAWMANAGER_LLM_PROVIDER_MODELS='["auto/auto","managed/demo"]',
+                       CLAWMANAGER_LLM_MODEL='["auto","demo"]', CLAWMANAGER_LLM_CONTEXT_WINDOW='0',
+                       CLAWMANAGER_LLM_CONTEXT_WINDOWS='{"auto":0,"demo":32000}')
+        for mode in sys.argv[1:] or ['lite', 'pro']:
+            assert mode in ['lite', 'pro'], 'mode must be lite or pro'
+            check_web(mode, web_env.copy(), root)
         canonical = subprocess.check_output(['/usr/local/bin/clawmanager-agent', 'llm-config', '--format', 'canonical',
                                              '--fallback-provider', 'clawmanager', '--default-model', 'auto'], env=env, text=True)
         env['CLAWMANAGER_LLM_RESOLVED_CONFIG_JSON'] = canonical

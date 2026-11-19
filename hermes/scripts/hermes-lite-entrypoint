@@ -1,15 +1,37 @@
 #!/usr/bin/env bash
 set -euo pipefail
-umask 077
+umask "${CLAWMANAGER_TEAM_UMASK:-0077}"
 
-# The Lite image is a shared runtime pod, never a Pro instance agent.
-if [[ -z "${RUNTIME_AGENT_CONTROL_TOKEN:-}" || -z "${RUNTIME_AGENT_REPORT_TOKEN:-}" ]]; then
-    echo "Hermes Lite requires runtime control and report credentials" >&2
-    exit 64
+instance_mode="${CLAWMANAGER_AGENT_ENABLED:-false}"
+instance_mode="${instance_mode//[[:space:]]/}"
+if [[ "${instance_mode}" == [Tt][Rr][Uu][Ee] ]]; then
+  echo "Lite does not accept Pro instance agent mode" >&2
+  exit 64
 fi
-if [[ "${CLAWMANAGER_AGENT_ENABLED:-false}" == "true" ]]; then
-    echo "Hermes Lite does not accept Pro instance agent mode" >&2
+case "${RUNTIME_AGENT_ROLE:-}" in
+  slot)
+    # Slot control is local to the trusted Pod coordinator, without backend reports.
+    if [[ -z "${RUNTIME_AGENT_CONTROL_TOKEN:-}" ]]; then
+      echo "Lite slot requires runtime control credentials" >&2
+      exit 64
+    fi
+    ;;
+  pool)
+    if [[ -z "${RUNTIME_AGENT_CONTROL_TOKEN:-}" || -z "${RUNTIME_AGENT_REPORT_TOKEN:-}" ]]; then
+      echo "Lite pool requires runtime control and report credentials" >&2
+      exit 64
+    fi
+    ;;
+  '')
+    if [[ -z "${RUNTIME_AGENT_CONTROL_TOKEN:-}" || -z "${RUNTIME_AGENT_REPORT_TOKEN:-}" ]]; then
+      echo "Hermes Lite requires runtime control and report credentials" >&2
+      exit 64
+    fi
+    ;;
+  *)
+    echo "invalid Lite runtime agent role" >&2
     exit 64
-fi
-mkdir -p "${RUNTIME_AGENT_DATA_DIR}" "${RUNTIME_WORKSPACE_ROOT}"
+    ;;
+esac
+mkdir -p "${RUNTIME_AGENT_DATA_DIR:-/var/lib/clawmanager-agent}" "${RUNTIME_WORKSPACE_ROOT:-/workspaces}"
 exec /usr/local/bin/clawmanager-agent

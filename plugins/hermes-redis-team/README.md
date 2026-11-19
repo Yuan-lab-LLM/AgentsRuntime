@@ -18,6 +18,21 @@ platform named `redis_team` and the shared team tools:
 
 ## Runtime contract
 
+The `active_context_delivery_v1` adapter uses the pinned native gateway's
+explicit active-agent reader and `steer()` for a valid reminder to the current
+busy work. It never changes global busy modes or `allow_gateway_control`.
+Transport receipt, submission and inclusion in a prepared native request are
+separate facts; inclusion does not guarantee model compliance. Identity and
+version come from the existing business envelope, not new model parameters.
+Ordinary peer/long context, idle recovery and legitimate post-delivery Leader
+questions retain their original dispatch path. Connected presence explicitly
+publishes online and its system generation after a restart.
+
+Use `hermes/Dockerfile.team-release` only on a verified immutable native base;
+it applies the narrow gateway reader patch and regenerates the image-owned
+release inventory. `hermes/tests/smoke_team_context_delivery.py` exercises the
+actual native steering boundary without claiming real-model acceptance.
+
 The adapter reads the same Team env contract used by the OpenClaw runtime:
 
 ```text

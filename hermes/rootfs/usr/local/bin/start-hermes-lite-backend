@@ -18,4 +18,8 @@ fail() { printf '%s\n' "$1" >&2; exit 64; }
 (( 10#${PORT} > 0 && 10#${PORT} <= 65535 )) || fail 'port_conflict: invalid assigned port'
 
 cd -- "${CLAWMANAGER_WORKSPACE_PATH}"
+# v0.22.5's HTTP session readers require a store initialized by its owner.
+# Lite owns initial creation/migration. Healthy existing databases are probed
+# read-only, without repeating writable SessionDB initialization on every boot.
+/opt/hermes-agent/.venv/bin/python /opt/hermes-agent/hermes_cli/lite_startup.py
 exec hermes serve --host 0.0.0.0 --port "${PORT}" --isolated

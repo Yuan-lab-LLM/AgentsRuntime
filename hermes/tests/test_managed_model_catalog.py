@@ -432,7 +432,10 @@ class ToolFenceTests(unittest.TestCase):
         middleware.run_tool_execution_middleware = lambda name, args, callback, **kw: callback(args)
         native_agent = types.ModuleType("agent")
         native_agent.relay_tools = types.SimpleNamespace(execute=lambda name, args, callback, **kw: (callback(args), args))
-        for native in (rendered, lite.patched_source(rendered.encode())):
+        variants = [rendered]
+        if hashlib.sha256(source.encode()).hexdigest() == lite.EXPECTED:
+            variants.append(lite.patched_source(rendered.encode()))
+        for native in variants:
             tree = ast.parse(native)
             function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_run_agent_tool_execution_middleware")
             module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), function], type_ignores=[])

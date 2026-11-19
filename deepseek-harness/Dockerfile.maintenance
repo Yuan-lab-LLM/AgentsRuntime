@@ -1,0 +1,26 @@
+# Build a source-verified maintenance image on an already-built native release.
+# agent-binaries must contain binaries compiled from this checkout/recorded SHA,
+# plus the original sandbox JS whose SHA is checked by patch-persistent-tmp.py.
+ARG DSH_BASE_IMAGE
+FROM ${DSH_BASE_IMAGE}
+ARG VCS_REF
+ARG DSH_MODE
+COPY --from=agent-binaries /clawmanager-agent /usr/local/bin/clawmanager-agent
+COPY --from=agent-binaries /clawmanager-agent /usr/local/libexec/clawmanager-agent-image
+COPY --from=agent-binaries /original-sandbox.js /opt/clawmanager-dsh/node_modules/@deepseek-ai/dsh-sandbox-local/lib/index.js
+COPY deepseek-harness/native/source-lock.json /opt/clawmanager-dsh/source-lock.json
+COPY deepseek-harness/scripts/verify-native.mjs /opt/clawmanager-dsh/verify-native.mjs
+COPY deepseek-harness/scripts/prepare-managed-config.mjs deepseek-harness/config/managed.cordis.patch.yml /usr/local/share/deepseek-harness/
+COPY deepseek-harness/scripts/start-deepseek-harness-gateway /usr/local/bin/start-deepseek-harness-gateway
+COPY deepseek-harness/scripts/start-deepseek-harness-pro /usr/local/bin/start-deepseek-harness-pro
+COPY deepseek-harness/scripts/patch-persistent-tmp.py /usr/local/share/deepseek-harness/patch-persistent-tmp.py
+RUN set -eu; \
+    chmod 755 /usr/local/bin/clawmanager-agent /usr/local/libexec/clawmanager-agent-image \
+      /usr/local/bin/start-deepseek-harness-gateway /usr/local/bin/start-deepseek-harness-pro; \
+    case "$DSH_MODE" in \
+      lite) python3 /usr/local/share/deepseek-harness/patch-persistent-tmp.py /opt/clawmanager-dsh/node_modules/@deepseek-ai/dsh-sandbox-local/lib/index.js; \
+        node /opt/clawmanager-dsh/verify-native.mjs /opt/clawmanager-dsh/native-manifest.json --patched ;; \
+      pro) node /opt/clawmanager-dsh/verify-native.mjs /opt/clawmanager-dsh/native-manifest.json ;; \
+      *) exit 2 ;; \
+    esac
+LABEL org.opencontainers.image.revision=$VCS_REF

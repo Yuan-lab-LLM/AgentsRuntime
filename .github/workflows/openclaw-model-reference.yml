@@ -1,9 +1,9 @@
 name: OpenClaw model reference regression
 on:
   push:
-    paths: ['openclaw/**', 'clawmanager-agent/internal/gateway/**', 'clawmanager-agent/internal/runtime/openclaw/**', 'clawmanager-agent/internal/managedmodelrefs/**', 'clawmanager-agent/internal/shutdownoutbox/**', 'clawmanager-agent/internal/control/**', 'clawmanager-agent/internal/agent/**', '.github/workflows/openclaw-model-reference.yml']
+    paths: ['openclaw/**', 'clawmanager-agent/gateway/**', 'openclaw/lite/**', 'clawmanager-agent/managedmodelrefs/**', 'clawmanager-agent/shutdownoutbox/**', 'clawmanager-agent/control/**', 'clawmanager-agent/agent/**', '.github/workflows/openclaw-model-reference.yml']
   pull_request:
-    paths: ['openclaw/**', 'clawmanager-agent/internal/gateway/**', 'clawmanager-agent/internal/runtime/openclaw/**', 'clawmanager-agent/internal/managedmodelrefs/**', 'clawmanager-agent/internal/shutdownoutbox/**', 'clawmanager-agent/internal/control/**', 'clawmanager-agent/internal/agent/**', '.github/workflows/openclaw-model-reference.yml']
+    paths: ['openclaw/**', 'clawmanager-agent/gateway/**', 'openclaw/lite/**', 'clawmanager-agent/managedmodelrefs/**', 'clawmanager-agent/shutdownoutbox/**', 'clawmanager-agent/control/**', 'clawmanager-agent/agent/**', '.github/workflows/openclaw-model-reference.yml']
   workflow_dispatch:
 permissions:
   contents: read
@@ -24,13 +24,16 @@ jobs:
             openclaw/go.sum
       - name: Test Lite startup activation gate
         working-directory: clawmanager-agent
-        run: go test ./internal/gateway ./internal/runtime/openclaw -run 'TestOpenClaw|Test.*GatewayEnv' -count=1
+        run: go test ./gateway -run 'TestOpenClaw|Test.*GatewayEnv' -count=1
+      - name: Test Lite runtime adapter
+        working-directory: openclaw
+        run: go test ./lite -run 'TestOpenClaw|Test.*GatewayEnv' -count=1
       - name: Test Pro startup activation gate
         working-directory: openclaw
         run: go test ./internal/receiptstorage ./internal/bootstrap ./internal/process ./internal/supervisor -run 'TestOpenClaw|TestGateway|TestReceipt|TestProReceipt' -count=1
       - name: Test Lite durable shutdown delivery
         working-directory: clawmanager-agent
-        run: go test -vet=all ./internal/shutdownoutbox ./internal/gateway ./internal/control ./internal/agent -run 'TestOutbox|TestDelivery|TestShutdown' -count=1
+        run: go test -vet=all ./shutdownoutbox ./gateway ./control ./agent -run 'TestOutbox|TestDelivery|TestShutdown' -count=1
       - name: Test Pro durable shutdown delivery
         working-directory: openclaw
         run: go test -vet=all ./internal/shutdownoutbox ./internal/process ./internal/supervisor ./internal/control -run 'TestOutbox|TestDelivery|TestShutdown' -count=1

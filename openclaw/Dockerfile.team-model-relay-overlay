@@ -1,0 +1,7 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG VCS_REF
+COPY openclaw/patches/managed_proxy_policy.mjs openclaw/patches/patch_managed_proxy_policy_102.mjs openclaw/patches/test_managed_proxy_reload_102.mjs /usr/local/share/clawmanager/relay-policy/
+RUN node /usr/local/share/clawmanager/relay-policy/patch_managed_proxy_policy_102.mjs --patch --install-marker && node /usr/local/share/clawmanager/relay-policy/test_managed_proxy_reload_102.mjs
+COPY plugins/openclaw-redis-team/dist/index.js /usr/local/lib/node_modules/openclaw/dist/extensions/redis-team/dist/index.js
+LABEL org.opencontainers.image.revision=$VCS_REF

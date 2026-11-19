@@ -42,7 +42,7 @@ LOOP_EXPECTED = "33924321c2ef848a7474d4daf4dd5ec1e98588aa54db967d92ea2fc6aa3ff56
 AGENT_EXPECTED = "5b2e7083680e6c728f2306adc73e5f814c444aaa9ff3e3b840206142c67a7149"
 
 
-def render_agent(source):
+def render_agent(source, *, expected_hash=AGENT_EXPECTED):
     marker = "                    # ClawManager: scoped owner-task revocation watcher.\n"
     original = source
     if marker in source:
@@ -51,7 +51,7 @@ def render_agent(source):
         block = source[start:end]
         lines = block.splitlines(keepends=True)[3:]
         original = source[:start] + "".join(line[4:] for line in lines) + source[end:]
-    if hashlib.sha256(original.encode("utf-8")).hexdigest() != AGENT_EXPECTED:
+    if hashlib.sha256(original.encode("utf-8")).hexdigest() != expected_hash:
         raise ValueError("Managed monitor patch requires the exact locked Hermes agent")
     start = original.index("                    result = run_conversation(\n")
     end = original.index("                finally:\n", start)

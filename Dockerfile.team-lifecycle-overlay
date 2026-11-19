@@ -1,0 +1,19 @@
+# Maintain the native payload and Team adapters of an immutable serving image.
+# agent-binaries contains Linux binaries built from the recorded Runtime commit.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG RUNTIME_TYPE
+ARG VCS_REF
+COPY --from=agent-binaries /${RUNTIME_TYPE}-agent /usr/local/bin/clawmanager-agent
+RUN set -eu; \
+    if [ ! -x /usr/sbin/ip ] || [ ! -x /usr/sbin/nft ] || [ ! -x /usr/bin/bwrap ]; then apt-get -o Acquire::Retries=3 update; apt-get -o Acquire::Retries=3 install -y --no-install-recommends bubblewrap iproute2 nftables util-linux; rm -rf /var/lib/apt/lists/*; fi; \
+    test -x /usr/sbin/ip; test -x /usr/sbin/nft; test -x /usr/bin/bwrap; test -x /usr/bin/setpriv; test -x /usr/bin/nsenter; \
+    chmod 755 /usr/local/bin/clawmanager-agent; \
+    if [ "$RUNTIME_TYPE" = deepseek-harness ]; then \
+      cp /usr/local/bin/clawmanager-agent /usr/local/libexec/clawmanager-agent-image; \
+    fi; \
+    if [ "$RUNTIME_TYPE" = hermes ]; then \
+      python3 /usr/local/share/hermes-lite/verify_lite_release.py --lock /usr/local/share/hermes-lite/source-lock.json --generate-release --verify-release; \
+    fi; \
+    if [ "$RUNTIME_TYPE" = openclaw ]; then chmod -R a+rX /defaults/.openclaw/extensions; fi
+LABEL org.opencontainers.image.revision=$VCS_REF

@@ -4,16 +4,16 @@ on:
   push:
     paths:
       - 'hermes/**'
-      - 'clawmanager-agent/internal/runtime/hermes/**'
-      - 'clawmanager-agent/internal/llmconfig/**'
-      - 'clawmanager-agent/internal/gateway/**'
+      - 'hermes/lite/**'
+      - 'clawmanager-agent/llmconfig/**'
+      - 'clawmanager-agent/gateway/**'
       - '.github/workflows/hermes-model-catalog.yml'
   pull_request:
     paths:
       - 'hermes/**'
-      - 'clawmanager-agent/internal/runtime/hermes/**'
-      - 'clawmanager-agent/internal/llmconfig/**'
-      - 'clawmanager-agent/internal/gateway/**'
+      - 'hermes/lite/**'
+      - 'clawmanager-agent/llmconfig/**'
+      - 'clawmanager-agent/gateway/**'
       - '.github/workflows/hermes-model-catalog.yml'
   workflow_dispatch:
 
@@ -47,9 +47,13 @@ jobs:
           curl --fail --location --retry 3 --max-time 90 https://raw.githubusercontent.com/NousResearch/hermes-agent/29112bef099274229cadff79cdff7bf7b99c4b77/hermes_cli/runtime_provider.py -o "$RUNNER_TEMP/hermes-runtime-provider.py"
           curl --fail --location --retry 3 --max-time 90 https://raw.githubusercontent.com/NousResearch/hermes-agent/29112bef099274229cadff79cdff7bf7b99c4b77/agent/tool_executor.py -o "$RUNNER_TEMP/hermes-tool-executor.py"
           python hermes/tests/test_managed_model_catalog.py --native-source "$RUNNER_TEMP/hermes-runtime-provider.py" --native-tool-source "$RUNNER_TEMP/hermes-tool-executor.py"
+      - name: Verify managed hooks compose with locked Hermes Lite native source
+        run: |
+          python hermes/scripts/verify_lite_release.py --lock hermes/hermes-lite.lock.json --download "$RUNNER_TEMP/hermes-lite-native"
+          HERMES_LITE_NATIVE_ROOT="$RUNNER_TEMP/hermes-lite-native" python hermes/tests/test_managed_model_catalog_v0225.py
       - name: Test Runtime configuration contracts
         working-directory: clawmanager-agent
-        run: go test ./internal/runtime/hermes ./internal/llmconfig -count=1
+        run: go test ./llmconfig -count=1
       - name: Test Hermes image contracts
         working-directory: hermes
         run: go test ./... -count=1

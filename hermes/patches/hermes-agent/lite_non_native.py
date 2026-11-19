@@ -8,16 +8,18 @@ from functools import wraps
 import json
 import os
 import re
+import shlex
 
 ENABLED = True
 POLICY_VERSION = "lite-non-native-v2"
 _AGENT_SEAL = object()
-NATIVE_TOOLSETS = frozenset({"desktop_ui", "project", "desktop_project", "computer_use"})
+NATIVE_TOOLSETS = frozenset({"desktop_ui", "project", "desktop_project", "computer_use", "catalog", "onboarding"})
 # Exact locked toolsets.py desktop_ui + project + computer_use members.
 NATIVE_TOOLS = frozenset({
     "read_terminal", "close_terminal", "desktop_preview", "drive_preview",
     "annotate_preview", "read_window_below", "focus_pane", "react_to_message",
     "setup_mcp", "tour", "tip", "desktop_project", "computer_use",
+    "gui_tour", "show_tip", "set_theme", "manage_catalog", "setup_beat",
 })
 _SESSION_ID = re.compile(r"[A-Za-z0-9_:-]{1,160}\Z")
 _PROFILE_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
@@ -27,7 +29,7 @@ _NATIVE_RPC_PREFIXES = ("shell.", "cli.", "desktop.", "computer.", "browser.", "
 _NATIVE_RPC_METHODS = frozenset({"tools.call", "tool.call"})
 _MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./:@+-]{0,255}\Z")
 _MODEL_SWITCH = re.compile(r"([A-Za-z0-9][A-Za-z0-9_./:@+-]{0,255}) --provider ([A-Za-z0-9][A-Za-z0-9_./:@+-]{0,255}) --session\Z")
-REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
+REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
 
 
 class NonNativeSessionError(RuntimeError):
@@ -37,6 +39,15 @@ class NonNativeSessionError(RuntimeError):
 
 def filter_tool_names(names):
     return set(names) - NATIVE_TOOLS if ENABLED else names
+
+
+def is_native_call(function_name, function_args=None):
+    if function_name in NATIVE_TOOLS:
+        return True
+    # v0.22.5 permits GUI tools through the deferred bridge. Reject the wrapper
+    # even when its schema/scope probe prevents upstream from unwrapping it.
+    name = function_args.get("name") if function_name == "tool_call" and isinstance(function_args, dict) else None
+    return isinstance(name, str) and name in NATIVE_TOOLS
 
 
 def toolset_filter(fn):
@@ -49,10 +60,18 @@ def toolset_filter(fn):
     return filtered
 
 
+def install_gateway(namespace):
+    """Install policy wrappers after upstream's split-module rebinding."""
+    for name in ("_gui_surface_toolsets", "_load_enabled_toolsets"):
+        namespace[name] = toolset_filter(namespace[name])
+    namespace["_methods"]["config.set"] = session_config(namespace["_methods"]["config.set"])
+
+
 def tool_dispatch(fn):
     @wraps(fn)
     def guarded(function_name, *args, **kwargs):
-        if ENABLED and function_name in NATIVE_TOOLS:
+        arguments = args[0] if args else kwargs.get("function_args")
+        if ENABLED and is_native_call(function_name, arguments):
             # Do not inspect/reflect arguments or invoke renderer callbacks.
             return json.dumps({"error": "unsupported_native_desktop_tool"})
         return fn(function_name, *args, **kwargs)
@@ -217,6 +236,19 @@ def session_config(fn):
         transport = ns["current_transport"]()
         if not external_transport(transport, stdio=transport is ns["_stdio_transport"]):
             return fn(rid, params)
+        key, value = params.get("key"), params.get("value")
+        if params.get("scope") not in {None, "", "session"}:
+            return ns["_err"](rid, -32602, "unsupported_lite_session_configuration")
+        if ((key == "reasoning" and (not isinstance(value, str) or value not in REASONING_EFFORTS))
+                or (key == "fast" and (not isinstance(value, str) or value not in {"normal", "fast", "priority", "auto", "cold", "ultrafast"}))):
+            return ns["_err"](rid, -32602, "unsupported_lite_session_configuration")
+        if key == "model":
+            try:
+                tokens = shlex.split(value)
+            except (ValueError, TypeError):
+                tokens = ["--global"]
+            if any(token == "--global" or token.startswith("--global=") for token in tokens):
+                return ns["_err"](rid, -32602, "unsupported_lite_session_configuration")
         with ns["_session_resume_lock"]:
             with ns["_sessions_lock"]:
                 session = ns["_sessions"].get(params.get("session_id"))

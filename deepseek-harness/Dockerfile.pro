@@ -1,28 +1,50 @@
 # syntax=docker/dockerfile:1.7
 
 ARG WEBTOP_RUNTIME_BASE_IMAGE=ghcr.io/yuan-lab-llm/agentsruntime/openclaw:latest
+ARG GO_BUILDER_IMAGE=golang:1.26.8-bookworm@sha256:9fdc884aacc3bec89b20ffc69f4bb369c78210e3e4f600387b5128b12c199f81
 
-FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS clawmanager-agent-builder
+FROM node:24.21.0-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20 AS native-builder
+COPY deepseek-harness/native/package.json deepseek-harness/native/package-lock.json /opt/clawmanager-dsh/
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --prefix /opt/clawmanager-dsh --ignore-scripts --no-audit --no-fund
+COPY deepseek-harness/native/source-lock.json deepseek-harness/scripts/verify-native.mjs /opt/clawmanager-dsh/
+RUN node /opt/clawmanager-dsh/verify-native.mjs /opt/clawmanager-dsh/native-manifest.json
+
+FROM --platform=$BUILDPLATFORM ${GO_BUILDER_IMAGE} AS clawmanager-agent-builder
+ARG GOPROXY
 
 ARG TARGETOS=linux
 ARG TARGETARCH
 ARG AGENT_VERSION=dev
 
-WORKDIR /src/clawmanager-agent
-COPY clawmanager-agent ./
+WORKDIR /src/legacy-agent
+COPY clawmanager-agent /src/clawmanager-agent
+COPY legacy-agent /src/legacy-agent
+COPY openclaw/go.mod openclaw/go.sum /src/openclaw/
+COPY openclaw/lite /src/openclaw/lite
+COPY hermes/go.mod hermes/go.sum /src/hermes/
+COPY hermes/lite /src/hermes/lite
+COPY opencode/go.mod /src/opencode/
+COPY opencode/lite /src/opencode/lite
+COPY deepseek-harness/go.mod /src/deepseek-harness/
+COPY deepseek-harness/lite /src/deepseek-harness/lite
+COPY deepseek-harness/dshproxy /src/deepseek-harness/dshproxy
 RUN go mod download
 RUN set -eux; \
     arch="${TARGETARCH:-amd64}"; \
     CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${arch}" \
       go build -trimpath -ldflags="-s -w -X main.version=${AGENT_VERSION}" \
-      -o /out/clawmanager-agent ./cmd/clawmanager-agent
+      -o /out/clawmanager-agent ./cmd
 
-FROM golang:1.26-bookworm AS agent-builder
+FROM ${GO_BUILDER_IMAGE} AS agent-builder
+ARG GOPROXY
 
 ARG TARGETOS=linux
 ARG TARGETARCH
 
 WORKDIR /src/openclaw
+# Resolve openclaw/go.mod's local replacement in this independent stage.
+COPY clawmanager-agent/go.mod /src/clawmanager-agent/go.mod
 COPY openclaw/go.mod openclaw/go.sum ./
 RUN go mod download
 COPY openclaw/cmd ./cmd
@@ -31,12 +53,16 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /out/opencla
 
 FROM ${WEBTOP_RUNTIME_BASE_IMAGE}
 
-ARG DSH_VERSION=0.2.1-rc.3
-ARG PNPM_VERSION=11.25.0
-LABEL io.clawmanager.deepseek-harness.version="${DSH_VERSION}"
+ARG VCS_REF=unknown
+LABEL io.clawmanager.deepseek-harness.version="0.2.1-rc.3" org.opencontainers.image.revision=$VCS_REF
+COPY --from=native-builder /usr/local/bin/node /usr/local/bin/node
+COPY --from=native-builder /opt/clawmanager-dsh/ /opt/clawmanager-dsh/
 RUN set -eux; \
-    node -e 'const [major, minor] = process.versions.node.split(".").map(Number); if (!(major >= 24 || (major === 22 && minor >= 19))) process.exit(1)'; \
-    npm install --global "@deepseek-ai/dsh@${DSH_VERSION}" "pnpm@${PNPM_VERSION}"; \
+    mkdir -p /usr/local/lib/node_modules/@deepseek-ai; \
+    test ! -e /usr/local/lib/node_modules/@deepseek-ai/dsh; \
+    ln -s /opt/clawmanager-dsh/node_modules/@deepseek-ai/dsh /usr/local/lib/node_modules/@deepseek-ai/dsh; \
+    ln -s /opt/clawmanager-dsh/node_modules/.bin/dsh /usr/local/bin/dsh; \
+    ln -sf /opt/clawmanager-dsh/node_modules/.bin/pnpm /usr/local/bin/pnpm; \
     dsh --version; \
     npm cache clean --force
 
@@ -64,4 +90,5 @@ ENV CLAWMANAGER_RUNTIME_TYPE=deepseek-harness \
     DSH_HOME=/config/.dsh \
     DSH_NOFILE_SOFT=65536 \
     DSH_TELEMETRY_DISABLED=1 \
-    TITLE="DeepSeek Harness Pro"
+    TITLE="DeepSeek Harness Pro" \
+    CLAWMANAGER_REDIS_TEAM_PLUGIN_VERSION=""

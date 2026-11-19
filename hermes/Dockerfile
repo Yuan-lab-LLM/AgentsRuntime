@@ -2,20 +2,30 @@
 
 FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS clawmanager-agent-builder
 
-WORKDIR /src/clawmanager-agent
+WORKDIR /src/legacy-agent
 
 ARG TARGETOS=linux
 ARG TARGETARCH
 ARG AGENT_VERSION=dev
 
-COPY clawmanager-agent ./
+COPY clawmanager-agent /src/clawmanager-agent
+COPY legacy-agent /src/legacy-agent
+COPY openclaw/go.mod openclaw/go.sum /src/openclaw/
+COPY openclaw/lite /src/openclaw/lite
+COPY hermes/go.mod hermes/go.sum /src/hermes/
+COPY hermes/lite /src/hermes/lite
+COPY opencode/go.mod /src/opencode/
+COPY opencode/lite /src/opencode/lite
+COPY deepseek-harness/go.mod /src/deepseek-harness/
+COPY deepseek-harness/lite /src/deepseek-harness/lite
+COPY deepseek-harness/dshproxy /src/deepseek-harness/dshproxy
 RUN go mod download
 
 RUN set -eux; \
     arch="${TARGETARCH:-amd64}"; \
     CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${arch}" \
         go build -trimpath -ldflags="-s -w -X main.version=${AGENT_VERSION}" \
-        -o /out/clawmanager-agent ./cmd/clawmanager-agent
+        -o /out/clawmanager-agent ./cmd
 
 FROM lscr.io/linuxserver/webtop:ubuntu-kde
 
@@ -94,11 +104,15 @@ RUN set -eux; \
     npm --version; \
     rm -f /tmp/node.tar.xz
 
+COPY hermes/bootstrap/hermes-agent/install.sh /tmp/hermes-install.sh
+COPY hermes/bootstrap/hermes-agent/LICENSE /usr/local/share/licenses/hermes-agent-installer/LICENSE
+
 RUN set -eux; \
     mkdir -p "${HERMES_HOME}" "${PLAYWRIGHT_BROWSERS_PATH}"; \
     export HOME=/root; \
-    curl -fsSL "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_GIT_REF}/scripts/install.sh" \
-        | bash -s -- --branch "${HERMES_GIT_REF}" --hermes-home "${HERMES_HOME}" --skip-setup; \
+    echo '85ef536d455e51ab67aa74d79272efd49fe717597dbaadfd3cca179a905f4706  /tmp/hermes-install.sh' | sha256sum -c -; \
+    bash /tmp/hermes-install.sh --branch "${HERMES_GIT_REF}" --hermes-home "${HERMES_HOME}" --skip-setup; \
+    rm -f /tmp/hermes-install.sh; \
     test "$(git -C /usr/local/lib/hermes-agent rev-parse HEAD)" = "${HERMES_GIT_COMMIT}"; \
     /usr/local/lib/hermes-agent/venv/bin/python -m ensurepip --upgrade; \
     /usr/local/lib/hermes-agent/venv/bin/python -m pip install --no-cache-dir "hermes-agent[dingtalk,messaging,matrix,pty,web,wecom]==${HERMES_VERSION}"; \
@@ -107,10 +121,13 @@ RUN set -eux; \
 COPY hermes/patches/hermes-agent/apply_team_completion_stop.py /tmp/apply_team_completion_stop.py
 COPY hermes/patches/hermes-agent/apply_managed_model_catalog.py hermes/patches/hermes-agent/managed_model_catalog.py /tmp/model-catalog-patch/
 RUN /usr/local/lib/hermes-agent/venv/bin/python /tmp/model-catalog-patch/apply_managed_model_catalog.py /usr/local/lib/hermes-agent
+COPY hermes/patches/hermes-agent/apply_team_context_reader.py /tmp/apply_team_context_reader.py
 
 RUN set -eux; \
     /usr/local/lib/hermes-agent/venv/bin/python /tmp/apply_team_completion_stop.py \
         /usr/local/lib/hermes-agent/agent/conversation_loop.py; \
+    /usr/local/lib/hermes-agent/venv/bin/python /tmp/apply_team_context_reader.py \
+        /usr/local/lib/hermes-agent/gateway/run.py; \
     cd /usr/local/lib/hermes-agent; \
     hermes desktop --build-only; \
     test -d /usr/local/lib/hermes-agent/apps/desktop/release; \

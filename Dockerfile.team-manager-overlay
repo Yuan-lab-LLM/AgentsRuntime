@@ -1,0 +1,9 @@
+# Keep each immutable native Lite payload; update its trusted sandbox manager.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG RUNTIME_TYPE
+ARG VCS_REF
+COPY --chmod=755 --from=manager-binaries /${RUNTIME_TYPE}-agent /usr/local/bin/clawmanager-agent
+COPY --chmod=755 --from=manager-binaries /${RUNTIME_TYPE}-agent /usr/local/libexec/clawmanager-agent-image
+RUN if [ "$RUNTIME_TYPE" = hermes ]; then python3 /usr/local/share/hermes-lite/verify_lite_release.py --lock /usr/local/share/hermes-lite/source-lock.json --generate-release --verify-release; fi
+LABEL org.opencontainers.image.revision=$VCS_REF

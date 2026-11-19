@@ -21,3 +21,5 @@ hermes/patches/hermes-agent/apply_team_completion_stop.py text eol=lf
 hermes/tests/*lite*.py text eol=lf
 hermes/hermes-lite.lock.json text eol=lf
 hermes/Dockerfile.lite* text eol=lf
+
+opencode/scripts/opencode-lite-entrypoint text eol=lf

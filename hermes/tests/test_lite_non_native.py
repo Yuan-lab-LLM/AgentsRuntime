@@ -6,8 +6,9 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import sys
 import threading
-from types import SimpleNamespace
+from types import SimpleNamespace, ModuleType
 import unittest
 from unittest.mock import patch
 from urllib.parse import urlencode
@@ -51,6 +52,9 @@ class NonNativePolicyTests(unittest.TestCase):
                 result = guarded(name, {"password": "private-do-not-reflect"})
                 self.assertEqual({"error": "unsupported_native_desktop_tool"}, json.loads(result))
                 self.assertNotIn("private", result)
+                alias = guarded("tool_call", {"name": name, "arguments": {"private": "do-not-reflect"}})
+                self.assertEqual({"error": "unsupported_native_desktop_tool"}, json.loads(alias))
+                self.assertNotIn("private", alias)
 
     def test_terminal_and_clarify_keep_real_arguments(self):
         called = []
@@ -273,11 +277,69 @@ class RPCPolicyTests(unittest.TestCase):
 
 
 class HydrationLifecycleTests(unittest.TestCase):
+    def test_actual_rpc_model_catalog_reads_each_env_file_once_per_request(self):
+        root = Path(os.environ.get("HERMES_LITE_TEST_PATCHED_ROOT", "/opt/hermes-agent"))
+        source = root / "tui_gateway/methods_complete.py"
+        if not source.is_file():
+            self.skipTest("requires installed candidate or HERMES_LITE_TEST_PATCHED_ROOT")
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        handler = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                       and any(isinstance(d, ast.Call) and isinstance(d.func, ast.Name)
+                               and d.func.id == "method" and d.args and isinstance(d.args[0], ast.Constant)
+                               and d.args[0].value == "model.options" for d in node.decorator_list))
+        handler.decorator_list = []
+        guard = module("lite_rpc_catalog_test", PATCHES / "lite_environment.py")
+        reads = []
+        @guard.secret_file
+        def read(path):
+            reads.append(path)
+            return {"PLUGIN_KEY": "fixture"}
+        def context(_agent):
+            read("profile.env")
+            return "context"
+        def build(ctx, **_kwargs):
+            self.assertEqual("context", ctx)
+            for _ in range(100):
+                read("profile.env")
+            return {"providers": [{"models": ["fixture"]}]}
+        package, inventory = ModuleType("hermes_cli"), ModuleType("hermes_cli.inventory")
+        package.lite_environment = guard
+        inventory.build_model_options_payload = build
+        ns = {"_model_skew_err": lambda _: None, "_ok": lambda _id, value: value,
+              "_model_picker_context": context, "_session_agent": lambda _: None}
+        exec(compile(ast.Module(body=[handler], type_ignores=[]), str(source), "exec"), ns)
+        with patch.dict(sys.modules, {"hermes_cli": package, "hermes_cli.inventory": inventory}):
+            ns["_"](1, {"explicit_only": True})
+            self.assertEqual(["profile.env"], reads)
+            ns["_"](2, {"explicit_only": True})
+            self.assertEqual(["profile.env", "profile.env"], reads)
+
+    def test_actual_claim_checks_parked_duplicates_within_the_selected_profile(self):
+        source = Path(os.environ.get("HERMES_LITE_TEST_PATCHED_ROOT", "/opt/hermes-agent")) / "tui_gateway/session_registry.py"
+        if not source.is_file():
+            self.skipTest("requires the pinned patched Hermes source")
+        names = {"_claim_or_reuse_live", "_find_live_session_by_key", "_live_profile_matches"}
+        functions = [n for n in ast.parse(source.read_text()).body if isinstance(n, ast.FunctionDef) and n.name in names]
+        self.assertEqual(names, {n.name for n in functions})
+        safe = {"session_key": "stored", "profile_home": "/profile-a", "agent": policy.seal_agent(agent())}
+        unsafe = {"session_key": "stored", "profile_home": "/profile-a", "agent": agent(("read_terminal",), ("desktop_ui",))}
+        sessions = {"winner": safe, "parked": unsafe}
+        ns = {"_ANY_PROFILE": object(), "_sessions": sessions, "_lite_non_native": policy,
+              "_session_resume_lock": threading.Lock(), "_sessions_lock": threading.RLock(),
+              "_session_lookup_key": lambda session, **kw: session["session_key"]}
+        exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), ns)
+        record = {"profile_home": "/profile-a"}
+        with self.assertRaises(policy.NonNativeSessionError):
+            ns["_claim_or_reuse_live"]("new", "stored", record, None)
+        self.assertEqual({"winner": safe, "parked": unsafe}, sessions)
+        unsafe["profile_home"] = "/profile-b"
+        self.assertEqual(("winner", safe), ns["_claim_or_reuse_live"]("new", "stored", record, None))
+
     def test_actual_hydration_failure_cannot_remove_configured_session(self):
         # Use the actual built/installed handler, not a rewritten lookalike.
         # Host integration runs point this at the exact patched upstream tree.
         source_root = Path(os.environ.get("HERMES_LITE_TEST_PATCHED_ROOT", "/opt/hermes-agent"))
-        source_file = source_root / "tui_gateway/server.py"
+        source_file = source_root / "tui_gateway/session_registry.py"
         if not source_file.is_file():
             self.skipTest("requires installed candidate or HERMES_LITE_TEST_PATCHED_ROOT")
         tree = ast.parse(source_file.read_text(encoding="utf-8"))
@@ -320,6 +382,9 @@ class HydrationLifecycleTests(unittest.TestCase):
                      "current_transport": lambda: None, "_stdio_transport": object(),
                      "_err": lambda rid, code, message: {"error": {"code": code}},
                      "sanitize_replay_history": lambda value: value, "_todo_state_from_history": lambda _: None,
+                     "canonicalize_replay_history": lambda value: value,
+                     "_load_resume_transcript": lambda *_args, **_kwargs: ([], [], []),
+                     "resume_failed_message": lambda _error: "controlled hydration failure",
                      "_start_agent_build": lambda *_: None, "_maybe_schedule_auto_continue": late_failure,
                      "_emit": emit, "entered": entered, "failed": failed, "popped": popped}
         exec(compile(ast.Module(body=[hydration], type_ignores=[]), str(source_file), "exec"), namespace)
@@ -344,6 +409,109 @@ class HydrationLifecycleTests(unittest.TestCase):
         self.assertTrue(popped.is_set(), "failed hydration did not release its record after config")
 
 
+class BackgroundTurnLifecycleTests(unittest.TestCase):
+    """Execute the real patched orphan lifecycle without model/network dependencies."""
+    def setUp(self):
+        root = Path(os.environ.get("HERMES_LITE_TEST_PATCHED_ROOT", "/opt/hermes-agent"))
+        source = root / "tui_gateway/session_lifecycle.py"
+        if not source.is_file():
+            self.skipTest("requires the pinned patched Hermes source")
+        names = {"_ws_session_is_detached", "_schedule_ws_orphan_reap", "_cancel_ws_orphan_reap",
+                 "_close_sessions_for_transport", "_rebind_live_transport", "_live_session_payload"}
+        functions = [n for path in (source, root / "tui_gateway/session_registry.py")
+                     for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name in names]
+        self.assertEqual(names, {n.name for n in functions})
+        timers = self.timers = []
+        class Timer:
+            def __init__(self, delay, callback):
+                self.delay, self.callback, self.cancelled = delay, callback, False
+                timers.append(self)
+            def start(self):
+                pass
+            def cancel(self):
+                self.cancelled = True
+        self.transport = object()
+        self.agent = policy.seal_agent(agent())
+        self.session = {"agent": self.agent, "transport": self.transport, "running": True,
+                        "history_lock": threading.RLock(), "history": [{"role": "user", "content": "work"}],
+                        "inflight_turn": {"started_at": 1.0}, "session_key": "stored", "source": "web"}
+        self.interrupted, self.closed = [], []
+        sessions = {"s": self.session}
+        self.ns = {"threading": SimpleNamespace(Timer=Timer), "time": __import__("time"), "Transport": object,
+                   "_lite_non_native": policy, "_sessions": sessions, "_sessions_lock": threading.RLock(),
+                   "_session_resume_lock": threading.Lock(), "_detached_ws_transport": object(),
+                   "contextlib": __import__("contextlib"), "_session_transport_lock": threading.Lock(),
+                   "_detach_transport_from_sessions": lambda _: list(sessions.items()),
+                   "_session_has_live_transport": lambda *args, **kw: False,
+                   "_attach_session_transport": lambda s, t: s.update(transport=t),
+                   "_WS_ORPHAN_REAP_GRACE_S": 20, "_WS_ORPHAN_REAP_SLEEP_SLACK_S": 2,
+                   "_WS_ORPHAN_INTERRUPT_REAP_POLL_S": 1,
+                   "_session_owns_live_wakeup_schedule": lambda _: False,
+                   "_session_owns_pending_process_notification": lambda _: False,
+                   "_ws_orphan_turn_activity_is_fresh": lambda _: False,
+                   "_WS_ORPHAN_INTERRUPT_REAP_MAX_POLLS": 60, "_pending_ws_reaps": {},
+                   "_session_has_active_delegations": lambda *_: False,
+                   "_pop_session_by_id": lambda sid: sessions.pop(sid, None),
+                   "_interrupt_session_turn": lambda *args, **kw: self.interrupted.append(args),
+                   "_teardown_popped_session": lambda session, **kw: self.closed.append(session),
+                   "_transport_is_dead": lambda _: False,
+                   "logger": SimpleNamespace(info=lambda *_: None, error=lambda *_: None, exception=lambda *_: None),
+                   "_inflight_snapshot": lambda _: {"assistant": "partial progress"},
+                   "_queued_prompt_snapshot": lambda _: None, "_fallback_session_info": lambda _: {},
+                   "_session_lookup_key": lambda session, **kw: session["session_key"],
+                   "_session_live_status": lambda *_: "running", "_pending_approval_request_payload": lambda _: None,
+                   "_pending_clarify_request_payload": lambda _: None, "_attach_todo_state": lambda payload, _: payload,
+                   "_turn_started_at": lambda _: 1.0, "_open_requests": lambda _: None,
+                   "_pending_connection_request_payload": lambda _: None}
+        exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), self.ns)
+
+    def test_leaving_keeps_turn_alive_then_reentry_restores_progress(self):
+        self.assertEqual((0, 1), self.ns["_close_sessions_for_transport"](self.transport))
+        for _ in range(65):  # Also exceed the former forced-interrupt polling budget.
+            self.timers[-1].callback()
+        self.assertEqual([], self.interrupted, "navigation must not act as a user interrupt")
+        self.assertEqual([], self.closed)
+        self.assertIs(self.session, self.ns["_sessions"]["s"])
+        pending = self.timers[-1]
+        replacement = object()
+        payload = self.ns["_live_session_payload"]("s", self.session, transport=replacement, omit_messages=True)
+        self.assertTrue(pending.cancelled)
+        self.assertIs(self.agent, self.session["agent"])
+        self.assertIs(replacement, self.session["transport"])
+        self.assertTrue(payload["running"])
+        self.assertEqual({"assistant": "partial progress"}, payload["inflight"])
+        self.assertEqual(1, payload["message_count"])
+
+    def test_detached_completed_turn_is_still_reaped(self):
+        self.ns["_close_sessions_for_transport"](self.transport)
+        self.timers[-1].callback()
+        self.assertEqual([], self.interrupted)
+        self.session["running"] = False  # Normal model/turn finalization owns completion.
+        self.timers[-1].callback()
+        self.assertEqual([], self.interrupted)
+        self.assertEqual([self.session], self.closed)
+        self.assertNotIn("s", self.ns["_sessions"])
+
+
+    def test_queued_turn_survives_the_completion_to_dispatch_handoff(self):
+        self.ns["_close_sessions_for_transport"](self.transport)
+        self.session["running"] = False
+        for key in ("queued_prompt", "queued_prompts"):
+            with self.subTest(key=key):
+                self.session[key] = {"text": "accepted next turn"} if key == "queued_prompt" else [{"text": "accepted next turn"}]
+                self.timers[-1].callback()
+                self.assertIs(self.session, self.ns["_sessions"].get("s"))
+                self.assertEqual([], self.closed)
+                self.session.pop(key)
+
+    def test_non_lite_disconnect_policy_remains_unchanged(self):
+        self.ns["_close_sessions_for_transport"](self.transport)
+        with patch.object(policy, "ENABLED", False):
+            self.timers[-1].callback()
+        self.assertEqual(1, len(self.interrupted))
+
+
+
 class PatchIntegrityTests(unittest.TestCase):
     def test_sha_mismatch_is_rejected_before_writing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -364,6 +532,55 @@ class PatchIntegrityTests(unittest.TestCase):
 
 
 class DeploymentEnvironmentTests(unittest.TestCase):
+    def test_catalog_snapshot_is_request_local_and_preserves_seals(self):
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "managed-fixture"}, clear=True):
+            guard = module("lite_catalog_env_test", PATCHES / "lite_environment.py")
+            reads = []
+            value = {"USER_PLUGIN_KEY": "first", "OPENAI_API_KEY": "forged"}
+            @guard.secret_file
+            def read(path):
+                reads.append(path)
+                return dict(value)
+            @guard.env_read_request
+            def catalog():
+                calls = []
+                def load():
+                    calls.append(True)
+                    return {"actual": len(calls)}
+                self.assertEqual(guard.catalog_value("gateway-config", load), guard.catalog_value("gateway-config", load))
+                self.assertEqual(1, len(calls))
+                first = read("a.env")
+                first["USER_PLUGIN_KEY"] = "caller mutation"
+                value["USER_PLUGIN_KEY"] = "second"
+                self.assertEqual("first", read("a.env")["USER_PLUGIN_KEY"])
+                self.assertEqual("second", read("b.env")["USER_PLUGIN_KEY"])
+                self.assertEqual("managed-fixture", read("a.env")["OPENAI_API_KEY"])
+            catalog()
+            self.assertEqual(["a.env", "b.env"], reads)
+            self.assertEqual("second", read("a.env")["USER_PLUGIN_KEY"])
+            @guard.env_read_request
+            def failed():
+                read("a.env")
+                raise RuntimeError("fixture")
+            with self.assertRaises(RuntimeError):
+                failed()
+            value["USER_PLUGIN_KEY"] = "third"
+            self.assertEqual("third", read("a.env")["USER_PLUGIN_KEY"])
+
+    def test_profile_files_and_scopes_cannot_replace_instance_credentials(self):
+        with patch.dict(os.environ, {"HOME": "/fixture/home", "OPENAI_API_KEY": "instance-fixture-only"}, clear=True):
+            guard = module("lite_secret_scope_test", PATCHES / "lite_environment.py")
+            user = {"HOME": "/foreign", "OPENAI_API_KEY": "workspace-override", "CLAWMANAGER_FORGED": "bad", "USER_PLUGIN_KEY": "retained"}
+            parsed = guard.secret_file(lambda: user)()
+            self.assertEqual("instance-fixture-only", parsed["OPENAI_API_KEY"])
+            self.assertEqual("/fixture/home", parsed["HOME"])
+            self.assertNotIn("CLAWMANAGER_FORGED", parsed)
+            scoped = guard.secret_scope(user, lambda key: key == "HOME")
+            self.assertEqual({"OPENAI_API_KEY": "instance-fixture-only", "USER_PLUGIN_KEY": "retained",
+                              "CLAWMANAGER_HERMES_DESKTOP_WEB_ENABLED": "true"}, scoped)
+            self.assertEqual("instance-fixture-only", guard.managed_value("OPENAI_API_KEY"))
+            self.assertIsNone(guard.managed_value("CLAWMANAGER_FORGED"))
+
     def test_workspace_cannot_change_or_create_managed_keys(self):
         initial = {"HOME": "/fixture/home", "HERMES_HOME": "/fixture/home/.hermes", "PORT": "20001",
                    "CLAWMANAGER_CONTROL_UI_ORIGIN": "https://internal.example",

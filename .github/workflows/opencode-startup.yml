@@ -4,12 +4,12 @@ on:
   push:
     paths:
       - 'opencode/**'
-      - 'clawmanager-agent/internal/runtime/opencode/**'
+      - 'opencode/lite/**'
       - '.github/workflows/opencode-startup.yml'
   pull_request:
     paths:
       - 'opencode/**'
-      - 'clawmanager-agent/internal/runtime/opencode/**'
+      - 'opencode/lite/**'
       - '.github/workflows/opencode-startup.yml'
   workflow_dispatch:
 
