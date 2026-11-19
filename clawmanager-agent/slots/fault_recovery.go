@@ -157,6 +157,10 @@ func (w *Worker) serveFaultRecovery(out http.ResponseWriter, r *http.Request, re
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.book.PendingReset != nil {
+		http.Error(out, "physical slot reset awaiting release", 409)
+		return
+	}
 	if release && w.savedFaultRelease(proof) && proof.CurrentWorkerEpoch == w.workerEpoch && (w.book.faultFinalized() || w.book.Assignment == nil || w.book.Assignment.WorkerEpoch != proof.WorkerEpoch || w.book.Digest != proof.AssignmentDigest) {
 		var s faultRecoveryScope
 		var receipt faultRecoveryReceipt

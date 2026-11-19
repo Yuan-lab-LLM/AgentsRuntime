@@ -9,6 +9,24 @@ COPY opencode /src/opencode
 WORKDIR /src/opencode
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/clawmanager-agent ./cmd/opencode-lite-agent
 FROM ${BASE_IMAGE}
+ARG BASE_IMAGE
+ARG OPENCODE_BINARY_SHA256
+# Native preservation deliberately supports an agent-only update of this exact
+# native payload. CM verifies the immutable source/base chain before mutation.
+LABEL io.clawmanager.runtime.type="opencode" \
+      io.clawmanager.opencode.version="1.18.13" \
+      io.clawmanager.opencode.revision="a105350812f05f914c768e468559dbd6bd508d8e" \
+      io.clawmanager.opencode.binary-sha256="${OPENCODE_BINARY_SHA256}" \
+      io.clawmanager.opencode.journal-sha256="2ef42ffb09410c0f91535d25fce5b4107c46ee3fd7a4725e521c197ad4f5949c" \
+      io.clawmanager.opencode.base-image="${BASE_IMAGE}" \
+      io.clawmanager.upgrade.strategy="opencode-native-preserve-v1" \
+      io.clawmanager.upgrade.protocol="opencode-preserve-v1"
+COPY opencode/lite/upgrade_attestation.json /usr/local/share/clawmanager/opencode-native-preserve-attestation.json
+RUN test "${BASE_IMAGE}" = 'clawmanager.local/opencode-lite@sha256:7ba6888e43480496704a10d9a496b1398863515166acab5c544ccc9c9d91ed31' \
+ && test "${OPENCODE_BINARY_SHA256}" = 'bcebc898d22419417b8dbec0f5e3f00f5b67b5a38c1de37c77c699d0e31fe0dd' \
+ && echo "${OPENCODE_BINARY_SHA256}  /usr/local/bin/opencode" | sha256sum -c - \
+ && /usr/local/bin/opencode --version | grep -Fx '1.18.13'
+ENV CLAWMANAGER_OPENCODE_UPGRADE_PROTOCOL=opencode-preserve-v1
 # Older overlay bases can predate isolated networking. Match Dockerfile.lite's
 # fixed tool paths before advertising any container slot as ready.
 RUN if [ ! -x /usr/sbin/ip ] || [ ! -x /usr/sbin/nft ]; then \

@@ -335,10 +335,15 @@ func NewControlHandler(cfg gateway.Config, manager *gateway.GatewayManager, repo
 			return
 		}
 		var req struct {
-			RolloutID string `json:"rollout_id"`
+			RolloutID      string `json:"rollout_id"`
+			ExpectedPodUID string `json:"expected_pod_uid,omitempty"`
 		}
 		if err := decodeRequiredJSON(r, &req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := gateway.ValidateUpgradePodIdentity(cfg, gateway.WorkspaceUpgradeRequest{ExpectedPodUID: req.ExpectedPodUID}); err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
 			return
 		}
 		if err := manager.ActivateUpgrade(req.RolloutID); err != nil {

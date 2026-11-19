@@ -21,6 +21,7 @@ import (
 var safeUpgradeID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 
 type WorkspaceUpgradeRequest struct {
+	ExpectedPodUID          string `json:"expected_pod_uid,omitempty"`
 	RolloutID               string `json:"rollout_id"`
 	SnapshotID              string `json:"snapshot_id,omitempty"`
 	InstanceID              int    `json:"instance_id"`
@@ -71,6 +72,8 @@ type SessionSQLiteRestoreResult struct {
 }
 
 type UpgradeCompatibilityResult struct {
+	RolloutID               string    `json:"rollout_id,omitempty"`
+	Generation              int       `json:"generation,omitempty"`
 	ManagedPluginPlanSHA256 string    `json:"managed_plugin_plan_sha256,omitempty"`
 	InstanceID              int       `json:"instance_id"`
 	Status                  string    `json:"status"`
@@ -146,6 +149,9 @@ type WriterLease struct {
 }
 
 func (m *GatewayManager) workspaceForUpgrade(req WorkspaceUpgradeRequest) (string, error) {
+	if err := ValidateUpgradePodIdentity(m.cfg, req); err != nil {
+		return "", err
+	}
 	if req.UserID <= 0 || req.InstanceID <= 0 || req.Generation <= 0 {
 		return "", fmt.Errorf("%w: positive user, instance and generation are required", ErrWorkspacePath)
 	}
@@ -270,6 +276,9 @@ func (m *GatewayManager) readWriterLease(instanceID int) (WriterLease, error) {
 }
 
 func (m *GatewayManager) requireWriterLease(req WorkspaceUpgradeRequest) (WriterLease, error) {
+	if err := ValidateUpgradePodIdentity(m.cfg, req); err != nil {
+		return WriterLease{}, err
+	}
 	lease, err := m.readWriterLease(req.InstanceID)
 	if err != nil {
 		return lease, fmt.Errorf("read writer lease: %w", err)
@@ -303,6 +312,9 @@ func (m *GatewayManager) RenewWriterLease(req WorkspaceUpgradeRequest, ttl time.
 }
 
 func (m *GatewayManager) ReleaseWriterLease(req WorkspaceUpgradeRequest) error {
+	if err := ValidateUpgradePodIdentity(m.cfg, req); err != nil {
+		return err
+	}
 	unlock, lockErr := m.lockUpgradeOperation(req.InstanceID)
 	if lockErr != nil {
 		return lockErr

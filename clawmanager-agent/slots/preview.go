@@ -53,7 +53,7 @@ func (w *Worker) serveWorkbenchPreview(out http.ResponseWriter, r *http.Request)
 	}
 	req := route.Scope()
 	w.mu.Lock()
-	if w.book == nil || w.book.quarantined || w.book.StopIntent != nil || w.book.Maintenance != nil || !matchesWorkbench(w.book.Assignment, req) {
+	if !w.admitsWorkbench(req) {
 		w.mu.Unlock()
 		workbenchError(out, gateway.ErrStaleGeneration)
 		return

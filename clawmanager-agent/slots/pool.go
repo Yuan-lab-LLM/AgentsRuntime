@@ -35,6 +35,7 @@ type Assignment struct {
 }
 
 type Snapshot struct {
+	NFSWriterOwned         bool                       `json:"nfs_writer_owned,omitempty"`
 	PodUID                 string                     `json:"pod_uid,omitempty"`
 	IdleConfirmed          bool                       `json:"idle_confirmed"`
 	MaintenanceOperationID string                     `json:"maintenance_operation_id,omitempty"`
@@ -172,7 +173,12 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.forward(w, copyReq, index, nil)
 			return
 		}
-		if (parts[1] == "reconcile-stop" || parts[1] == "release-stop" || parts[1] == "reconcile-fault-stop" || parts[1] == "release-fault-stop") && r.Method == http.MethodPost {
+		physicalReset := parts[1] == "reconcile-reset" || parts[1] == "release-reset"
+		if physicalReset && parts[0] != fmt.Sprintf("slot-%d", index) {
+			http.Error(w, "invalid physical slot name", 400)
+			return
+		}
+		if (parts[1] == "reconcile-stop" || parts[1] == "release-stop" || parts[1] == "reconcile-fault-stop" || parts[1] == "release-fault-stop" || physicalReset) && r.Method == http.MethodPost {
 			body, err := io.ReadAll(io.LimitReader(r.Body, 16385))
 			if err != nil || len(body) > 16384 {
 				http.Error(w, "invalid reconciliation", 400)
@@ -255,6 +261,17 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/v1/openclaw/upgrade/activate" {
 		if r.Method == http.MethodGet {
 			p.forward(w, r, 0, body)
+			return
+		}
+		var target struct {
+			ExpectedPodUID string `json:"expected_pod_uid,omitempty"`
+		}
+		if json.Unmarshal(body, &target) != nil {
+			http.Error(w, "invalid upgrade activation", 400)
+			return
+		}
+		if err := gateway.ValidateUpgradePodIdentity(p.cfg, gateway.WorkspaceUpgradeRequest{ExpectedPodUID: target.ExpectedPodUID}); err != nil {
+			http.Error(w, err.Error(), 409)
 			return
 		}
 		if p.broadcast(w, r, body) {
@@ -347,6 +364,17 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// translate this operation to the forceful manual stop protocol.
 		p.forward(w, r, selected, body)
 		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/v1/openclaw/writer-leases/") {
+		var req gateway.WorkspaceUpgradeRequest
+		if json.Unmarshal(body, &req) != nil {
+			http.Error(w, "invalid writer lease request", http.StatusBadRequest)
+			return
+		}
+		if err := gateway.ValidateUpgradePodIdentity(p.cfg, req); err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
 	}
 	snapshots, _ := p.snapshots(r.Context())
 	if strings.HasPrefix(r.URL.Path, "/v1/gateways/") {

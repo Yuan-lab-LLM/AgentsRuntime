@@ -67,6 +67,9 @@ func prepareNativeUpgradeCapsules(cfg gateway.Config, op gateway.NativeUpgradeOp
 // ExecuteNativeUpgrade returns a staged result only. The worker must persist it
 // and reset its container; the coordinator publishes it after termination proof.
 func ExecuteNativeUpgrade(ctx context.Context, cfg gateway.Config, op gateway.NativeUpgradeOperation, verify func(context.Context) error) (json.RawMessage, error) {
+	if err := gateway.ValidateUpgradePodIdentity(cfg, op.Request); err != nil {
+		return nil, err
+	}
 	if cfg.SandboxProfile != "nfs-rootless-v1" || cfg.NetworkSecurityProfile != "isolated-network-v1" || cfg.Runtime == nil || verify == nil {
 		return nil, fmt.Errorf("native maintenance execution unavailable")
 	}
@@ -101,7 +104,14 @@ func ExecuteNativeUpgrade(ctx context.Context, cfg gateway.Config, op gateway.Na
 	for _, mount := range mounts {
 		privatePaths = append(privatePaths, mount.Source)
 	}
-	if err := runPrivateStorageAudit(r.UID, r.GID, privatePaths, false); err != nil {
+	var parentProof *gateway.NativeUpgradeParentProof
+	if cfg.RuntimeType == "opencode" {
+		roots, auditErr := runPrivateStorageAuditProof(r.UID, r.GID, privatePaths, false)
+		if auditErr != nil {
+			return nil, auditErr
+		}
+		parentProof = &gateway.NativeUpgradeParentProof{ActorUID: r.UID, ActorGID: r.GID, Roots: roots}
+	} else if err := runPrivateStorageAudit(r.UID, r.GID, privatePaths, false); err != nil {
 		return nil, err
 	}
 	executable, err := os.Executable()
@@ -161,7 +171,7 @@ func ExecuteNativeUpgrade(ctx context.Context, cfg gateway.Config, op gateway.Na
 		return nil, fmt.Errorf("%w: %v: %s", gateway.ErrNativeStorageUncertain, err, detail)
 	}
 	encoder := json.NewEncoder(input)
-	if err = encoder.Encode(gateway.NativeUpgradeHelperRequest{Config: gateway.NativeConfig(cfg), Operation: op.Child()}); err != nil {
+	if err = encoder.Encode(gateway.NativeUpgradeHelperRequest{Config: gateway.NativeConfig(cfg), Operation: op.Child(), ParentProof: parentProof}); err != nil {
 		cancel()
 		<-waited
 		return nil, errors.Join(gateway.ErrNativeStorageUncertain, err)

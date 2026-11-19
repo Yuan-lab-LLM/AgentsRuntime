@@ -1,0 +1,31 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+const root=await fs.mkdtemp(path.join(os.tmpdir(),'team-durable-'));
+process.env.XDG_STATE_HOME=root;
+const source=(await fs.readFile(new URL('../dist/index.js',import.meta.url),'utf8')).replace('import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";','const definePluginEntry = x => x;');
+assert.ok(source.includes("function terminalJournal("),"durable terminal journal must exist before dispatch");
+const p=await import(`data:text/javascript;base64,${Buffer.from(source+'\nexport { terminalJournal, RedisClient, startConsumer };').toString('base64')}`);
+const cfg={teamId:'durable',memberId:'worker',sharedDir:path.join(root,'shared'),redisUrl:process.env.REDIS_TEAM_TEST_URL,consumerGroup:'durable'};
+const envelope={messageId:'m1',taskId:'t1',assignmentId:'a1',idempotencyKey:'m1'};
+try {
+ const j=p.terminalJournal(cfg,{global:2,team:2,member:1});
+ assert.equal((await j.admit(envelope)).state,'admitted');
+ await j.started(envelope);
+ assert.equal((await p.terminalJournal(cfg).read(envelope)).state,'started','restart retains uncertain execution');
+ await assert.rejects(j.admit({...envelope,messageId:'m2',idempotencyKey:'m2'}),/capacity/i);
+ const event={event:'completion_proposed',eventId:'evt1',completionId:'c1',attemptId:'a1',resultMarkdown:'actual completed work'};
+ await j.stage(envelope,event);
+ let calls=0;
+ await assert.rejects(j.flush({async command(){calls++;throw Error('OOM command not allowed')}}));
+ assert.equal((await j.read(envelope)).publications[0].event.resultMarkdown,event.resultMarkdown);
+ const seen=[];const redis={async command(...args){if(args[0]==='GET')return null;seen.push(args);return [1,'1-0'];}};
+ await p.terminalJournal(cfg).flush(redis);
+ await p.terminalJournal(cfg).flush(redis);
+ assert.equal(seen.length,1);assert.equal(seen[0][0],'EVAL');
+ assert.equal((await j.read(envelope)).publications[0].event.attemptId,'a1');
+ await j.accepted(envelope);
+ assert.equal((await p.terminalJournal(cfg).admit(envelope)).state,'accepted');
+ console.log('PASS durable terminal admission, quota, OOM, restart, immutable replay and accepted tombstone');
+} finally {await fs.rm(root,{recursive:true,force:true});}

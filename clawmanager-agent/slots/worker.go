@@ -120,7 +120,7 @@ func (w *Worker) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/v1/slot-state" && r.Method == http.MethodGet {
 		w.mu.Lock()
 		defer w.mu.Unlock()
-		snapshot := Snapshot{PodUID: w.cfg.PodUID, IdleConfirmed: w.idleConfirmed(), WorkerEpoch: w.workerEpoch, Digest: w.book.Digest, Gateways: w.manager.GatewayStates(), Assignment: w.book.Assignment, Quarantined: w.book.quarantined || w.book.StopIntent != nil && w.book.Assignment != nil && w.book.Assignment.State != "stopped" || w.manager.Health() != nil || w.network.unavailable()}
+		snapshot := Snapshot{NFSWriterOwned: w.currentNFSWriter(), PodUID: w.cfg.PodUID, IdleConfirmed: w.idleConfirmed(), WorkerEpoch: w.workerEpoch, Digest: w.book.Digest, Gateways: w.manager.GatewayStates(), Assignment: w.book.Assignment, Quarantined: w.book.quarantined || w.book.StopIntent != nil && w.book.Assignment != nil && w.book.Assignment.State != "stopped" || w.manager.Health() != nil || w.network.unavailable()}
 		if w.book.Maintenance != nil {
 			snapshot.MaintenanceOperationID = w.book.Maintenance.OperationID
 		}
@@ -133,6 +133,10 @@ func (w *Worker) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	}
 	if w.cfg.SandboxProfile == "nfs-rootless-v1" && r.URL.Path == "/v1/native-maintenance/reconcile" {
 		w.serveNativeMaintenanceReconcile(out, r)
+		return
+	}
+	if w.cfg.SandboxProfile == "nfs-rootless-v1" && (r.URL.Path == "/v1/reconcile-reset" || r.URL.Path == "/v1/release-reset") && r.Method == http.MethodPost {
+		w.serveSlotReset(out, r, r.URL.Path == "/v1/release-reset")
 		return
 	}
 	if w.cfg.SandboxProfile == "nfs-rootless-v1" && (r.URL.Path == "/v1/reconcile-fault-stop" || r.URL.Path == "/v1/release-fault-stop") && r.Method == http.MethodPost {
