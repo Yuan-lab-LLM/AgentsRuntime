@@ -44,6 +44,8 @@ COPY --from=agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agen
 COPY --chmod=755 --from=native-team-builder /out/opencode /usr/local/bin/opencode
 COPY --from=native-team-builder /out/governance-manifest.json /usr/local/share/clawmanager/opencode-governance-manifest.json
 RUN opencode --version | grep -Fx "opencode v${OPENCODE_VERSION}"
+RUN --network=none --mount=type=bind,source=opencode/model-governance/check-native-web.sh,target=/tmp/check-native-web.sh \
+    sh /tmp/check-native-web.sh
 ENV CLAWMANAGER_MODEL_GOVERNANCE_PROTOCOL=1 CLAWMANAGER_REDIS_TEAM_PLUGIN_VERSION=opencode-team-v1
 COPY opencode/rootfs/usr/local/bin/start-opencode-web /usr/local/bin/start-opencode-web
 COPY opencode/scripts/opencode-lite-entrypoint /usr/local/bin/opencode-lite-entrypoint

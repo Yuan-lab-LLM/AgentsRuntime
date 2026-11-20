@@ -10,9 +10,65 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestTeamRedisUpstreamLossAllowsNewConnectionWithoutReplay(t *testing.T) {
+	var calls atomic.Int32
+	backend := brokerBackend(t, func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(503)
+			return
+		}
+		c, buffered, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		buffered.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: clawmanager-redis\r\n\r\n+READY\r\n")
+		buffered.Flush()
+		io.Copy(c, buffered.Reader)
+	})
+	b := brokerForTest(t, backend.URL, backend.URL)
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- b.ServeTeamRedis(ctx, l) }()
+	first, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.SetDeadline(time.Now().Add(time.Second))
+	if _, err = bufio.NewReader(first).ReadByte(); err == nil {
+		t.Fatal("failed upstream looked ready")
+	}
+	first.Close()
+	second, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal("listener died on one upstream failure", err)
+	}
+	defer second.Close()
+	second.SetDeadline(time.Now().Add(time.Second))
+	reader := bufio.NewReader(second)
+	if line, err := reader.ReadString('\n'); err != nil || line != "+READY\r\n" {
+		t.Fatal("new bridge failed", line, err)
+	}
+	if calls.Load() != 2 || b.ctx.Err() != nil {
+		t.Fatal("service request replayed or broker canceled", calls.Load())
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("listener did not join")
+	}
+}
 
 func TestManagedServicesFixedRoutesAndServicesAudience(t *testing.T) {
 	seen := make(chan *http.Request, 2)

@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -72,9 +73,7 @@ func (s sandboxStarter) StartGateway(_ context.Context, spec gateway.GatewayStar
 	}
 	policy := &sandboxStopPolicy{}
 	stopNetworkFailure := func() bool { return true }
-	if execution != nil {
-		stopNetworkFailure = context.AfterFunc(execution.ctx, func() { policy.networkFailure(func() { _ = kill() }) })
-	}
+	var networkFailed atomic.Bool
 	startupCtx, cancelStartup := context.WithTimeout(context.Background(), 10*time.Second)
 	startErr := tracker.Started(startupCtx)
 	cancelStartup()
@@ -85,7 +84,6 @@ func (s sandboxStarter) StartGateway(_ context.Context, spec gateway.GatewayStar
 	done := make(chan error, 1)
 	waited := make(chan struct{})
 	var waitErr error
-	go func() { waitErr = cmd.Wait(); stopNetworkFailure(); done <- waitErr; close(done); close(waited) }()
 	var mu sync.Mutex
 	confirmedStop := func(ctx context.Context) error {
 		if err := tracker.WaitStopped(ctx); err != nil {
@@ -227,6 +225,36 @@ func (s sandboxStarter) StartGateway(_ context.Context, spec gateway.GatewayStar
 		}
 		return s.startGatewayTerminal(ctx, spec, options, tracker)
 	}
+	if execution != nil {
+		stopNetworkFailure = context.AfterFunc(execution.ctx, func() {
+			policy.networkFailure(func() {
+				networkFailed.Store(true)
+				// Use the same pinned-primary teardown as an explicit stop. Killing
+				// only bubblewrap can strand native children in a shared PID scope.
+				timeout := s.cfg.ProcessStopTimeout
+				if timeout <= 0 {
+					timeout = 20 * time.Second
+				}
+				stopCtx, cancel := context.WithTimeout(context.Background(), timeout+5*time.Second)
+				defer cancel()
+				if err := process.Stop(stopCtx); err != nil {
+					// A reset requirement is deliberately not execution-stop proof.
+					log.Printf("runtime network teardown unconfirmed: instance_id=%d generation=%d container_reset_required=%t", spec.InstanceID, spec.Generation, errors.Is(err, sandbox.ErrContainerResetRequired))
+				}
+			})
+		})
+	}
+	go func() {
+		waitErr = cmd.Wait()
+		stopNetworkFailure()
+		reported := waitErr
+		if networkFailed.Load() {
+			reported = errors.Join(gateway.ErrNetworkAuthorizationLost, waitErr)
+		}
+		done <- reported
+		close(done)
+		close(waited)
+	}()
 	return process, startErr
 }
 

@@ -20,21 +20,22 @@ import (
 )
 
 type Worker struct {
+	containerPreparation *containerPreparation
 	workerEpoch          string
 	reset                chan struct{}
 	resetReady           bool
-	containerPreparation *containerPreparation
 	network              *networkOwner
 	cfg                  gateway.Config
 	manager              *gateway.GatewayManager
 	handler              http.Handler
-	mu                   sync.Mutex
+	mu                   sync.RWMutex
 	book                 *book
 	lease                *os.File
 	writerPath           string
 	writerRequest        gateway.CreateGatewayRequest
 	slotName             string
 	metrics              *metricsSampler
+	storageHealth        *slotStorageHealth
 }
 
 func NewWorker(cfg gateway.Config) (*Worker, error) {
@@ -49,6 +50,13 @@ func NewWorker(cfg gateway.Config) (*Worker, error) {
 	children := []string{"teams"}
 	if cfg.RuntimeType != "" {
 		children = append(children, cfg.RuntimeType)
+	}
+	var storageHealth *slotStorageHealth
+	if cfg.SandboxProfile == "nfs-rootless-v1" {
+		children = append(children, storageProbeDirectory)
+		root := cfg.WorkspaceRoot
+		storageHealth = &slotStorageHealth{probe: func() error { return probeSlotStorage(root) }}
+		cfg.ManagementStorageHealth = storageHealth.health
 	}
 	if err := prepareWorkerStorage(cfg, children...); err != nil {
 		return nil, fmt.Errorf("prepare trusted runtime workspace: %w", err)
@@ -74,7 +82,7 @@ func NewWorker(cfg gateway.Config) (*Worker, error) {
 	if slot == "" {
 		slot = "0"
 	}
-	worker := &Worker{cfg: cfg, network: network, manager: manager, book: b, slotName: "slot-" + slot, metrics: newMetricsSampler()}
+	worker := &Worker{cfg: cfg, network: network, manager: manager, book: b, slotName: "slot-" + slot, metrics: newMetricsSampler(), storageHealth: storageHealth}
 	worker.workerEpoch, err = newExecutionToken()
 	if err != nil {
 		return nil, err
@@ -118,12 +126,27 @@ func (w *Worker) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/v1/slot-state" && r.Method == http.MethodGet {
-		w.mu.Lock()
-		defer w.mu.Unlock()
-		snapshot := Snapshot{NFSWriterOwned: w.currentNFSWriter(), PodUID: w.cfg.PodUID, IdleConfirmed: w.idleConfirmed(), WorkerEpoch: w.workerEpoch, Digest: w.book.Digest, Gateways: w.manager.GatewayStates(), Assignment: w.book.Assignment, Quarantined: w.book.quarantined || w.book.StopIntent != nil && w.book.Assignment != nil && w.book.Assignment.State != "stopped" || w.manager.Health() != nil || w.network.unavailable()}
+		healthErr := w.manager.Health()
+		if r.Context().Err() != nil || !w.mu.TryRLock() {
+			http.Error(out, "slot state unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		networkIdle, networkUnavailable := w.network.snapshotHealth()
+		snapshot := Snapshot{
+			NFSWriterOwned: w.currentNFSWriter(), PodUID: w.cfg.PodUID, WorkerEpoch: w.workerEpoch, Digest: w.book.Digest,
+			Gateways: w.manager.GatewayStates(), StorageUnavailable: healthErr != nil,
+			IdleConfirmed: healthErr == nil && networkIdle && w.idleConfirmed(),
+			Quarantined:   w.book.quarantined || healthErr != nil || networkUnavailable,
+		}
+		if w.book.Assignment != nil {
+			assignment := *w.book.Assignment
+			snapshot.Assignment = &assignment
+			snapshot.Quarantined = snapshot.Quarantined || (w.book.StopIntent != nil && assignment.State != "stopped")
+		}
 		if w.book.Maintenance != nil {
 			snapshot.MaintenanceOperationID = w.book.Maintenance.OperationID
 		}
+		w.mu.RUnlock()
 		writeJSON(out, 200, snapshot)
 		return
 	}
