@@ -1,6 +1,8 @@
 package hermesimage_test
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -223,12 +225,17 @@ func TestDockerfilePinsHermesAgentVersion(t *testing.T) {
 		t.Fatalf("read Dockerfile: %v", err)
 	}
 	dockerfile := string(data)
+	installer, err := os.ReadFile(filepath.Join("bootstrap", "hermes-agent", "install.sh"))
+	if err != nil {
+		t.Fatalf("read vendored installer: %v", err)
+	}
 	for _, want := range []string{
 		"ARG HERMES_VERSION=0.21.0",
 		"ARG HERMES_GIT_REF=v2026.8.31",
 		"ARG HERMES_GIT_COMMIT=29112bef099274229cadff79cdff7bf7b99c4b77",
 		"COPY hermes/bootstrap/hermes-agent/install.sh /tmp/hermes-install.sh",
-		"85ef536d455e51ab67aa74d79272efd49fe717597dbaadfd3cca179a905f4706  /tmp/hermes-install.sh",
+		"bash /tmp/hermes-install.sh --branch",
+		fmt.Sprintf("%x  /tmp/hermes-install.sh", sha256.Sum256(installer)),
 		"sha256sum -c -",
 		`--branch "${HERMES_GIT_REF}"`,
 		`hermes-agent[dingtalk,messaging,matrix,pty,web,wecom]==${HERMES_VERSION}`,

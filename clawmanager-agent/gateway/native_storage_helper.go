@@ -54,6 +54,7 @@ func NativeStorageFailureCode(err error) string {
 // NativeStorageConfig contains only configuration the instance already receives
 // through its generated native files. Management credentials are not serializable.
 type NativeStorageConfig struct {
+	PodUID                                                             string `json:"pod_uid,omitempty"`
 	TeamGrant                                                          *NativeTeamGrant
 	RuntimeType, WorkspaceRoot, SandboxProfile, NetworkSecurityProfile string
 	OpenClawVersion, GatewayAuthMode, PublicOrigin, ProxyPolicyFile    string
@@ -68,13 +69,14 @@ type NativeStorageConfig struct {
 
 func NativeConfig(cfg Config) NativeStorageConfig {
 	return NativeStorageConfig{
+		PodUID:      cfg.PodUID,
 		RuntimeType: cfg.RuntimeType, WorkspaceRoot: cfg.WorkspaceRoot, SandboxProfile: cfg.SandboxProfile, NetworkSecurityProfile: cfg.NetworkSecurityProfile,
 		GatewayPortStart: cfg.GatewayPortStart, GatewayPortEnd: cfg.GatewayPortEnd, GatewayPortBlockSize: cfg.GatewayPortBlockSize, OpenClawVersion: cfg.OpenClawVersion, GatewayAuthMode: cfg.GatewayAuthMode, PublicOrigin: cfg.PublicOrigin, ProxyPolicyFile: cfg.ProxyPolicyFile,
 		AllowedOrigins: cfg.AllowedOrigins, TrustedProxies: cfg.TrustedProxies, LLMBaseURL: "http://clawmanager-local-model.invalid:31281/api/v1/gateway/llm", LLMAPIKeyEnvName: cfg.LLMAPIKeyEnvName, LLMAPIKeySet: cfg.LLMAPIKeySet, LLMModelsQualified: cfg.LLMModelsQualified, LLMModelIDs: cfg.LLMModelIDs, LLMVision: cfg.LLMVision, LLMReasoning: cfg.LLMReasoning, LLMReasoningControl: cfg.LLMReasoningControl,
 	}
 }
 func (c NativeStorageConfig) config(profile RuntimeProfile) Config {
-	return Config{Runtime: profile, RuntimeType: c.RuntimeType, WorkspaceRoot: c.WorkspaceRoot, SandboxProfile: c.SandboxProfile, NetworkSecurityProfile: c.NetworkSecurityProfile, GatewayPortStart: c.GatewayPortStart, GatewayPortEnd: c.GatewayPortEnd, GatewayPortBlockSize: c.GatewayPortBlockSize, OpenClawVersion: c.OpenClawVersion, GatewayAuthMode: c.GatewayAuthMode, PublicOrigin: c.PublicOrigin, ProxyPolicyFile: c.ProxyPolicyFile, AllowedOrigins: c.AllowedOrigins, TrustedProxies: c.TrustedProxies, LLMBaseURL: c.LLMBaseURL, LLMAPIKeyEnvName: c.LLMAPIKeyEnvName, LLMAPIKeySet: c.LLMAPIKeySet, LLMModelsQualified: c.LLMModelsQualified, LLMModelIDs: c.LLMModelIDs, LLMVision: c.LLMVision, LLMReasoning: c.LLMReasoning, LLMReasoningControl: c.LLMReasoningControl}
+	return Config{Runtime: profile, PodUID: c.PodUID, RuntimeType: c.RuntimeType, WorkspaceRoot: c.WorkspaceRoot, SandboxProfile: c.SandboxProfile, NetworkSecurityProfile: c.NetworkSecurityProfile, GatewayPortStart: c.GatewayPortStart, GatewayPortEnd: c.GatewayPortEnd, GatewayPortBlockSize: c.GatewayPortBlockSize, OpenClawVersion: c.OpenClawVersion, GatewayAuthMode: c.GatewayAuthMode, PublicOrigin: c.PublicOrigin, ProxyPolicyFile: c.ProxyPolicyFile, AllowedOrigins: c.AllowedOrigins, TrustedProxies: c.TrustedProxies, LLMBaseURL: c.LLMBaseURL, LLMAPIKeyEnvName: c.LLMAPIKeyEnvName, LLMAPIKeySet: c.LLMAPIKeySet, LLMModelsQualified: c.LLMModelsQualified, LLMModelIDs: c.LLMModelIDs, LLMVision: c.LLMVision, LLMReasoning: c.LLMReasoning, LLMReasoningControl: c.LLMReasoningControl}
 }
 
 type NativeStorageRequest struct {

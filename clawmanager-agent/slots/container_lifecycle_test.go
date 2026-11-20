@@ -40,6 +40,11 @@ func TestContainerTerminationCommitmentFitsKubeletBudget(t *testing.T) {
 	if forced != "C1:753s4hFxuxQB7Dy7eTeFyiPwsJqaEwHmQKibceW93NQ" {
 		t.Fatalf("CM/AR force-delete commitment schema drift: %s", forced)
 	}
+	auxiliary := message
+	auxiliary.AuxiliaryExitPending, auxiliary.CleanupConfirmed = true, false
+	if got, _ := containerTerminationCommitment(auxiliary); got != "C2:4uYrg-WIrvY7XUw5cxj_w4aAPTH1ogwVjEx_KMHiv1Y" {
+		t.Fatalf("CM/AR auxiliary commitment schema drift: %s", got)
+	}
 	for _, mutate := range []func(*containerTerminationMessage){
 		func(m *containerTerminationMessage) { m.CleanupConfirmed = false },
 		func(m *containerTerminationMessage) { m.WorkerEpoch = strings.Repeat("3", 32) },
@@ -406,5 +411,198 @@ func TestForceDeletePersistFailureKeepsOldIntentAndPreparation(t *testing.T) {
 	next.Graceful = false
 	if callContainerStop(w, next) != 409 || *w.book.StopIntent != old || ctx.Err() != nil {
 		t.Fatal("failed durable CAS changed or canceled the original operation")
+	}
+}
+
+type auxiliaryResetStarter struct {
+	forceTestStarter
+	owner *networkOwner
+}
+
+func (s auxiliaryResetStarter) PrepareGateway(ctx context.Context, req gateway.CreateGatewayRequest, port int) (func(context.Context) error, error) {
+	return s.owner.prepare(ctx, gateway.Config{}, req, port)
+}
+
+func TestContainerResetJoinedAuxiliaryRequiresExactExitAfterPrimary(t *testing.T) {
+	for _, kind := range []string{"stop", "sleep", "force-delete", "primary-error", "network-error"} {
+		t.Run(kind, func(t *testing.T) {
+			// The optional fixture is a temporary file bound at /dev/termination-log
+			// in a private mount namespace. Never overwrite an unrelated host file.
+			const terminationLog = "/dev/termination-log"
+			fixture := os.Getenv("RUNTIME_SLOT_TEST_KUBELET_FILE")
+			if fixture == "" {
+				t.Setenv("RUNTIME_SLOT_TERMINATION_MESSAGE_PATH", "")
+			} else {
+				original, err := os.Lstat(fixture)
+				mounted, mountErr := os.Lstat(terminationLog)
+				if filepath.Dir(fixture) == "/dev" || err != nil || mountErr != nil || !original.Mode().IsRegular() || !os.SameFile(original, mounted) {
+					t.Fatal("an independently named, bind-mounted kubelet test fixture is required")
+				}
+				t.Setenv("RUNTIME_SLOT_TERMINATION_MESSAGE_PATH", terminationLog)
+			}
+			w, intent := forceDeleteWorker(t)
+			intent.Graceful = kind == "sleep"
+			if kind == "force-delete" {
+				intent.Kind = kind
+			}
+			cfg := w.cfg
+			cfg.Capacity, cfg.IsolatedLifecycle, cfg.GatewayPortStart, cfg.GatewayPortEnd, cfg.GatewayPortBlockSize = 1, true, 20000, 20000, 1
+			cfg.Runtime = generic.NewProfile(cfg.RuntimeType)
+			var releaseCalls int
+			w.network.build = func(ctx context.Context, _ gateway.Config, _ gateway.CreateGatewayRequest, _ int) (*networkSession, error) {
+				return newTestNetworkSession(ctx, func(context.Context) error {
+					releaseCalls++
+					if kind == "network-error" {
+						return errors.New("network cleanup failed")
+					}
+					return nil
+				}), nil
+			}
+			prepared := false
+			prepare := func() error {
+				if kind == "primary-error" {
+					return errors.New("primary flush failed")
+				}
+				prepared = true
+				return nil
+			}
+			w.manager = gateway.NewGatewayManager(cfg, auxiliaryResetStarter{forceTestStarter{idleTestStarter{func() gateway.ManagedProcess {
+				return gateway.ManagedProcess{PID: 42, Stop: func(context.Context) error { return errors.New("exact container exit required") }, GracefulStop: func(context.Context) error { return errors.New("exact container exit required") }, ForceStop: func(context.Context) error { return errors.New("exact container exit required") }, PrepareReset: func(_ context.Context, graceful bool) error {
+					if graceful != intent.Graceful {
+						t.Error("changed primary shutdown policy")
+					}
+					return prepare()
+				}, PrepareForceReset: func(context.Context) error {
+					if kind != "force-delete" {
+						t.Error("unexpected force")
+					}
+					return prepare()
+				}}
+			}}}, w.network}, gateway.NewPortAllocator(func(int) bool { return false }))
+			req := gateway.CreateGatewayRequest{InstanceID: intent.InstanceID, UserID: intent.UserID, Generation: intent.Generation, PodUID: cfg.PodUID, AgentType: cfg.RuntimeType, UID: os.Getuid(), GID: os.Getgid(), GatewayPort: 20000, WorkspacePath: filepath.Join(cfg.WorkspaceRoot, cfg.RuntimeType, "user-2", "instance-7")}
+			if _, err := w.manager.CreateGateway(context.Background(), req); err != nil {
+				t.Fatal(err)
+			}
+			deadline := time.Now().Add(3 * time.Second)
+			for {
+				state, _ := w.manager.GatewayState(intent.GatewayID)
+				if state.State == "running" {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("start failed: %+v", state)
+				}
+				time.Sleep(time.Millisecond)
+			}
+			_, finish, err := w.network.join(gateway.GatewayStartSpec{InstanceID: req.InstanceID, UserID: req.UserID, Generation: req.Generation, UID: req.UID, GID: req.GID, WorkspacePath: req.WorkspacePath, RuntimeType: req.AgentType, Port: req.GatewayPort})
+			if err != nil {
+				t.Fatal(err)
+			}
+			finish(gateway.ErrGatewayStopFailed)
+			if err = w.network.closeForContainerReset(context.Background()); err == nil || !strings.Contains(err.Error(), "auxiliary writer stop unconfirmed") {
+				t.Fatalf("missing original failure: %v", err)
+			}
+			success := kind != "primary-error" && kind != "network-error"
+			wantStatus := http.StatusConflict
+			if success && fixture != "" {
+				wantStatus = http.StatusAccepted
+			}
+			if status := callContainerStop(w, intent); status != wantStatus {
+				t.Fatalf("prepare returned %d, expected %d", status, wantStatus)
+			}
+			raw, err := os.ReadFile(w.book.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var bookFields map[string]json.RawMessage
+			if err = json.Unmarshal(raw, &bookFields); err != nil {
+				t.Fatal(err)
+			}
+			var commitment string
+			_ = json.Unmarshal(bookFields["auxiliary_exit_commitment"], &commitment)
+			if kind == "primary-error" || kind == "network-error" {
+				if commitment != "" || w.resetReady {
+					t.Fatal("other failure authorized auxiliary continuation")
+				}
+				return
+			}
+			if !prepared || releaseCalls != 1 || !strings.HasPrefix(commitment, "C2:") || w.resetReady != (fixture != "") || w.book.TerminationProof != nil || w.book.Assignment.State == "stopped" {
+				t.Fatalf("missing fenced C2 primary authorization: prepared=%t network=%d book=%s", prepared, releaseCalls, raw)
+			}
+			if fixture != "" {
+				data, err := os.ReadFile(fixture)
+				if err != nil || string(data) != commitment {
+					t.Fatalf("kubelet did not receive the exact durable C2: %q %v", data, err)
+				}
+				select {
+				case <-w.reset:
+				default:
+					t.Fatal("worker did not request its container exit")
+				}
+			}
+			var message map[string]any
+			raw, _ = json.Marshal(intent)
+			json.Unmarshal(raw, &message)
+			message["cleanup_confirmed"], message["auxiliary_exit_pending"] = false, true
+			var stopMessage containerTerminationMessage
+			raw, _ = json.Marshal(message)
+			json.Unmarshal(raw, &stopMessage)
+			got, _ := containerTerminationCommitment(stopMessage)
+			if got != commitment {
+				t.Fatalf("wire commitment changed: %s vs %s", commitment, got)
+			}
+			message["container_id"] = "containerd://" + strings.Repeat("a", 64)
+			message["finished_at"] = time.Now().UTC()
+			lockPath, writer, err := w.writerPaths(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = claimWriter(writer, req, w.slotName); err != nil {
+				t.Fatal(err)
+			}
+			w.book, err = openBook(cfg.AgentDataDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			w.workerEpoch = strings.Repeat("d", 32)
+			call := func() int {
+				raw, _ := json.Marshal(message)
+				out := httptest.NewRecorder()
+				w.serveContainerReconcile(out, httptest.NewRequest(http.MethodPost, "/v1/reconcile-stop", bytes.NewReader(raw)))
+				return out.Code
+			}
+			lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = lockWorkspace(lock); err != nil {
+				t.Fatal(err)
+			}
+			if code := call(); code != 409 {
+				t.Fatalf("C2 ignored external writer lock: %d", code)
+			}
+			lock.Close()
+			message["cleanup_confirmed"], message["auxiliary_exit_pending"] = true, false
+			if code := call(); code != 409 {
+				t.Fatalf("different native proof replaced the prepared C2: %d", code)
+			}
+			message["cleanup_confirmed"], message["auxiliary_exit_pending"] = false, true
+			message["proof_source"] = "kubelet-container-fence-v1"
+			message["fence_request_uid"] = "foreign"
+			if code := call(); code != 409 {
+				t.Fatalf("operator fence claimed C2: %d", code)
+			}
+			delete(message, "proof_source")
+			delete(message, "fence_request_uid")
+			if code := call(); code != 200 || w.book.Assignment.State != "stopped" || !w.book.quarantined {
+				t.Fatalf("confirmed C2 did not stop old writer: %d", code)
+			}
+			raw, _ = json.Marshal(message)
+			out := httptest.NewRecorder()
+			w.serveContainerRelease(out, httptest.NewRequest(http.MethodPost, "/v1/release-stop", bytes.NewReader(raw)))
+			if out.Code != 200 || w.book.quarantined {
+				t.Fatalf("C2 release: %d %s", out.Code, out.Body)
+			}
+		})
 	}
 }

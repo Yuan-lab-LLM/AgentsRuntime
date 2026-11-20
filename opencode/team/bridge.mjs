@@ -43,6 +43,7 @@ export async function createBridge({ protocol, native, environment = process.env
  };
  const deliveries=protocol.runtimeStateDir ? deliveryOutbox(path.join(protocol.runtimeStateDir(cfg),"native-public-delivery"),publishDelivery) : null;
  const abort = new AbortController();
+ let toolRequests = 0;
  let stopInFlight, closeInFlight;
  async function stopExecution() {
   if (stopInFlight) return stopInFlight;
@@ -55,6 +56,9 @@ export async function createBridge({ protocol, native, environment = process.env
   const reply = (status, value) => { response.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store" }); response.end(JSON.stringify(value)); };
   if (!equal(request.headers.authorization, `Bearer ${token}`)) return reply(403, { error: "Team tool authorization failed" });
   if (request.method !== "POST" || !["/tool","/context-included"].includes(request.url)) return reply(404, { error: "Unknown Team operation" });
+  if (toolRequests >= 8) return reply(503, { error: "Team tool capacity exhausted; request not admitted" });
+  toolRequests++;
+  request.setTimeout(10000, () => request.destroy());
   try {
    let size = 0; const chunks = [];
    for await (const chunk of request) { size += chunk.length; if (size > 1024 * 1024) { reply(413, { error: "Team tool request too large" }); return; } chunks.push(chunk); }
@@ -99,8 +103,12 @@ export async function createBridge({ protocol, native, environment = process.env
     return reply(422, { error_code: "TEAM_INVALID_ARGUMENT" });
    // Runtime/model secrets and source URLs are never returned in tool errors.
    reply(500, { error: "Team tool failed; inspect the current work before retrying" });
-  }
+  } finally { toolRequests--; }
  });
+ server.maxConnections = 32;
+ server.requestTimeout = 15000;
+ server.headersTimeout = 10000;
+ server.keepAliveTimeout = 5000;
  await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
 
  async function consume(envelope) {
@@ -208,9 +216,15 @@ export async function createBridge({ protocol, native, environment = process.env
       eventId: "native-delivery-" + createHash("sha256").update(JSON.stringify([identity, body.recordId, body.text])).digest("hex"),
       sourceRecordId: body.recordId, sourceMessageId: deliveryStatus?.currentSourceMessageId || envelope.messageId, nativeInputId: ids.message, generation,
       sourceOccurredAt: body.at, lateProjection: true, nonAuthoritative: true, stateEffect: "none",
-      rootTaskTerminal: false, text: body.text.slice(0, 64000), textTruncated: body.text.length > 64000,
+      rootTaskTerminal: false, text: body.text,
       summary: "Final public answer from the acknowledged member turn", visibleToChat: true, chatKind: "delivery_supplement" };
-     if(deliveries){await deliveries.save(envelope,deliveryPayload); await deliveries.flush().catch(()=>log.warn?.(`${runtimeName} public delivery retained for publication retry`));}
+     if(protocol.terminalJournal){
+      const journal=protocol.terminalJournal(cfg);
+      await journal.stage(envelope,protocol.taskEvent(cfg,"reply",envelope,deliveryPayload));
+      const redis=new protocol.RedisClient(cfg.redisUrl);
+      try {await redis.connect();await journal.flush(redis,envelope);}catch{log.warn?.(`${runtimeName} public delivery durably retained for publication retry`);}finally{redis.close();}
+     }
+     else if(deliveries){await deliveries.save(envelope,deliveryPayload); await deliveries.flush().catch(()=>log.warn?.(`${runtimeName} public delivery retained for publication retry`));}
      else await publishDelivery(envelope,deliveryPayload);
     }
     // Native idle is an execution fact, never a business completion receipt.

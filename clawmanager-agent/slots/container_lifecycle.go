@@ -38,7 +38,8 @@ type containerStopIntent struct {
 
 type containerTerminationMessage struct {
 	containerStopIntent
-	CleanupConfirmed bool `json:"cleanup_confirmed"`
+	CleanupConfirmed     bool `json:"cleanup_confirmed"`
+	AuxiliaryExitPending bool `json:"auxiliary_exit_pending,omitempty"`
 }
 
 type containerTerminationProof struct {
@@ -90,7 +91,7 @@ func decodeContainerOperation(r *http.Request, out any) error {
 
 func (w *Worker) matchesContainerIntent(intent containerStopIntent) bool {
 	a := w.book.Assignment
-	return a != nil && intent.Version == 1 && executionTokenValid(intent.OperationID) &&
+	return w.book.PendingReset == nil && a != nil && intent.Version == 1 && executionTokenValid(intent.OperationID) &&
 		intent.PodUID == w.cfg.PodUID && intent.PodUID == a.PodUID && intent.Slot == w.slotName &&
 		intent.GatewayID == a.GatewayID && intent.InstanceID == a.InstanceID && intent.UserID == a.UserID &&
 		intent.Generation == a.Generation && intent.WorkerEpoch == a.WorkerEpoch && executionTokenValid(intent.WorkerEpoch) &&
@@ -131,13 +132,15 @@ func (w *Worker) serveContainerStop(out http.ResponseWriter, r *http.Request, id
 		return
 	}
 	if previous == nil || *previous != intent {
-		w.book.StopIntent = &intent
-		if err := w.book.save(); err != nil {
-			w.book.StopIntent = previous
+		next := *w.book
+		next.StopIntent = &intent
+		next.AuxiliaryExitCommitment = ""
+		if err := next.save(); err != nil {
 			w.mu.Unlock()
 			http.Error(out, "cannot persist container stop", 409)
 			return
 		}
+		*w.book = next
 		if w.containerPreparation != nil {
 			w.containerPreparation.cancel()
 		}
@@ -176,7 +179,9 @@ func (w *Worker) serveContainerStop(out http.ResponseWriter, r *http.Request, id
 		} else {
 			err = w.manager.PrepareContainerReset(ctx, id, intent.Graceful, persistGraceful)
 		}
-		if err != nil {
+		cleanup, postPrimary := err.(*gateway.ContainerExecutionCleanupError)
+		auxiliaryPending := postPrimary && cleanup.Cause == errAuxiliaryWriterUnconfirmed
+		if err != nil && !auxiliaryPending {
 			log.Printf("runtime-agent container reset preparation failed: %v", err)
 			http.Error(out, "container reset preparation is incomplete", 409)
 			return
@@ -188,7 +193,14 @@ func (w *Worker) serveContainerStop(out http.ResponseWriter, r *http.Request, id
 			http.Error(out, "container reset preparation was superseded", 409)
 			return
 		}
-		if err = w.network.closeForContainerReset(ctx); err != nil {
+		err = w.network.closeForContainerReset(ctx)
+		if err == errAuxiliaryWriterUnconfirmed {
+			auxiliaryPending = true
+			err = w.network.prepareAuxiliaryExit(ctx, intent)
+		} else if auxiliaryPending && err == nil {
+			err = errors.New("uncertain auxiliary session changed")
+		}
+		if err != nil {
 			log.Printf("runtime-agent container network cleanup failed: %v", err)
 			http.Error(out, "execution resource cleanup is incomplete", 409)
 			return
@@ -201,7 +213,18 @@ func (w *Worker) serveContainerStop(out http.ResponseWriter, r *http.Request, id
 			http.Error(out, "container reset preparation was superseded", 409)
 			return
 		}
-		message := containerTerminationMessage{containerStopIntent: intent, CleanupConfirmed: true}
+		message := containerTerminationMessage{containerStopIntent: intent, CleanupConfirmed: !auxiliaryPending, AuxiliaryExitPending: auxiliaryPending}
+		if auxiliaryPending {
+			commitment, commitErr := containerTerminationCommitment(message)
+			next := *w.book
+			next.AuxiliaryExitCommitment = commitment
+			if commitErr != nil || intent.Graceful && !next.Assignment.IdleStop || next.save() != nil {
+				w.mu.Unlock()
+				http.Error(out, "cannot persist exact auxiliary exit preparation", 409)
+				return
+			}
+			*w.book = next
+		}
 		if err = writeContainerTermination(message); err != nil {
 			w.mu.Unlock()
 			http.Error(out, "cannot persist container cleanup receipt", 409)
@@ -229,6 +252,35 @@ func (o *networkOwner) closeForContainerReset(ctx context.Context) error {
 		return nil
 	}
 	return o.cleanup(active)(ctx)
+}
+
+// A joined command may leave descendants in this NFS slot's container.
+// Still close ingress, broker and keeper resources under the exact session;
+// retain local writer ownership until kubelet proves the old container exited.
+func (o *networkOwner) prepareAuxiliaryExit(ctx context.Context, intent containerStopIntent) error {
+	o.mu.Lock()
+	s := o.active
+	o.mu.Unlock()
+	if s == nil || s.req.InstanceID != intent.InstanceID || s.req.UserID != intent.UserID || s.req.Generation != intent.Generation || s.req.PodUID != intent.PodUID {
+		return errors.New("auxiliary exit session does not match stop intent")
+	}
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	s.mu.Lock()
+	fenced := s.uncertain && s.closing && s.ctx.Err() != nil
+	s.mu.Unlock()
+	if !fenced || ctx.Err() != nil {
+		return errors.New("auxiliary exit preparation is not fenced")
+	}
+	if !s.auxiliaryExitPrepared {
+		if s.release != nil {
+			if err := s.release(ctx); err != nil {
+				return err
+			}
+		}
+		s.auxiliaryExitPrepared = true
+	}
+	return nil
 }
 
 func (o *networkOwner) fenceForContainerReset() {
@@ -280,7 +332,18 @@ func containerTerminationCommitment(message containerTerminationMessage) (string
 		return "", err
 	}
 	digest := sha256.Sum256(data)
-	return "C1:" + base64.RawURLEncoding.EncodeToString(digest[:]), nil
+	prefix := "C1:"
+	if message.AuxiliaryExitPending {
+		prefix = "C2:"
+	}
+	return prefix + base64.RawURLEncoding.EncodeToString(digest[:]), nil
+}
+
+func validContainerCleanupProof(p containerTerminationProof) bool {
+	if !p.AuxiliaryExitPending {
+		return p.CleanupConfirmed
+	}
+	return !p.CleanupConfirmed && p.ProofSource == "" && p.FenceRequestUID == "" && (p.Kind == "" || p.Kind == "force-delete" && !p.Graceful)
 }
 
 func (w *Worker) serveContainerReconcile(out http.ResponseWriter, r *http.Request) {
@@ -291,9 +354,20 @@ func (w *Worker) serveContainerReconcile(out http.ResponseWriter, r *http.Reques
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if (proof.Kind != "" && proof.Kind != "force-delete" || proof.Kind == "force-delete" && proof.Graceful) || !validContainerProofSource(proof) || !proof.CleanupConfirmed || proof.ContainerID == "" || proof.FinishedAt.IsZero() || proof.WorkerEpoch == w.workerEpoch || !w.matchesContainerIntent(proof.containerStopIntent) || w.book.StopIntent == nil || *w.book.StopIntent != proof.containerStopIntent {
+	if (proof.Kind != "" && proof.Kind != "force-delete" || proof.Kind == "force-delete" && proof.Graceful) || !validContainerProofSource(proof) || !validContainerCleanupProof(proof) || proof.ContainerID == "" || proof.FinishedAt.IsZero() || proof.WorkerEpoch == w.workerEpoch || !w.matchesContainerIntent(proof.containerStopIntent) || w.book.StopIntent == nil || *w.book.StopIntent != proof.containerStopIntent {
 		http.Error(out, "container proof does not match old execution", 409)
 		return
+	}
+	if proof.ProofSource == "" && w.book.AuxiliaryExitCommitment != "" && !proof.AuxiliaryExitPending {
+		http.Error(out, "native termination proof differs from prepared auxiliary exit", 409)
+		return
+	}
+	if proof.AuxiliaryExitPending {
+		commitment, err := containerTerminationCommitment(proof.containerTerminationMessage)
+		if err != nil || w.book.AuxiliaryExitCommitment != commitment || proof.Graceful && !w.book.Assignment.IdleStop || w.book.Assignment.State == "stopped" && w.book.TerminationProof == nil {
+			http.Error(out, "primary and auxiliary exit preparation is unconfirmed", 409)
+			return
+		}
 	}
 	if w.book.TerminationProof != nil && *w.book.TerminationProof != proof {
 		http.Error(out, "container proof changed", 409)
@@ -345,13 +419,17 @@ func (w *Worker) serveContainerReconcile(out http.ResponseWriter, r *http.Reques
 
 func (w *Worker) serveContainerRelease(out http.ResponseWriter, r *http.Request) {
 	var proof containerTerminationProof
-	if decodeContainerOperation(r, &proof) != nil || !validContainerProofSource(proof) || !proof.CleanupConfirmed || proof.ContainerID == "" || proof.FinishedAt.IsZero() || proof.Version != 1 || proof.InstanceID < 1 || proof.UserID < 1 || proof.Generation < 1 || proof.GatewayID != fmt.Sprintf("gw-%d-%d", proof.InstanceID, proof.Generation) || len(proof.AssignmentDigest) != 64 || !executionTokenValid(proof.OperationID) || !executionTokenValid(proof.WorkerEpoch) || proof.PodUID != w.cfg.PodUID || proof.Slot != w.slotName {
+	if decodeContainerOperation(r, &proof) != nil || !validContainerProofSource(proof) || !validContainerCleanupProof(proof) || proof.ContainerID == "" || proof.FinishedAt.IsZero() || proof.Version != 1 || proof.InstanceID < 1 || proof.UserID < 1 || proof.Generation < 1 || proof.GatewayID != fmt.Sprintf("gw-%d-%d", proof.InstanceID, proof.Generation) || len(proof.AssignmentDigest) != 64 || !executionTokenValid(proof.OperationID) || !executionTokenValid(proof.WorkerEpoch) || proof.PodUID != w.cfg.PodUID || proof.Slot != w.slotName {
 		http.Error(out, "invalid finalized stop proof", 400)
 		return
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	a := w.book.Assignment
+	if w.book.PendingReset != nil {
+		http.Error(out, "physical slot reset awaiting release", 409)
+		return
+	}
 	if a == nil {
 		http.Error(out, "slot release state is unknown", 409)
 		return

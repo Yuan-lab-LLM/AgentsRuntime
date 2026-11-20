@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "protocol": "opencode-preserve-v1",
+  "native_version": "1.18.13",
+  "observed_binary_sha256": "bcebc898d22419417b8dbec0f5e3f00f5b67b5a38c1de37c77c699d0e31fe0dd",
+  "observed_base_image": "clawmanager.local/opencode-lite@sha256:7ba6888e43480496704a10d9a496b1398863515166acab5c544ccc9c9d91ed31",
+  "official_source_reference": "a105350812f05f914c768e468559dbd6bd508d8e",
+  "journal_sha256": "2ef42ffb09410c0f91535d25fce5b4107c46ee3fd7a4725e521c197ad4f5949c",
+  "scope": "Identical observed native binary; agent-only update. Official source is a separately verified schema reference, not an original-image governance build assertion."
+}

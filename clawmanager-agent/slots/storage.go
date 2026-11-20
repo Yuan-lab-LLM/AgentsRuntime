@@ -78,9 +78,18 @@ func runStorageGrant(req gateway.StorageGrantRequest, gid int) error {
 // Management pins O_PATH grant FDs; the instance helper can traverse the exact
 // grants even when management ancestors are0700. No ancestor FD is inherited.
 func runPrivateStorageAudit(uid, gid int, paths []string, tmpLast bool) error {
+	_, err := auditPrivateStorage(uid, gid, paths, tmpLast, false)
+	return err
+}
+
+func runPrivateStorageAuditProof(uid, gid int, paths []string, tmpLast bool) ([]gateway.NativeUpgradeRootProof, error) {
+	return auditPrivateStorage(uid, gid, paths, tmpLast, true)
+}
+
+func auditPrivateStorage(uid, gid int, paths []string, tmpLast, collectProof bool) ([]gateway.NativeUpgradeRootProof, error) {
 	executable, err := os.Executable()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	request := gateway.PrivateStorageAuditRequest{UID: uid, GID: gid}
 	var files []*os.File
@@ -91,28 +100,43 @@ func runPrivateStorageAudit(uid, gid int, paths []string, tmpLast bool) error {
 	}()
 	for i, path := range paths {
 		if _, err = checkedSandboxSource(path); err != nil {
-			return err
+			return nil, err
 		}
 		fd, err := syscall.Open(path, 0x200000|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		files = append(files, os.NewFile(uintptr(fd), "private-grant"))
 		request.TmpRoots = append(request.TmpRoots, tmpLast && i == len(paths)-1)
 	}
 	payload, err := json.Marshal(request)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	cmd := exec.Command("/usr/bin/setpriv", "--inh-caps=-all", "--ambient-caps=-all", "--", executable, "managed-private-tree-audit")
 	cmd.Env = []string{"PATH=/usr/bin:/bin"}
 	cmd.Stdin = bytes.NewReader(payload)
 	cmd.ExtraFiles = files
 	if err = configureSandboxProcess(cmd, uid, gid, nil); err != nil {
-		return err
+		return nil, err
 	}
 	if err = cmd.Run(); err != nil {
-		return fmt.Errorf("NFS private inode validation failed: %w", err)
+		return nil, fmt.Errorf("NFS private inode validation failed: %w", err)
 	}
-	return nil
+	if !collectProof {
+		return nil, nil
+	}
+	var proof []gateway.NativeUpgradeRootProof
+	for i, file := range files {
+		info, err := file.Stat()
+		if err != nil {
+			return nil, err
+		}
+		st, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			return nil, fmt.Errorf("private audit grant identity unavailable")
+		}
+		proof = append(proof, gateway.NativeUpgradeRootProof{Path: paths[i], Device: uint64(st.Dev), Inode: st.Ino, OwnerUID: st.Uid, OwnerGID: st.Gid, Mode: uint32(st.Mode)})
+	}
+	return proof, nil
 }

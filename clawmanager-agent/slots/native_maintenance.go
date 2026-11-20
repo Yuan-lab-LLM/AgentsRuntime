@@ -59,6 +59,10 @@ func (w *Worker) serveNativeMaintenance(out http.ResponseWriter, r *http.Request
 		return
 	}
 	op := request.Operation
+	if err := gateway.ValidateUpgradePodIdentity(w.cfg, op.Request); err != nil {
+		http.Error(out, err.Error(), http.StatusConflict)
+		return
+	}
 	operation, err := json.Marshal(op)
 	if err != nil {
 		http.Error(out, "invalid native maintenance operation", 400)
@@ -155,7 +159,7 @@ func (w *Worker) serveNativeMaintenanceReconcile(out http.ResponseWriter, r *htt
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	m := w.book.Maintenance
-	if m == nil || !m.Ready || proof.Kind != "maintenance" || !proof.CleanupConfirmed || proof.ContainerID == "" || proof.FinishedAt.IsZero() || proof.WorkerEpoch == w.workerEpoch || m.Intent != proof.containerStopIntent || !w.matchesContainerIntent(proof.containerStopIntent) || w.book.StopIntent == nil || *w.book.StopIntent != proof.containerStopIntent {
+	if m == nil || !m.Ready || proof.Kind != "maintenance" || proof.AuxiliaryExitPending || !proof.CleanupConfirmed || proof.ContainerID == "" || proof.FinishedAt.IsZero() || proof.WorkerEpoch == w.workerEpoch || m.Intent != proof.containerStopIntent || !w.matchesContainerIntent(proof.containerStopIntent) || w.book.StopIntent == nil || *w.book.StopIntent != proof.containerStopIntent {
 		http.Error(out, "maintenance result lacks matching old container termination", 409)
 		return
 	}
@@ -243,6 +247,7 @@ func (w *Worker) reserveNativeMaintenance(operationID string, operation json.Raw
 	w.book.Assignment = &Assignment{PodUID: intent.PodUID, GatewayID: intent.GatewayID, InstanceID: instanceID, UserID: userID, Generation: generation, WorkerEpoch: w.workerEpoch, State: "maintenance"}
 	w.book.Digest = intent.AssignmentDigest
 	w.book.StopIntent = &intent
+	w.book.AuxiliaryExitCommitment = ""
 	w.book.TerminationProof = nil
 	w.book.StopFinalized = false
 	w.book.Maintenance = &nativeMaintenanceBook{OperationID: operationID, Operation: canonical, Intent: intent}

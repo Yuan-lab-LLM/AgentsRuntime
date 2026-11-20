@@ -78,6 +78,9 @@ func (p *Pool) nativeRecordPath(id string) (string, error) {
 }
 func (s *nativeUpgradeSession) save() error { return atomicJSON(s.path, s.record) }
 func (p *Pool) nativeSession(ctx context.Context, op gateway.NativeUpgradeOperation, finalizedOnly bool) (*nativeUpgradeSession, error) {
+	if err := gateway.ValidateUpgradePodIdentity(p.cfg, op.Request); err != nil {
+		return nil, err
+	}
 	if s := p.maintenance[op.OperationID]; s != nil {
 		digest, _ := nativeOperationDigest(op)
 		if s.record.Digest != digest || s.record.LeaseToken != op.Request.LeaseToken {
@@ -322,6 +325,9 @@ func (p *Pool) openNativeCallback(s *nativeUpgradeSession, op gateway.NativeUpgr
 }
 func (p *Pool) startNativeMaintenance(ctx context.Context, op gateway.NativeUpgradeOperation) (nativeMaintenancePending, error) {
 	var empty nativeMaintenancePending
+	if err := gateway.ValidateUpgradePodIdentity(p.cfg, op.Request); err != nil {
+		return empty, err
+	}
 	if err := op.Validate(); err != nil {
 		return empty, err
 	}
@@ -403,6 +409,9 @@ func (p *Pool) startNativeMaintenance(ctx context.Context, op gateway.NativeUpgr
 // Resume only an authenticated finalized record. Unlike start, this must never
 // reserve a slot, acquire a writer or recreate a missing operation.
 func (p *Pool) resumeNativeMaintenance(ctx context.Context, op gateway.NativeUpgradeOperation) (nativeMaintenancePending, error) {
+	if err := gateway.ValidateUpgradePodIdentity(p.cfg, op.Request); err != nil {
+		return nativeMaintenancePending{}, err
+	}
 	p.maintenanceMu.Lock()
 	defer p.maintenanceMu.Unlock()
 	if p.maintenance == nil {
@@ -420,7 +429,7 @@ func (p *Pool) validateFinalizedNativeRecord(record *nativeUpgradeRecord) error 
 		return fmt.Errorf("native parent record is not finalized")
 	}
 	op, intent, proof := record.Operation, record.Intent, record.Proof
-	if intent.Version != 1 || intent.Kind != "maintenance" || intent.Graceful || intent.OperationID != op.OperationID || intent.PodUID != record.PodUID || intent.Slot != "slot-"+strconv.Itoa(record.Slot) || intent.InstanceID != op.Request.InstanceID || intent.UserID != op.Request.UserID || intent.Generation != op.Request.Generation || intent.GatewayID != fmt.Sprintf("gw-%d-%d", op.Request.InstanceID, op.Request.Generation) || intent.AssignmentDigest != record.Digest || !executionTokenValid(intent.WorkerEpoch) || proof.containerStopIntent != *intent || !proof.CleanupConfirmed || proof.ContainerID == "" || proof.FinishedAt.IsZero() || len(record.Result) > 1<<20 || len(record.Error) > 4096 || len(record.Result) > 0 && !json.Valid(record.Result) {
+	if intent.Version != 1 || intent.Kind != "maintenance" || intent.Graceful || intent.OperationID != op.OperationID || intent.PodUID != record.PodUID || intent.Slot != "slot-"+strconv.Itoa(record.Slot) || intent.InstanceID != op.Request.InstanceID || intent.UserID != op.Request.UserID || intent.Generation != op.Request.Generation || intent.GatewayID != fmt.Sprintf("gw-%d-%d", op.Request.InstanceID, op.Request.Generation) || intent.AssignmentDigest != record.Digest || !executionTokenValid(intent.WorkerEpoch) || proof.containerStopIntent != *intent || proof.AuxiliaryExitPending || !proof.CleanupConfirmed || proof.ContainerID == "" || proof.FinishedAt.IsZero() || len(record.Result) > 1<<20 || len(record.Error) > 4096 || len(record.Result) > 0 && !json.Valid(record.Result) {
 		return fmt.Errorf("native finalized parent identity changed")
 	}
 	return nil
@@ -429,7 +438,7 @@ func (p *Pool) validateFinalizedNativeRecord(record *nativeUpgradeRecord) error 
 func (p *Pool) finishNativeMaintenance(ctx context.Context, proof containerTerminationProof) (json.RawMessage, error) {
 	p.maintenanceMu.Lock()
 	defer p.maintenanceMu.Unlock()
-	if proof.Kind != "maintenance" || !proof.CleanupConfirmed || proof.ContainerID == "" || proof.FinishedAt.IsZero() {
+	if proof.Kind != "maintenance" || proof.AuxiliaryExitPending || !proof.CleanupConfirmed || proof.ContainerID == "" || proof.FinishedAt.IsZero() {
 		return nil, fmt.Errorf("native termination proof incomplete")
 	}
 	session := p.maintenance[proof.OperationID]

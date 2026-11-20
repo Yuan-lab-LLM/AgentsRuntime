@@ -32,6 +32,14 @@ func onlyContainerResetRequired(err error) bool {
 	return false
 }
 
+// ContainerExecutionCleanupError is raised only after the required primary
+// preparation succeeded. Callers can distinguish a specific execution cleanup
+// failure without treating primary, context or lifecycle errors as preparation.
+type ContainerExecutionCleanupError struct{ Cause error }
+
+func (e *ContainerExecutionCleanupError) Error() string { return e.Cause.Error() }
+func (e *ContainerExecutionCleanupError) Unwrap() error { return e.Cause }
+
 // PrepareContainerReset fences admission, joins application/automation work and
 // closes execution resources held outside the business process. It deliberately
 // retains reservations: the caller still needs actual container termination.
@@ -90,7 +98,9 @@ func (m *GatewayManager) PrepareContainerReset(ctx context.Context, id string, g
 		}
 	}
 	if cleanup != nil {
-		return cleanup(ctx)
+		if err := cleanup(ctx); err != nil {
+			return &ContainerExecutionCleanupError{Cause: err}
+		}
 	}
 	return nil
 }
@@ -143,7 +153,9 @@ func (m *GatewayManager) PrepareContainerForceDelete(ctx context.Context, id str
 		}
 	}
 	if cleanup != nil {
-		return cleanup(ctx)
+		if err := cleanup(ctx); err != nil {
+			return &ContainerExecutionCleanupError{Cause: err}
+		}
 	}
 	return nil
 }

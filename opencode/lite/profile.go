@@ -1,6 +1,7 @@
 package opencode
 
 import (
+	"context"
 	"fmt"
 	"github.com/iamlovingit/clawmanager-agent/workspaceio"
 	"log"
@@ -391,6 +392,15 @@ func (p Profile) RegistrationMetadata(gateway.Config) gateway.RuntimeRegistratio
 	metadata := gateway.RuntimeRegistrationMetadata{}
 	if os.Getenv("CLAWMANAGER_REDIS_TEAM_PLUGIN_VERSION") == "opencode-team-v1" {
 		metadata.TeamPluginVersion = "opencode-team-v1"
+	}
+	if os.Getenv("CLAWMANAGER_OPENCODE_UPGRADE_PROTOCOL") == OpenCodeUpgradeProtocol {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if validateOpenCodeNativePayload(ctx) == nil {
+			metadata.ProtocolVersion = OpenCodeUpgradeProtocol
+			metadata.SessionStore = "sqlite"
+			metadata.Capabilities = append([]string(nil), OpenCodeUpgradeCapabilities...)
+		}
 	}
 	return metadata
 }
