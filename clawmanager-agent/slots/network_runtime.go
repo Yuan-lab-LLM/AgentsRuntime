@@ -88,7 +88,7 @@ func prepareNetworkSession(parent context.Context, cfg gateway.Config, req gatew
 	}()
 	resources.credentials, err = netbroker.NewCredentials(ctx, cfg.BackendURL, cfg.ControlToken, netbroker.Identity{InstanceID: req.InstanceID, UserID: req.UserID, Generation: req.Generation, PodUID: cfg.PodUID})
 	if err != nil {
-		return session, fmt.Errorf("private network credential acquisition failed")
+		return session, fmt.Errorf("private network credential acquisition failed: %w", err)
 	}
 	context.AfterFunc(resources.credentials.Context(), cancel)
 	stateDir := filepath.Join(cfg.AgentDataDir, "network")

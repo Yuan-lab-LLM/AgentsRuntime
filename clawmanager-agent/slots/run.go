@@ -99,6 +99,9 @@ func runWorker(ctx context.Context, cfg gateway.Config) error {
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	if worker.storageHealth != nil {
+		go worker.storageHealth.run(runCtx, storageProbeInterval)
+	}
 	if worker.reset != nil {
 		go func() {
 			select {
@@ -212,6 +215,14 @@ func (p *Pool) report(ctx context.Context) {
 	metadata := p.metadata
 	podID := 0
 	for ctx.Err() == nil {
+		if p.cfg.SandboxProfile == "nfs-rootless-v1" && metadata.UpgradeStandby() && !p.standbySlotStorageReady(ctx) {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+				continue
+			}
+		}
 		payload := metadata.RegisterPayload()
 		payload.Capacity = p.count
 		payload.MaxGateways = p.count
@@ -313,4 +324,19 @@ func (p *Pool) report(ctx context.Context) {
 		}
 	})
 	wg.Wait()
+}
+
+// The controller may start native compatibility checks as soon as an upgrade
+// pool registers. Wait for initial storage evidence before advertising it.
+// Existing maintenance records can still register and reconcile after restart.
+func (p *Pool) standbySlotStorageReady(ctx context.Context) bool {
+	probeCtx, cancel := context.WithTimeout(ctx, storageProbeBudget)
+	defer cancel()
+	snapshots, _ := p.snapshots(probeCtx)
+	for _, snapshot := range snapshots {
+		if snapshot.unreachable || snapshot.StorageUnavailable {
+			return false
+		}
+	}
+	return probeCtx.Err() == nil
 }

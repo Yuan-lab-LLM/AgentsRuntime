@@ -3,6 +3,7 @@ package netbroker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -97,12 +98,48 @@ func TestAcquireRejectsRedirectAndUnsafeConfiguration(t *testing.T) {
 		}
 	}
 }
+func TestCredentialsInitialRetryOnlyForTemporaryFailures(t *testing.T) {
+	for _, scenario := range []struct {
+		name   string
+		status int
+		retry  bool
+	}{
+		{"unavailable", http.StatusServiceUnavailable, true},
+		{"forbidden", http.StatusForbidden, false},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			var calls atomic.Int32
+			server := leaseServer(t, func(w http.ResponseWriter, r *http.Request) {
+				if calls.Add(1) == 1 {
+					w.WriteHeader(scenario.status)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(testLease())
+			})
+			creds, err := NewCredentials(t.Context(), server.URL, "control-sentinel", testIdentity)
+			if !scenario.retry {
+				if creds != nil || !errors.Is(err, errLeaseRejected) || calls.Load() != 1 {
+					t.Fatalf("rejected initial lease was retried: calls=%d err=%v", calls.Load(), err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer creds.Close()
+			if lease, err := creds.Snapshot(); err != nil || lease.Identity != testIdentity || calls.Load() != 2 {
+				t.Fatalf("initial lease did not recover: calls=%d err=%v", calls.Load(), err)
+			}
+		})
+	}
+}
+
 func TestCredentialsRenewAndFailClosed(t *testing.T) {
 	var calls atomic.Int32
 	server := leaseServer(t, func(w http.ResponseWriter, r *http.Request) {
 		n := calls.Add(1)
 		if n >= 3 {
-			w.WriteHeader(503)
+			w.WriteHeader(403)
 			return
 		}
 		lease := testLease()

@@ -137,6 +137,9 @@ func (p *Pool) nativeSession(ctx context.Context, op gateway.NativeUpgradeOperat
 	}
 	session.unlock = unlock
 	abandon := func(err error) (*nativeUpgradeSession, error) { session.closeParent(false); return nil, err }
+	if _, err := os.Lstat(path + ".cancelled"); !os.IsNotExist(err) {
+		return abandon(fmt.Errorf("native reservation is cancelled or cannot be inspected"))
+	}
 	if op.MutatesWorkspace() {
 		leaseCtx, finish, leaseErr := p.metadata.KeepUpgradeWriterLease(scope, op.Request)
 		if leaseErr != nil && record.Launched { // Cleanup proof must remain recoverable even after lease expiry.
@@ -187,11 +190,18 @@ func (s *nativeUpgradeSession) acquireWriter(cfg gateway.Config) error {
 		file.Close()
 		return err
 	}
-	if current.InstanceID != r.InstanceID || current.UserID != r.UserID || current.Generation != r.Generation || current.RuntimeType != cfg.RuntimeType {
+	// Explicit recovery may follow one or more SQL generations that never
+	// published a native writer. The locked original record must still be
+	// positively stopped; its real generation is retained in Previous and is
+	// restored unchanged. Ordinary upgrades keep exact-generation admission.
+	holder := "maintenance-" + s.record.Operation.OperationID
+	previous := s.record.Previous
+	resumingStoppedSource := current.State == "upgrading" && current.Slot == holder && current.PodUID == cfg.PodUID && previous != nil && previous.State == "stopped" && previous.InstanceID == current.InstanceID && previous.UserID == current.UserID && previous.Generation == current.Generation && previous.RuntimeType == current.RuntimeType
+	restoredSource := (r.RecoveryMode == "retry" || r.RecoveryMode == "rebuild") && (current.State == "stopped" || resumingStoppedSource) && current.Generation > 0 && current.Generation < r.Generation
+	if current.InstanceID != r.InstanceID || current.UserID != r.UserID || (current.Generation != r.Generation && !restoredSource) || current.RuntimeType != cfg.RuntimeType {
 		file.Close()
 		return fmt.Errorf("native stopped writer identity changed")
 	}
-	holder := "maintenance-" + s.record.Operation.OperationID
 	if current.State == "stopped" {
 		if s.record.Previous == nil {
 			copy := *current
@@ -533,6 +543,10 @@ func (p *Pool) serveNativeUpgrades(out http.ResponseWriter, r *http.Request) boo
 	}
 	if r.Method != http.MethodPost {
 		out.WriteHeader(405)
+		return true
+	}
+	if r.URL.Path == "/v1/native-upgrades/cancel-unstarted" {
+		p.serveCancelUnstartedNativeReservation(out, r)
 		return true
 	}
 	if r.URL.Path == "/v1/native-upgrades/start" || r.URL.Path == "/v1/native-upgrades/resume" {

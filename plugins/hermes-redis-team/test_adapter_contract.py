@@ -2055,6 +2055,52 @@ class HermesRedisTeamContractTests(unittest.TestCase):
             self.assertEqual(len(monitor_events), 0, "a non-terminal Monitor must reach the model instead of being answered mechanically")
 
 class ActiveContextDeliveryTests(unittest.TestCase):
+    def test_narrative_only_legacy_record_cannot_block_presence_or_create_a_turn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings=adapter.RedisTeamSettings(enabled=True,redis_url="redis://example.invalid",team_id="42",member_id="worker",role="worker",shared_dir=directory,generation=4)
+            legacy={"lastAssistantResponse":"ordinary reply","lastAssistantResponseAt":"2026-11-17T02:30:00Z"}
+            adapter._atomic_write_json(adapter._active_envelope_path(settings),legacy)
+            with mock.patch.object(adapter,"load_settings",return_value=settings):
+                instance=adapter.RedisTeamAdapter(None)
+            instance.is_connected=True
+            reader=mock.Mock(side_effect=AssertionError("unscoped response opened a native session"))
+            instance.set_clawmanager_team_agent_reader(reader)
+            instance.handle_message=mock.AsyncMock()
+            commands=[]
+            class PresenceRedis:
+                async def command(self,*args):
+                    commands.append(args)
+                    if args[0]=="HSET":instance.is_connected=False
+                    return "OK"
+            instance._redis=PresenceRedis()
+            async def finish_cycle(_delay):
+                # End both the success and exception paths. A regression must
+                # fail the missing-HSET assertion, never spin indefinitely.
+                instance.is_connected=False
+            async def run():
+                with mock.patch.object(adapter.asyncio,"sleep",new=mock.AsyncMock(side_effect=finish_cycle)):
+                    await asyncio.wait_for(instance._presence_loop(),timeout=1)
+            asyncio.run(run())
+            self.assertEqual(adapter._load_active_envelope(settings),{})
+            self.assertEqual(adapter._read_json(adapter._active_envelope_path(settings)),legacy)
+            presence=[x for x in commands if x[0]=="HSET"]
+            self.assertEqual(len(presence),1)
+            self.assertEqual(json.loads(presence[0][-1])["liveness"],"online")
+            reader.assert_not_called()
+            instance.handle_message.assert_not_awaited()
+
+    def test_root_task_alias_retains_original_context_without_fabricated_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings=adapter.RedisTeamSettings(enabled=True,redis_url="redis://example.invalid",team_id="42",member_id="worker",role="worker",shared_dir=directory)
+            active={"rootTaskId":"root-7","assignmentId":"work-1","messageId":"original"}
+            adapter._persist_active_envelope(settings,active)
+            instance=adapter.RedisTeamAdapter(None);instance.settings=settings
+            source=instance._context_source(adapter._load_active_envelope(settings))
+            self.assertEqual(source.chat_id,"root-7")
+            self.assertEqual(source.thread_id,"root-7")
+            self.assertEqual(adapter._load_active_envelope(settings),active)
+            with self.assertRaises(ValueError):instance._context_source({"lastAssistantResponse":"unscoped"})
+
     def test_restart_presence_does_not_inherit_old_offline_marker(self):
         import tempfile
         with tempfile.TemporaryDirectory() as directory:
