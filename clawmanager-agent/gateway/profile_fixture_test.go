@@ -1,7 +1,9 @@
 package gateway
 
 import (
+	"context"
 	"fmt"
+	"os"
 	"time"
 )
 
@@ -38,6 +40,12 @@ func (openClawCompatProfile) GatewayEnv(base []string, cfg Config, req CreateGat
 }
 
 func (openClawCompatProfile) PrepareWorkspace(cfg Config, req CreateGatewayRequest, workspacePath string) error {
+	if err := CheckOpenClawTaskActivation(context.Background(), ApplyRequestEnvironment(os.Environ(), req)); err != nil {
+		return err
+	}
+	if err := PrepareOpenClawReceiptDirectory(cfg, req); err != nil {
+		return err
+	}
 	prepared, err := PrepareWorkspace(cfg.WorkspaceRoot, cfg.RuntimeType, req)
 	if err != nil {
 		return err

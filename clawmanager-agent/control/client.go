@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/iamlovingit/clawmanager-agent/gateway"
+	"github.com/iamlovingit/clawmanager-agent/shutdownoutbox"
 )
 
 type ReportClient struct {
@@ -68,6 +69,17 @@ func (c *ReportClient) ReportMetrics(ctx context.Context, payload gateway.Metric
 
 func (c *ReportClient) ReportGateways(ctx context.Context, payload gateway.GatewayReportPayload) error {
 	return c.doJSON(ctx, "/api/v1/runtime-agent/gateways/report", payload, nil)
+}
+
+func (c *ReportClient) ReportShutdownDeliveries(ctx context.Context, items []shutdownoutbox.Delivery) (shutdownoutbox.Ack, error) {
+	var ack shutdownoutbox.Ack
+	err := shutdownDeliveryJSON(ctx, c.httpClient, c.baseURL+"/api/v1/runtime-agent/shutdown-deliveries", "X-ClawManager-Agent-Token", c.token, http.MethodPost, struct {
+		Deliveries []shutdownoutbox.Delivery `json:"deliveries"`
+	}{items}, &ack)
+	if err != nil || ack.Version != 1 || !ack.DiagnosticOnly || ack.AcceptedIDs == nil {
+		return ack, fmt.Errorf("shutdown delivery unconfirmed")
+	}
+	return ack, nil
 }
 
 func (c *ReportClient) ReportSkills(ctx context.Context, payload gateway.SkillReportPayload) error {

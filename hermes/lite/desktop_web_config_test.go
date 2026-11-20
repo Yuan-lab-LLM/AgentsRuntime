@@ -462,6 +462,8 @@ settings:
 func TestDesktopWebQualifiedProvidersUseManagedCustomNamespace(t *testing.T) {
 	before := []byte(`providers:
   clawmanager-auto:
+    base_url: http://gateway.platform.svc/v1
+    key_env: OPENAI_API_KEY
     enabled: false
     api: https://stale-api.example/v1
     url: https://stale-url.example/v1
@@ -510,10 +512,14 @@ func TestDesktopWebQualifiedProvidersUseManagedCustomNamespace(t *testing.T) {
 func TestDesktopWebManagedCatalogKeepsProviderGroupsSeparate(t *testing.T) {
 	before := []byte(`providers:
   clawmanager-auto:
+    base_url: http://gateway.platform.svc/v1
+    key_env: OPENAI_API_KEY
     models:
       auto: {context_length: 12345}
       stale-model: {}
   clawmanager-icompify:
+    base_url: http://gateway.platform.svc/v1
+    key_env: OPENAI_API_KEY
     models:
       icompify: {}
       model-a: {supports_tools: true}

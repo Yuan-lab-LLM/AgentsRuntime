@@ -13,12 +13,15 @@ import (
 
 	"github.com/iamlovingit/clawmanager-agent/control"
 	"github.com/iamlovingit/clawmanager-agent/gateway"
+	"github.com/iamlovingit/clawmanager-agent/shutdownoutbox"
+	"strings"
 )
 
 type Agent struct {
-	cfg      Config
-	manager  *gateway.GatewayManager
-	reporter *control.ReportClient
+	shutdownQueue *shutdownoutbox.Queue
+	cfg           Config
+	manager       *gateway.GatewayManager
+	reporter      *control.ReportClient
 
 	podMu sync.RWMutex
 	podID int
@@ -26,10 +29,22 @@ type Agent struct {
 
 func NewAgent(cfg Config) *Agent {
 	manager := gateway.NewGatewayManager(cfg, nil, nil)
+	var queue *shutdownoutbox.Queue
+	if cfg.RuntimeType == "openclaw" || cfg.RuntimeType == "openclaw-shell" {
+		queue = shutdownoutbox.New(cfg.AgentDataDir, cfg.ReportToken, strings.TrimRight(cfg.BackendURL, "/")+"/lite/"+cfg.RuntimeType)
+		manager.ConfigureShutdownObservationSink(func(state gateway.GatewayState) error {
+			if state.ShutdownObservation == nil {
+				return nil
+			}
+			o := state.ShutdownObservation
+			return queue.Put(shutdownoutbox.Event{InstanceID: state.InstanceID, OwnerUserID: state.UserID, Generation: o.Generation, ClaimID: o.ClaimID, Outcome: o.Outcome})
+		})
+	}
 	return &Agent{
-		cfg:      cfg,
-		manager:  manager,
-		reporter: control.NewReportClient(cfg),
+		shutdownQueue: queue,
+		cfg:           cfg,
+		manager:       manager,
+		reporter:      control.NewReportClient(cfg),
 	}
 }
 
@@ -73,6 +88,9 @@ func (a *Agent) Run(ctx context.Context) error {
 			log.Printf("runtime-agent shutdown gateway stop failed: %v", err)
 		}
 		stopCancel()
+		flushCtx, flushCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		a.reportShutdownDeliveries(flushCtx)
+		flushCancel()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		_ = server.Shutdown(shutdownCtx)
 		cancel()
@@ -83,7 +101,8 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(4)
+	wg.Add(5)
+	go func() { defer wg.Done(); a.shutdownDeliveryLoop(ctx) }()
 	go func() {
 		defer wg.Done()
 		a.heartbeatLoop(ctx)
@@ -237,6 +256,44 @@ func (a *Agent) reportGateways(ctx context.Context) {
 	payload := a.manager.GatewayReportPayload(a.currentPodID())
 	if err := a.reporter.ReportGateways(ctx, payload); err != nil {
 		log.Printf("runtime-agent gateways report failed: %v", err)
+	}
+}
+
+func (a *Agent) reportShutdownDeliveries(ctx context.Context) {
+	if a.shutdownQueue == nil {
+		return
+	}
+	items, err := a.shutdownQueue.Pending()
+	if err != nil {
+		log.Printf("shutdown observation queue unavailable")
+		return
+	}
+	if len(items) == 0 {
+		return
+	}
+	ack, err := a.reporter.ReportShutdownDeliveries(ctx, items)
+	if err != nil {
+		log.Printf("shutdown observation delivery pending")
+		return
+	}
+	if a.shutdownQueue.Acknowledge(items, ack) != nil {
+		log.Printf("shutdown observation acknowledgement unconfirmed")
+	}
+}
+
+func (a *Agent) shutdownDeliveryLoop(ctx context.Context) {
+	if a.shutdownQueue == nil {
+		return
+	}
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		a.reportShutdownDeliveries(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 	}
 }
 

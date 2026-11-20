@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -54,7 +53,6 @@ func TestGatewayEnvAlignsOpenCodeHomeWithWorkspaceRoot(t *testing.T) {
 		"HOME=/workspaces/opencode/user-3/instance-7",
 		"CLAWMANAGER_WORKSPACE_PATH=/workspaces/opencode/user-3/instance-7",
 		"CLAWMANAGER_PROJECT_PATH=/workspaces/opencode/user-3/instance-7",
-		"CLAWMANAGER_DEFAULT_PROJECT_PATH=/workspaces/opencode/user-3/instance-7",
 		"OPENCODE_CONFIG_DIR=/workspaces/opencode/user-3/instance-7/home/.opencode",
 		"XDG_CONFIG_HOME=/workspaces/opencode/user-3/instance-7/home/.config",
 		"XDG_CACHE_HOME=/workspaces/opencode/user-3/instance-7/home/.cache",
@@ -70,132 +68,14 @@ func TestGatewayEnvAlignsOpenCodeHomeWithWorkspaceRoot(t *testing.T) {
 			t.Fatalf("env missing %q in:\n%s", want, joined)
 		}
 	}
-}
-
-func TestGatewayEnvUsesValidatedTypedDefaultProject(t *testing.T) {
-	workspace := t.TempDir()
-	starter := filepath.Join(workspace, "starter")
-	if err := os.Mkdir(starter, 0o750); err != nil {
-		t.Fatal(err)
-	}
-	req := gateway.CreateGatewayRequest{
-		InstanceID:          7,
-		ProjectRelativePath: "starter",
-		Environment: map[string]string{
-			"CLAWMANAGER_DEFAULT_PROJECT_RELATIVE_PATH": "../other-instance",
-			"CLAWMANAGER_DEFAULT_PROJECT_PATH":          filepath.Join(workspace, "missing"),
-		},
-	}
-	env := NewProfile("opencode").GatewayEnv(nil, gateway.Config{RuntimeType: "opencode"}, req, workspace, 20042)
-	joined := strings.Join(env, "\n")
-	for _, want := range []string{
-		"CLAWMANAGER_PROJECT_PATH=" + starter,
-		"CLAWMANAGER_DEFAULT_PROJECT_PATH=" + starter,
-		"CLAWMANAGER_DEFAULT_PROJECT_RELATIVE_PATH=starter",
-	} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("env missing %q in:\n%s", want, joined)
+	for _, unwanted := range []string{"CLAWMANAGER_DEFAULT_PROJECT_PATH=", "CLAWMANAGER_DEFAULT_PROJECT_RELATIVE_PATH="} {
+		if strings.Contains(joined, unwanted) {
+			t.Fatalf("env unexpectedly contains %q in:\n%s", unwanted, joined)
 		}
 	}
 }
 
-func TestResolveOpenCodeProjectPathSupportsCompatibilityInputs(t *testing.T) {
-	workspace := t.TempDir()
-	starter := filepath.Join(workspace, "starter")
-	if err := os.Mkdir(starter, 0o750); err != nil {
-		t.Fatal(err)
-	}
-
-	tests := []struct {
-		name string
-		req  gateway.CreateGatewayRequest
-	}{
-		{
-			name: "relative environment",
-			req: gateway.CreateGatewayRequest{Environment: map[string]string{
-				"CLAWMANAGER_DEFAULT_PROJECT_RELATIVE_PATH": "starter",
-			}},
-		},
-		{
-			name: "absolute environment",
-			req: gateway.CreateGatewayRequest{Environment: map[string]string{
-				"CLAWMANAGER_DEFAULT_PROJECT_PATH": starter,
-			}},
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got, relative, reason := resolveOpenCodeProjectPath(tc.req, workspace)
-			if reason != "" || got != starter || relative != "starter" {
-				t.Fatalf("resolveOpenCodeProjectPath() = (%q, %q, %q), want (%q, starter, empty)", got, relative, reason, starter)
-			}
-		})
-	}
-}
-
-func TestResolveOpenCodeProjectPathKeepsExistingLegacyProject(t *testing.T) {
-	workspace := t.TempDir()
-	legacyProject := filepath.Join(workspace, "project")
-	if err := os.Mkdir(legacyProject, 0o750); err != nil {
-		t.Fatal(err)
-	}
-	got, relative, reason := resolveOpenCodeProjectPath(gateway.CreateGatewayRequest{}, workspace)
-	if got != legacyProject || relative != "" || reason != "" {
-		t.Fatalf("resolveOpenCodeProjectPath() = (%q, %q, %q), want legacy project", got, relative, reason)
-	}
-}
-
-func TestResolveOpenCodeProjectPathFallsBackWithoutMutatingWorkspace(t *testing.T) {
-	workspace := t.TempDir()
-	filePath := filepath.Join(workspace, "file.txt")
-	if err := os.WriteFile(filePath, []byte("keep"), 0o640); err != nil {
-		t.Fatal(err)
-	}
-	missing := filepath.Join(workspace, "missing")
-	tests := []struct {
-		name string
-		req  gateway.CreateGatewayRequest
-	}{
-		{name: "legacy request", req: gateway.CreateGatewayRequest{}},
-		{name: "parent escape", req: gateway.CreateGatewayRequest{ProjectRelativePath: "../instance-8/starter"}},
-		{name: "absolute typed path", req: gateway.CreateGatewayRequest{ProjectRelativePath: filepath.Join(workspace, "starter")}},
-		{name: "missing directory", req: gateway.CreateGatewayRequest{ProjectRelativePath: "missing"}},
-		{name: "file target", req: gateway.CreateGatewayRequest{ProjectRelativePath: "file.txt"}},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got, relative, _ := resolveOpenCodeProjectPath(tc.req, workspace)
-			if got != workspace || relative != "" {
-				t.Fatalf("resolveOpenCodeProjectPath() = (%q, %q), want workspace fallback", got, relative)
-			}
-		})
-	}
-	if _, err := os.Stat(missing); !os.IsNotExist(err) {
-		t.Fatalf("resolver created missing project directory: %v", err)
-	}
-	raw, err := os.ReadFile(filePath)
-	if err != nil || string(raw) != "keep" {
-		t.Fatalf("resolver mutated existing file: %q, %v", raw, err)
-	}
-}
-
-func TestResolveOpenCodeProjectPathRejectsSymlinkEscape(t *testing.T) {
-	workspace := t.TempDir()
-	outside := t.TempDir()
-	link := filepath.Join(workspace, "starter")
-	if err := os.Symlink(outside, link); err != nil {
-		if runtime.GOOS == "windows" {
-			t.Skipf("symlink creation is unavailable: %v", err)
-		}
-		t.Fatal(err)
-	}
-	got, relative, reason := resolveOpenCodeProjectPath(gateway.CreateGatewayRequest{ProjectRelativePath: "starter"}, workspace)
-	if got != workspace || relative != "" || !strings.Contains(reason, "symbolic link") {
-		t.Fatalf("resolveOpenCodeProjectPath() = (%q, %q, %q), want symlink fallback", got, relative, reason)
-	}
-}
-
-func TestPrepareWorkspaceCreatesTypedDefaultProjectIdempotently(t *testing.T) {
+func TestLegacyDefaultProjectInputDoesNotCreateOrSelectDirectory(t *testing.T) {
 	root := t.TempDir()
 	workspace := filepath.Join(root, "opencode", "user-3", "instance-7")
 	req := gateway.CreateGatewayRequest{
@@ -203,47 +83,28 @@ func TestPrepareWorkspaceCreatesTypedDefaultProjectIdempotently(t *testing.T) {
 		UserID:              3,
 		WorkspacePath:       workspace,
 		ProjectRelativePath: "starter",
+		Environment: map[string]string{
+			"CLAWMANAGER_DEFAULT_PROJECT_PATH":          filepath.Join(workspace, "starter"),
+			"CLAWMANAGER_DEFAULT_PROJECT_RELATIVE_PATH": "starter",
+		},
 	}
 	profile := NewProfile("opencode")
 	cfg := gateway.Config{WorkspaceRoot: root, RuntimeType: "opencode"}
+	if err := profile.PrepareWorkspace(cfg, req, workspace); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "starter")); !os.IsNotExist(err) {
+		t.Fatalf("legacy input created a starter directory: %v", err)
+	}
 
-	for attempt := 0; attempt < 2; attempt++ {
-		if err := profile.PrepareWorkspace(cfg, req, workspace); err != nil {
-			t.Fatalf("PrepareWorkspace attempt %d: %v", attempt+1, err)
+	joined := strings.Join(profile.GatewayEnv(nil, cfg, req, workspace, 20042), "\n")
+	if !strings.Contains(joined, "CLAWMANAGER_PROJECT_PATH="+workspace) {
+		t.Fatalf("workspace root was not selected:\n%s", joined)
+	}
+	for _, unwanted := range []string{"CLAWMANAGER_DEFAULT_PROJECT_PATH=", "CLAWMANAGER_DEFAULT_PROJECT_RELATIVE_PATH="} {
+		if strings.Contains(joined, unwanted) {
+			t.Fatalf("legacy input leaked %q into runtime env:\n%s", unwanted, joined)
 		}
-	}
-	info, err := os.Stat(filepath.Join(workspace, "starter"))
-	if err != nil || !info.IsDir() {
-		t.Fatalf("starter directory was not created: %v", err)
-	}
-	entries, err := os.ReadDir(filepath.Join(workspace, "starter"))
-	if err != nil || len(entries) != 0 {
-		t.Fatalf("starter must be empty, entries=%v err=%v", entries, err)
-	}
-}
-
-func TestPrepareWorkspaceRejectsExistingDefaultProjectFile(t *testing.T) {
-	root := t.TempDir()
-	workspace := filepath.Join(root, "opencode", "user-3", "instance-7")
-	if err := os.MkdirAll(workspace, 0o750); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(workspace, "starter"), []byte("keep"), 0o640); err != nil {
-		t.Fatal(err)
-	}
-	req := gateway.CreateGatewayRequest{
-		InstanceID:          7,
-		UserID:              3,
-		WorkspacePath:       workspace,
-		ProjectRelativePath: "starter",
-	}
-	err := NewProfile("opencode").PrepareWorkspace(
-		gateway.Config{WorkspaceRoot: root, RuntimeType: "opencode"},
-		req,
-		workspace,
-	)
-	if err == nil || !strings.Contains(err.Error(), "not a directory") {
-		t.Fatalf("expected existing file rejection, got %v", err)
 	}
 }
 

@@ -46,14 +46,30 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 	}
 
 	configPath := filepath.Join(opencodeHome, "opencode.json")
-	raw, err := RenderConfig(settings)
+	content, _ := gateway.RequestEnvValue(req, "OPENCODE_CONFIG_CONTENT")
+	raw, err := RenderManagedConfig(settings, content)
 	if err != nil {
 		return err
 	}
 	if cfg.NetworkSecurityProfile == "isolated-network-v1" && req.SecurityProfile == cfg.NetworkSecurityProfile {
-		return writeProtectedOpenCodeConfig(cfg, req, workspacePath, raw)
+		return writeProtectedOpenCodeConfig(cfg, req, workspacePath, raw, settings)
 	}
-	if err := root.WriteFile(configPath, raw, 0o640); err != nil {
+	if info, statErr := root.Lstat(configPath); statErr == nil {
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("refusing to replace non-regular OpenCode config")
+		}
+		previous, readErr := root.ReadFile(configPath)
+		if readErr != nil {
+			return readErr
+		}
+		raw, err = mergeManagedConfigData(previous, raw, settings)
+		if err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(statErr) {
+		return statErr
+	}
+	if err := root.WriteFileAtomic(configPath, raw, 0o640); err != nil {
 		return fmt.Errorf("write opencode config: %w", err)
 	}
 	if err := root.ChownTree(opencodeHome, req.UID, req.GID); err != nil {
@@ -85,7 +101,7 @@ func normalizeLLMSettings(settings llmconfig.Settings) (llmconfig.Settings, erro
 	if !settings.APIKeySet || strings.TrimSpace(settings.APIKey) == "" {
 		return llmconfig.Settings{}, fmt.Errorf("missing OpenCode LLM API key")
 	}
-	if len(settings.ModelIDs) == 0 {
+	if len(settings.ModelIDs) == 0 && !settings.CatalogSynced {
 		settings.ModelIDs = []string{defaultModelID}
 		settings.ModelsQualified = false
 	}
@@ -98,6 +114,9 @@ func RenderConfig(settings llmconfig.Settings) ([]byte, error) {
 		return nil, err
 	}
 
+	if settings.CatalogSynced && len(settings.ModelIDs) == 0 {
+		return json.MarshalIndent(map[string]any{"provider": map[string]any{clawmanagerProviderID: providerConfig(clawmanagerProviderName, settings.BaseURL, "CLAWMANAGER_LLM_API_KEY", nil)}, "enabled_providers": []string{clawmanagerProviderID}}, "", "  ")
+	}
 	// v2 governance uses one managed provider. Preserve gateway model names
 	// rather than creating provider IDs that bypass its request adapter.
 	if managedV2Provider() && settings.ModelsQualified {
@@ -146,18 +165,16 @@ func RenderConfig(settings llmconfig.Settings) ([]byte, error) {
 		providers, enabledProviders = qualifiedProviderConfig(settings.BaseURL, apiKeyEnv, llmconfig.GroupModelRefs(refs))
 	}
 	for _, ref := range refs {
-		if managedV2Provider() {
-			window, exists := settings.ContextWindows[ref.Qualified]
-			if !exists {
-				window, exists = settings.ContextWindows[ref.ModelID]
+		if name := settings.ModelNames[ref.ModelID]; name != "" {
+			providers[ref.ProviderID].(map[string]any)["models"].(map[string]any)[ref.ModelID].(map[string]any)["name"] = name
+		}
+		if window := settings.ContextFor(ref.ProviderID, ref.ModelID); window > 0 {
+			model := providers[ref.ProviderID].(map[string]any)["models"].(map[string]any)[ref.ModelID].(map[string]any)
+			limit := map[string]int{"context": window}
+			if managedV2Provider() {
+				limit["output"] = min(32000, window)
 			}
-			if !exists {
-				window = settings.ContextWindow
-			}
-			if window > 0 {
-				model := providers[ref.ProviderID].(map[string]any)["models"].(map[string]any)[ref.ModelID].(map[string]any)
-				model["limit"] = map[string]int{"context": window, "output": min(32000, window)}
-			}
+			model["limit"] = limit
 		}
 		enabled, managed := settings.Vision[ref.Qualified]
 		if !managed {

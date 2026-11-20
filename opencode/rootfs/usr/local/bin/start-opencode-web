@@ -19,16 +19,19 @@ if [ -z "${OPENCODE_CONFIG:-}" ] && [ -f "${opencode_home}/opencode.json" ]; the
   export OPENCODE_CONFIG="${opencode_home}/opencode.json"
 fi
 
-# OpenCode resolves a non-project working directory to the global root (/),
-# which leaves the Web UI with an empty session pane. Each managed instance
-# gets its own lightweight Git worktree instead.
-# The managed workspace is only a container for uploaded projects and skills.
-# Init-container exports are not inherited by the main desktop container, so
-# calculate the default project here instead of relying on its temporary env.
-workspace_path="${CLAWMANAGER_WORKSPACE_PATH:-/config/workspace}"
-workspace_path="$(realpath -m "${workspace_path}")"
-project_path="${CLAWMANAGER_DEFAULT_PROJECT_PATH:-${CLAWMANAGER_PROJECT_PATH:-${workspace_path%/}/project}}"
-project_path="$(realpath -m "${project_path}")"
+workspace_path="$(realpath -m "${CLAWMANAGER_WORKSPACE_PATH:-/config/workspace}")"
+
+if [ "${CLAWMANAGER_RUNTIME_TYPE:-}" = "opencode" ]; then
+  # Lite users select their own project in OpenCode. Never create a project or
+  # initialize Git while launching the shared Runtime gateway.
+  project_path="${workspace_path}"
+  export CLAWMANAGER_PROJECT_PATH="${workspace_path}"
+  unset CLAWMANAGER_DEFAULT_PROJECT_PATH CLAWMANAGER_DEFAULT_PROJECT_RELATIVE_PATH
+else
+  # The independent Pro desktop retains its existing managed project flow.
+  project_path="${CLAWMANAGER_DEFAULT_PROJECT_PATH:-${CLAWMANAGER_PROJECT_PATH:-${workspace_path%/}/project}}"
+  project_path="$(realpath -m "${project_path}")"
+fi
 
 # A project path originates from the control plane.  Treat it as untrusted at
 # the image boundary so a malformed override cannot make OpenCode browse the
@@ -41,9 +44,11 @@ case "${project_path}" in
     ;;
 esac
 
-mkdir -p "${project_path}"
-if command -v git >/dev/null 2>&1 && [ ! -d "${project_path}/.git" ]; then
-  git -C "${project_path}" init --quiet || true
+if [ "${CLAWMANAGER_RUNTIME_TYPE:-}" != "opencode" ]; then
+  mkdir -p "${project_path}"
+  if command -v git >/dev/null 2>&1 && [ ! -d "${project_path}/.git" ]; then
+    git -C "${project_path}" init --quiet || true
+  fi
 fi
 
 if [ -z "${OPENCODE_SERVER_PASSWORD:-}" ] && [ "${host}" != "127.0.0.1" ] && [ "${host}" != "::1" ] && [ "${host}" != "localhost" ]; then
@@ -54,12 +59,13 @@ if [ -n "${OPENCODE_SERVER_PASSWORD:-}" ]; then
   export OPENCODE_SERVER_USERNAME="${OPENCODE_SERVER_USERNAME:-opencode}"
 fi
 
-if [ -n "${project_path}" ]; then
-  cd "${project_path}"
-fi
+cd "${project_path}"
 # `opencode web` also calls xdg-open, which creates a normal Chromium window.
 # Pro launches its own app-mode Chromium from start-opencode-terminal, so use
 # the headless server command here to keep exactly one desktop window.
+# The validated, merged file is authoritative. Do not reapply the raw control
+# plane document on top of preserved user settings inside the CLI.
+unset OPENCODE_CONFIG_CONTENT
 if [ "${CLAWMANAGER_TEAM_ENABLED:-false}" = "true" ]; then
   exec /usr/local/bin/node /usr/local/share/clawmanager/opencode-team/main.mjs --hostname "${host}" --port "${port}"
 fi

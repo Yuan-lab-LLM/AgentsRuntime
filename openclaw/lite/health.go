@@ -22,7 +22,10 @@ func newHealthChecker(cfg gateway.Config) gateway.GatewayHealthChecker {
 		if err := native.probeOpenClawAdmission(ctx, base+"/startupz", "ok"); err != nil {
 			return err
 		}
-		return native.probeOpenClawAdmission(ctx, base+"/readyz", "ready")
+		if err := native.probeOpenClawAdmission(ctx, base+"/readyz", "ready"); err != nil {
+			return err
+		}
+		return gateway.CheckTaskCapabilityHealth(ctx, spec.Env)
 	})
 }
 func (h *nativeAdmissionChecker) probeOpenClawAdmission(ctx context.Context, rawURL, flag string) error {

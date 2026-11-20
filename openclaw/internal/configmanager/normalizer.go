@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/iamlovingit/clawmanager-openclaw-image/internal/managedmodelrefs"
 	"log"
 	"os"
 	"path"
@@ -26,6 +27,9 @@ func (m *Manager) NormalizeActiveConfig() error {
 		return err
 	}
 	if changed {
+		if err := managedmodelrefs.BackupOnce(m.cfg.OpenClawConfigPath); err != nil {
+			return fmt.Errorf("backup model references: %w", err)
+		}
 		if err := os.WriteFile(m.cfg.OpenClawConfigPath, normalized, 0o600); err != nil {
 			return err
 		}
@@ -71,9 +75,14 @@ func normalizeConfigMap(content []byte, cfg appconfig.Config) ([]byte, bool, err
 		return nil, false, err
 	}
 	if hasLLMOverrides {
-		normalizeLLMConfigContent(parsed, llm)
+		if err := normalizeLLMConfigContent(parsed, llm); err != nil {
+			return nil, false, err
+		}
 	}
 	normalizeProviderAuthContracts(parsed)
+	if _, err := managedmodelrefs.Normalize(parsed, llm.BaseURL, llm.APIKey); err != nil {
+		return nil, false, err
+	}
 	normalizeOpenClawVersionContracts(parsed, os.Getenv("CLAWMANAGER_OPENCLAW_VERSION"))
 
 	channelOpts := readChannelOverridesFromEnv(cfg)
@@ -198,7 +207,14 @@ func migrateLegacyModelAllowlist(defaults map[string]any) {
 	for _, ref := range refs {
 		legacyRefs = append(legacyRefs, ref)
 	}
+	// Retain managed allow-list synchronization until policy provenance is
+	// tracked. The model map remains supported for aliases/params.
 	policy["allow"] = mergeStringLists(policy["allow"], legacyRefs)
+	for _, value := range legacy {
+		if entry, ok := value.(map[string]any); !ok || len(entry) > 0 {
+			return
+		}
+	}
 	delete(defaults, "models")
 }
 
@@ -346,15 +362,22 @@ func rewriteConfig(parsed map[string]any) ([]byte, error) {
 }
 
 type llmOverrides struct {
-	BaseURL   string
-	APIKey    string
-	APIKeySet bool
-	ModelIDs  []string
-	Vision    map[string]bool
+	ContextWindow  int
+	ContextWindows map[string]int
+	BaseURL        string
+	APIKey         string
+	APIKeySet      bool
+	ModelIDs       []string
+	Vision         map[string]bool
 }
 
 func readLLMOverridesFromEnv() (llmOverrides, bool, error) {
 	var overrides llmOverrides
+	var contextErr error
+	overrides.ContextWindow, overrides.ContextWindows, contextErr = readManagedContextWindows()
+	if contextErr != nil {
+		return llmOverrides{}, false, contextErr
+	}
 
 	if raw := strings.TrimSpace(os.Getenv("CLAWMANAGER_LLM_MODEL")); raw != "" {
 		modelIDs, err := parseModelIDs(raw)
@@ -442,7 +465,12 @@ func uniqueNonEmptyModelIDs(values []any) []string {
 // normalizeLLMConfigContent writes baseUrl / apiKey / models / primary into
 // cfg based on environment-provided overrides. When no overrides exist for
 // a given field, the corresponding subtree is left untouched.
-func normalizeLLMConfigContent(cfg map[string]any, overrides llmOverrides) {
+func normalizeLLMConfigContent(cfg map[string]any, overrides llmOverrides) error {
+	names := []string{autoProviderName}
+	if err := managedmodelrefs.PrepareProviders(cfg, names, overrides.BaseURL, overrides.APIKey); err != nil {
+		return err
+	}
+	managed := managedmodelrefs.ManagedProviderNames(cfg, names, overrides.BaseURL, overrides.APIKey)
 	models := ensureObject(cfg, "models")
 	providers := ensureObject(models, "providers")
 	providerName := autoProviderName
@@ -464,6 +492,19 @@ func normalizeLLMConfigContent(cfg map[string]any, overrides llmOverrides) {
 		provider["models"] = buildProviderModels(provider["models"], overrides.ModelIDs)
 		for _, entry := range provider["models"].([]any) {
 			model := entry.(map[string]any)
+			if window := overrides.contextFor(providerName, stringValue(model["id"])); window > 0 {
+				model["contextWindow"] = window
+				switch maximum := model["maxTokens"].(type) {
+				case int:
+					if maximum > window {
+						model["maxTokens"] = window
+					}
+				case float64:
+					if maximum > float64(window) {
+						model["maxTokens"] = window
+					}
+				}
+			}
 			if enabled, ok := overrides.Vision[stringValue(model["id"])]; ok {
 				input := []any{}
 				if previous, ok := model["input"].([]any); ok {
@@ -487,8 +528,9 @@ func normalizeLLMConfigContent(cfg map[string]any, overrides llmOverrides) {
 		defaults := ensureObject(agents, "defaults")
 		model := ensureObject(defaults, "model")
 		model["primary"] = qualifiedModelID(providerName, overrides.ModelIDs[0])
-		defaults["models"] = buildAgentModels(defaults["models"], providerName, overrides.ModelIDs)
+		defaults["models"] = managedmodelrefs.MergeAgentEntries(defaults["models"], buildAgentModels(defaults["models"], providerName, overrides.ModelIDs), managed)
 	}
+	return nil
 }
 
 func normalizeProviderAuthContracts(cfg map[string]any) {
@@ -515,7 +557,11 @@ func buildProviderModels(existing any, modelIDs []string) []any {
 	byID := indexModelsByID(existing)
 	models := make([]any, 0, len(modelIDs))
 	for _, id := range modelIDs {
-		if current, ok := byID[id]; ok {
+		current, ok := byID[id]
+		if !ok {
+			current, ok = byID[managedmodelrefs.ModelID(id)]
+		}
+		if ok {
 			cloned := cloneMap(current)
 			cloned["id"] = id
 			if strings.EqualFold(id, "auto") || strings.TrimSpace(stringValue(cloned["name"])) == "" {
@@ -557,6 +603,10 @@ func buildAgentModels(existing any, providerName string, modelIDs []string) map[
 		key := qualifiedModelID(providerName, id)
 		if current != nil {
 			if value, ok := current[key]; ok {
+				models[key] = value
+				continue
+			}
+			if value, ok := current[managedmodelrefs.Ref(providerName, id)]; ok {
 				models[key] = value
 				continue
 			}

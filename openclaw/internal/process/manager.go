@@ -51,18 +51,21 @@ const (
 )
 
 type Snapshot struct {
-	Status               Status        `json:"status"`
-	PID                  int           `json:"pid,omitempty"`
-	StartedAt            time.Time     `json:"started_at,omitempty"`
-	ExitedAt             time.Time     `json:"exited_at,omitempty"`
-	LastExitCode         int           `json:"last_exit_code,omitempty"`
-	LastExitReason       string        `json:"last_exit_reason,omitempty"`
-	LastOperation        string        `json:"last_operation,omitempty"`
-	LastOperationResult  string        `json:"last_operation_result,omitempty"`
-	GatewayWarmupStarted bool          `json:"gateway_warmup_started"`
-	GatewayWarmupReady   bool          `json:"gateway_warmup_ready"`
-	Restarts             int           `json:"restarts"`
-	Uptime               time.Duration `json:"uptime,omitempty"`
+	ShutdownObservation   *ShutdownObservation `json:"shutdown_observation,omitempty"`
+	ShutdownAudit         string               `json:"shutdown_audit,omitempty"`
+	CapabilityReportReady *bool                `json:"capability_report_ready,omitempty"`
+	Status                Status               `json:"status"`
+	PID                   int                  `json:"pid,omitempty"`
+	StartedAt             time.Time            `json:"started_at,omitempty"`
+	ExitedAt              time.Time            `json:"exited_at,omitempty"`
+	LastExitCode          int                  `json:"last_exit_code,omitempty"`
+	LastExitReason        string               `json:"last_exit_reason,omitempty"`
+	LastOperation         string               `json:"last_operation,omitempty"`
+	LastOperationResult   string               `json:"last_operation_result,omitempty"`
+	GatewayWarmupStarted  bool                 `json:"gateway_warmup_started"`
+	GatewayWarmupReady    bool                 `json:"gateway_warmup_ready"`
+	Restarts              int                  `json:"restarts"`
+	Uptime                time.Duration        `json:"uptime,omitempty"`
 }
 
 type doctorState struct {
@@ -97,6 +100,16 @@ type Manager struct {
 	warmupMu               sync.Mutex
 	warmupStarted          bool
 	warmupDone             bool
+	capabilityCommand      *exec.Cmd
+	shutdownAudit          string
+	shutdownObservation    *ShutdownObservation
+	shutdownOwnerProvider  func() int
+	shutdownSink           func(int, ShutdownObservation) error
+	shutdownOwnerAtStart   int
+	shutdownPendingOwner   int
+	shutdownPending        *ShutdownObservation
+	capabilityReady        bool
+	capabilityCheckedAt    time.Time
 }
 
 func New(cfg appconfig.Config) *Manager {
@@ -111,6 +124,10 @@ func (m *Manager) Start(ctx context.Context) error {
 
 func (m *Manager) start(ctx context.Context, skipDoctor bool) error {
 	m.mu.Lock()
+	if err := m.flushShutdownObservationLocked(); err != nil {
+		m.mu.Unlock()
+		return err
+	}
 	if m.cmd != nil && m.cmd.Process != nil && m.status != StatusStopped && m.status != StatusCrashed {
 		m.lastOperation = "start_openclaw"
 		m.lastOperationResult = "noop_already_running"
@@ -127,6 +144,15 @@ func (m *Manager) start(ctx context.Context, skipDoctor bool) error {
 	m.lastOperationResult = "preparing_start"
 	m.mu.Unlock()
 
+	startEnv, err := proReceiptEnvironment(m.cfg, openClawStartEnvFromOS())
+	if err != nil {
+		m.markStartFailed(err)
+		return err
+	}
+	if err := checkRuntimeActivation(ctx, startEnv, runTaskActivationProbe); err != nil {
+		m.markStartFailed(err)
+		return err
+	}
 	m.notifyStartup(ctx, m.cfg.StartupNotificationMessage)
 	doctorRan := false
 	if !skipDoctor && m.shouldRunDoctorBeforeStart() {
@@ -145,7 +171,7 @@ func (m *Manager) start(ctx context.Context, skipDoctor bool) error {
 
 	m.setLastOperationResult("starting_openclaw_gateway")
 	cmd := exec.CommandContext(context.Background(), m.cfg.OpenClawCommand[0], m.cfg.OpenClawCommand[1:]...)
-	cmd.Env = openClawStartEnvFromOS()
+	cmd.Env = startEnv
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
@@ -165,6 +191,12 @@ func (m *Manager) start(ctx context.Context, skipDoctor bool) error {
 	}
 
 	m.cmd = cmd
+	m.shutdownOwnerAtStart = 0
+	if m.shutdownOwnerProvider != nil {
+		m.shutdownOwnerAtStart = m.shutdownOwnerProvider()
+	}
+	// A prior generation's observation must not be sent as this process's stop.
+	m.shutdownObservation = nil
 	m.done = make(chan struct{})
 	m.stopRequested = false
 	m.startedAt = time.Now().UTC()
@@ -175,10 +207,14 @@ func (m *Manager) start(ctx context.Context, skipDoctor bool) error {
 	m.warmupDone = false
 	pid := cmd.Process.Pid
 	repairOnHealthTimeout := !skipDoctor && !doctorRan && m.doctorPolicy() == "auto"
+	capabilityDone := m.done
 	m.mu.Unlock()
 
 	go m.wait(cmd, repairOnHealthTimeout)
 	go m.promoteRunning(pid, repairOnHealthTimeout)
+	if !m.isDeepSeekHarness() && capabilityHealthRequired(cmd.Env) {
+		go m.monitorCapabilities(cmd, capabilityDone)
+	}
 	m.startGatewayModelsWarmup(m.done)
 	return nil
 }
@@ -215,6 +251,9 @@ func removeEnv(env []string, key string) []string {
 }
 
 func (m *Manager) startGatewayModelsWarmup(done <-chan struct{}) {
+	if m.isDeepSeekHarness() {
+		return
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		if done == nil {
@@ -429,6 +468,9 @@ func (m *Manager) shouldRunDoctorBeforeStart() bool {
 }
 
 func (m *Manager) doctorPolicy() string {
+	if m.isDeepSeekHarness() {
+		return "never"
+	}
 	switch strings.ToLower(strings.TrimSpace(m.cfg.OpenClawDoctorPolicy)) {
 	case "always", "never", "auto":
 		return strings.ToLower(strings.TrimSpace(m.cfg.OpenClawDoctorPolicy))
@@ -738,6 +780,29 @@ func (m *Manager) promoteRunning(pid int, repairOnHealthTimeout bool) {
 	for {
 		select {
 		case <-timeout.C:
+			m.mu.Lock()
+			if !m.isDeepSeekHarness() && m.cmd != nil && m.cmd.Process != nil && m.cmd.Process.Pid == pid && capabilityHealthRequired(m.cmd.Env) {
+				m.lastOperationResult = "OpenClaw capability startup readiness timed out"
+				_ = m.cmd.Process.Kill()
+				m.mu.Unlock()
+				return
+			}
+			m.mu.Unlock()
+			if m.isDeepSeekHarness() {
+				m.mu.Lock()
+				if m.cmd != nil && m.cmd.Process != nil && m.cmd.Process.Pid == pid {
+					m.lastOperationResult = "DeepSeek Harness authenticated startup health check timed out"
+					// Let the proxy cancel and reap its DSH child before exiting.
+					// Platforms without SIGTERM support still terminate the process.
+					if err := m.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+						_ = m.cmd.Process.Kill()
+					} else {
+						go m.killUnreadyDeepSeekAfterGrace(pid, m.done)
+					}
+				}
+				m.mu.Unlock()
+				return
+			}
 			if repairOnHealthTimeout && m.cfg.OpenClawHealthURL != "" {
 				go m.repairAfterStartupHealthTimeout(pid)
 				return
@@ -750,6 +815,21 @@ func (m *Manager) promoteRunning(pid int, repairOnHealthTimeout bool) {
 				return
 			}
 		}
+	}
+}
+
+func (m *Manager) killUnreadyDeepSeekAfterGrace(pid int, done <-chan struct{}) {
+	timer := time.NewTimer(10 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return
+	case <-timer.C:
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cmd != nil && m.cmd.Process != nil && m.cmd.Process.Pid == pid {
+		_ = m.cmd.Process.Kill()
 	}
 }
 
@@ -860,7 +940,14 @@ func (m *Manager) stop(ctx context.Context) error {
 		m.lastOperation = "stop_openclaw"
 		m.lastOperationResult = "noop_already_stopped"
 		m.status = StatusStopped
+		unconfirmed := m.shutdownAudit != "" && m.shutdownAudit != "cleanup_confirmed_release_observed"
+		if m.flushShutdownObservationLocked() != nil {
+			unconfirmed = true
+		}
 		m.mu.Unlock()
+		if unconfirmed {
+			return errShutdownUnconfirmed
+		}
 		return nil
 	}
 	m.status = StatusStopping
@@ -868,6 +955,7 @@ func (m *Manager) stop(ctx context.Context) error {
 	m.stopRequested = true
 	m.mu.Unlock()
 
+	proof, proofErr := captureShutdownProof(cmd.Env)
 	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		m.mu.Lock()
 		m.lastOperationResult = err.Error()
@@ -888,7 +976,7 @@ func (m *Manager) stop(ctx context.Context) error {
 		m.mu.Lock()
 		m.lastOperationResult = "stopped"
 		m.mu.Unlock()
-		return nil
+		return m.auditStoppedProcess(cmd, proof, proofErr, "stopped")
 	case <-timer.C:
 		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 			m.mu.Lock()
@@ -901,7 +989,7 @@ func (m *Manager) stop(ctx context.Context) error {
 			m.mu.Lock()
 			m.lastOperationResult = "killed_after_timeout"
 			m.mu.Unlock()
-			return nil
+			return m.auditStoppedProcess(cmd, proof, proofErr, "killed_after_timeout")
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(5 * time.Second):
@@ -939,9 +1027,23 @@ func (m *Manager) Snapshot() Snapshot {
 		GatewayWarmupStarted: m.warmupStarted,
 		GatewayWarmupReady:   m.warmupDone,
 		Restarts:             m.restarts,
+		ShutdownAudit:        m.shutdownAudit,
 	}
 	if m.cmd != nil && m.cmd.Process != nil {
 		s.PID = m.cmd.Process.Pid
+	}
+	if m.shutdownObservation != nil {
+		value := *m.shutdownObservation
+		s.ShutdownObservation = &value
+	}
+	if m.status == StatusRunning && !m.isDeepSeekHarness() && m.cmd != nil && capabilityHealthRequired(m.cmd.Env) {
+		ready := m.capabilityCommand == m.cmd && m.capabilityReady && !m.capabilityCheckedAt.After(time.Now()) && time.Since(m.capabilityCheckedAt) <= 15*time.Second
+		s.CapabilityReportReady = &ready
+	}
+	if m.status == StatusRunning && !m.isDeepSeekHarness() && m.cmd != nil && capabilityHealthRequired(m.cmd.Env) &&
+		(m.capabilityCommand != m.cmd || !m.capabilityReady || m.capabilityCheckedAt.After(time.Now()) || time.Since(m.capabilityCheckedAt) > 15*time.Second) {
+		s.Status = StatusConfiguring
+		s.LastOperationResult = "capability_report_unavailable"
 	}
 	if !m.startedAt.IsZero() && (m.status == StatusRunning || m.status == StatusStarting || m.status == StatusConfiguring) {
 		s.Uptime = time.Since(m.startedAt)
@@ -950,12 +1052,38 @@ func (m *Manager) Snapshot() Snapshot {
 }
 
 func (m *Manager) checkHealth() bool {
+	requiresCapability := false
+	if !m.isDeepSeekHarness() {
+		m.mu.Lock()
+		var env []string
+		if m.cmd != nil {
+			env = append([]string(nil), m.cmd.Env...)
+		}
+		m.mu.Unlock()
+		if checkCapabilityHealth(context.Background(), env) != nil {
+			return false
+		}
+		requiresCapability = capabilityHealthRequired(env)
+	}
+	if m.isDeepSeekHarness() {
+		if strings.TrimSpace(m.cfg.OpenClawHealthURL) == "" {
+			return false
+		}
+		// The local DSH proxy supplies its browser cookie and checks the real
+		// application root. OpenClaw's /readyz and /startupz are not DSH APIs.
+		client := &http.Client{Timeout: 3 * time.Second}
+		return gatewayProbeFlag(context.Background(), client, m.cfg.OpenClawHealthURL, "")
+	}
 	readyURL := gatewayReadyURL(m.cfg.OpenClawHealthURL)
 	if readyURL == "" {
-		return true
+		return !requiresCapability
 	}
 	client := &http.Client{Timeout: 3 * time.Second}
 	return gatewayAdmissionReady(context.Background(), client, readyURL)
+}
+
+func (m *Manager) isDeepSeekHarness() bool {
+	return strings.EqualFold(strings.TrimSpace(m.cfg.RuntimeType), "deepseek-harness")
 }
 
 func gatewayAdmissionReady(ctx context.Context, client *http.Client, readyURL string) bool {

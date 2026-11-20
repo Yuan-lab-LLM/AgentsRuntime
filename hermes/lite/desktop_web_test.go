@@ -11,7 +11,13 @@ import (
 )
 
 func strictTestRequest(root string) gateway.CreateGatewayRequest {
-	return gateway.CreateGatewayRequest{InstanceID: 42, UserID: 7, Generation: 1, UID: 1000, GID: 1000, AgentType: "hermes", GatewayPort: 20000,
+	// Root can prepare the fixture identity; ordinary Unix runners must use
+	// their own identity so chown exercises the same-user contract.
+	uid, gid := os.Getuid(), os.Getgid()
+	if uid <= 0 || gid <= 0 {
+		uid, gid = 1000, 1000
+	}
+	return gateway.CreateGatewayRequest{InstanceID: 42, UserID: 7, Generation: 1, UID: uid, GID: gid, AgentType: "hermes", GatewayPort: 20000,
 		WorkspacePath: filepath.Join(root, "hermes", "user-7", "instance-42"), Environment: map[string]string{
 			"CLAWMANAGER_INSTANCE_TOKEN": "managed-auth", "CLAWMANAGER_LLM_API_KEY": "instance-model-key", "CLAWMANAGER_LLM_BASE_URL": "http://gateway.ns.svc.cluster.local:9001/v1",
 		}}
@@ -28,6 +34,7 @@ func TestDesktopWebEnvironmentWhitelistAndAuthoritativeIdentity(t *testing.T) {
 	req.Environment["NODE_OPTIONS"] = "--require /tmp/inject.js"
 	req.Environment["RUNTIME_AGENT_CONTROL_TOKEN"] = "request-control-secret"
 	req.Environment["UNDEFINED_ENV"] = "ignored"
+	req.Environment["CLAWMANAGER_MODEL_REFERENCE_PROTOCOL"] = "1"
 	req.Environment["CLAWMANAGER_HERMES_BACKEND_MODE"] = "dashboard"
 	cfg := gateway.Config{RuntimeType: "hermes", PublicOrigin: "https://manager.example", TrustedProxies: []string{"10.1.2.0/24"}, LLMAPIKey: "pod-llm-secret", GatewayToken: "pod-gateway-secret"}
 	env := p.GatewayEnv([]string{"PATH=/usr/bin:/bin", "RUNTIME_AGENT_REPORT_TOKEN=report-secret", "ANTHROPIC_API_KEY=pod-provider-secret", "HERMES_DASHBOARD_SESSION_TOKEN=pod-session-secret", "PYTHONPATH=/tmp/inject"}, cfg, req, req.WorkspacePath, 20000)
@@ -42,6 +49,9 @@ func TestDesktopWebEnvironmentWhitelistAndAuthoritativeIdentity(t *testing.T) {
 		}
 	}
 	if got := p.GatewayCommand(""); len(got) != 1 || got[0] != "start-hermes-lite-runtime" {
+		t.Fatal(got)
+	}
+	if got := envValue(env, "CLAWMANAGER_MODEL_REFERENCE_PROTOCOL"); got != "1" {
 		t.Fatal(got)
 	}
 }
@@ -79,7 +89,11 @@ func TestDesktopWebTeamUsesExistingTeamContractAlongsideDashboard(t *testing.T) 
 	req.Environment["CLAWMANAGER_TEAM_ROLE"] = "leader"
 	req.Environment["CLAWMANAGER_TEAM_REDIS_URL"] = "redis://redis.example:6379/0"
 	req.Environment["CLAWMANAGER_TEAM_SHARED_DIR"] = "/team"
-	req.Environment["CLAWMANAGER_TEAM_SHARED_GID"] = "300001"
+	teamGID := "300001"
+	if os.Geteuid() != 0 {
+		teamGID = strconv.Itoa(req.GID)
+	}
+	req.Environment["CLAWMANAGER_TEAM_SHARED_GID"] = teamGID
 	req.Environment["CLAWMANAGER_TEAM_TOKEN"] = "team-secret"
 	cfg := gateway.Config{WorkspaceRoot: root, RuntimeType: "hermes", GatewayPortStart: 20000, GatewayPortEnd: 20299}
 	if err := NewProfile("hermes").PrepareWorkspace(cfg, req, req.WorkspacePath); err != nil {
@@ -91,7 +105,7 @@ func TestDesktopWebTeamUsesExistingTeamContractAlongsideDashboard(t *testing.T) 
 		"CLAWMANAGER_TEAM_MEMBER_ID": "leader", "CLAWMANAGER_TEAM_ROLE": "leader",
 		"CLAWMANAGER_TEAM_REDIS_URL": "redis://redis.example:6379/0", "CLAWMANAGER_TEAM_TOKEN": "team-secret",
 		"CLAWMANAGER_TEAM_SHARED_DIR":            filepath.Join(req.WorkspacePath, "team"),
-		"CLAWMANAGER_TEAM_SHARED_GID":            "300001",
+		"CLAWMANAGER_TEAM_SHARED_GID":            teamGID,
 		"HERMES_TEAM_WORKER_HOME":                filepath.Join(req.WorkspacePath, "home", ".clawmanager-team-worker"),
 		"CLAWMANAGER_HERMES_DESKTOP_WEB_ENABLED": "true", "HERMES_ACCEPT_HOOKS": "1",
 	} {

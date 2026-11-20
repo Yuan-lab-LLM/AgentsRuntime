@@ -73,6 +73,8 @@ RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/openclaw
 COPY --from=node-runtime /usr/local /usr/local
 
 COPY openclaw/patches/ /usr/local/share/openclaw/patches/
+RUN node /usr/local/share/openclaw/patches/patch_managed_model_reference_102.mjs --patch \
+    && node /usr/local/share/openclaw/patches/patch_managed_model_reference_102.mjs --verify
 RUN node /usr/local/share/openclaw/patches/test_managed_proxy_policy.mjs \
     && node /usr/local/share/openclaw/patches/patch_managed_proxy_policy.mjs --patch --install-marker \
     && node /usr/local/share/openclaw/patches/test_managed_proxy_metadata.mjs

@@ -20,7 +20,8 @@ export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-/config/.config}"
 export XDG_DATA_HOME="${XDG_DATA_HOME:-/config/.local/share}"
 
 mkdir -p "$HOME" "$OPENCODE_CONFIG_DIR" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$CLAWMANAGER_PROJECT_PATH"
-/usr/local/bin/opencode-apply-runtime-config >/tmp/opencode-runtime-config.log 2>&1 || true
+/usr/local/bin/opencode-apply-runtime-config >/tmp/opencode-runtime-config.log 2>&1
+unset OPENCODE_CONFIG_CONTENT
 
 workspace_path="$(realpath -m "${CLAWMANAGER_WORKSPACE_PATH:-${CLAWMANAGER_PROJECT_PATH}}")"
 project_path="$(realpath -m "${CLAWMANAGER_DEFAULT_PROJECT_PATH:-${workspace_path%/}/project}")"

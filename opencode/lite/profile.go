@@ -19,6 +19,8 @@ type Profile struct {
 	runtimeType string
 }
 
+func (p Profile) WritesStartupModelCatalog() bool { return true }
+
 func NewProfile(runtimeType string) Profile {
 	return Profile{runtimeType: strings.ToLower(strings.TrimSpace(runtimeType))}
 }
@@ -62,6 +64,12 @@ func (p Profile) GatewayEnv(base []string, cfg gateway.Config, req gateway.Creat
 	}
 	env = gateway.ApplyLiteTeamConfigEnvironment(env, req, workspacePath)
 	projectPath, projectRelativePath, fallbackReason := resolveOpenCodeProjectPath(req, workspacePath)
+	if _, _, team := gateway.LiteTeamEnvironment(req, workspacePath); team && strings.TrimSpace(req.ProjectRelativePath) != "" {
+		env = setEnv(env, "CLAWMANAGER_DEFAULT_PROJECT_PATH", projectPath)
+		env = setEnv(env, "CLAWMANAGER_DEFAULT_PROJECT_RELATIVE_PATH", projectRelativePath)
+	} else {
+		env = unsetEnv(env, "CLAWMANAGER_DEFAULT_PROJECT_PATH", "CLAWMANAGER_DEFAULT_PROJECT_RELATIVE_PATH")
+	}
 	if fallbackReason != "" {
 		log.Printf("runtime-agent OpenCode default project fallback: instance_id=%d workspace_path=%q project_relative_path=%q reason=%s", req.InstanceID, workspacePath, req.ProjectRelativePath, fallbackReason)
 	}
@@ -70,13 +78,7 @@ func (p Profile) GatewayEnv(base []string, cfg gateway.Config, req gateway.Creat
 	env = setEnv(env, "CLAWMANAGER_USER_ID", strconv.Itoa(req.UserID))
 	env = setEnv(env, "CLAWMANAGER_RUNTIME_TYPE", cfg.RuntimeType)
 	env = setEnv(env, "CLAWMANAGER_WORKSPACE_PATH", workspacePath)
-	env = setEnv(env, "CLAWMANAGER_PROJECT_PATH", projectPath)
-	env = setEnv(env, "CLAWMANAGER_DEFAULT_PROJECT_PATH", projectPath)
-	if projectRelativePath == "" {
-		env = unsetEnv(env, "CLAWMANAGER_DEFAULT_PROJECT_RELATIVE_PATH")
-	} else {
-		env = setEnv(env, "CLAWMANAGER_DEFAULT_PROJECT_RELATIVE_PATH", projectRelativePath)
-	}
+	env = setEnv(env, "CLAWMANAGER_PROJECT_PATH", workspacePath)
 	env = setEnv(env, "CLAWMANAGER_GATEWAY_PORT", strconv.Itoa(port))
 	// ClawManager's workspace browser exposes workspacePath as its root. Keep
 	// OpenCode's idea of the user's home aligned with that root as well, or a
@@ -130,6 +132,9 @@ func (p Profile) GatewayEnv(base []string, cfg gateway.Config, req gateway.Creat
 }
 
 func resolveOpenCodeProjectPath(req gateway.CreateGatewayRequest, workspacePath string) (string, string, string) {
+	if _, _, team := gateway.LiteTeamEnvironment(req, workspacePath); !team {
+		return workspacePath, "", ""
+	}
 	workspacePath = cleanRuntimeWorkspacePath(workspacePath)
 	rawPath, absolute, supplied := requestedOpenCodeProjectPath(req)
 
@@ -266,6 +271,9 @@ func (p Profile) PrepareWorkspace(cfg gateway.Config, req gateway.CreateGatewayR
 }
 
 func prepareOpenCodeProjectDirectory(req gateway.CreateGatewayRequest, workspacePath string) error {
+	if _, _, team := gateway.LiteTeamEnvironment(req, workspacePath); !team {
+		return nil
+	}
 	if strings.TrimSpace(req.ProjectRelativePath) == "" {
 		return nil
 	}

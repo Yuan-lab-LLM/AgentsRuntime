@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/iamlovingit/clawmanager-agent/managedmodelrefs"
 	"log"
 	"net/url"
 	"os"
@@ -217,7 +218,18 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 		gatewayConfig["trustedProxies"] = appendUniqueStringArray(gatewayConfig["trustedProxies"], cfg.TrustedProxies...)
 	}
 	cfg.OpenClawVersion = openClawVersion
-	mergeOpenClawLLMConfig(config, cfg)
+	if err := mergeOpenClawLLMConfig(config, cfg); err != nil {
+		return fmt.Errorf("merge managed models: %w", err)
+	}
+	refsChanged, err := managedmodelrefs.Normalize(config, cfg.LLMBaseURL, cfg.LLMAPIKey)
+	if err != nil {
+		return fmt.Errorf("normalize managed model references: %w", err)
+	}
+	if refsChanged {
+		if err := managedmodelrefs.BackupOnce(configPath); err != nil {
+			return fmt.Errorf("backup model references: %w", err)
+		}
+	}
 	if IsOpenClawAtLeast(openClawVersion, OpenClaw81Version) {
 		openclawcompat.Normalize81(config)
 	}
@@ -954,16 +966,30 @@ func resolveOpenClawVersion(cfg gateway.Config, req gateway.CreateGatewayRequest
 	return strings.TrimSpace(os.Getenv("CLAWMANAGER_OPENCLAW_VERSION"))
 }
 
-func mergeOpenClawLLMConfig(config map[string]any, cfg gateway.Config) {
+func mergeOpenClawLLMConfig(config map[string]any, cfg gateway.Config) error {
 	if cfg.LLMBaseURL == "" && !cfg.LLMAPIKeySet && len(cfg.LLMModelIDs) == 0 {
 		normalizeOpenClawProviderAuthContracts(config)
-		return
+		return nil
 	}
 
-	models := ensureObject(config, "models")
-	providers := ensureObject(models, "providers")
 	modelRefs := llmconfig.FromGatewayConfig(cfg).ModelRefs(openClawAutoProviderName)
 	providerGroups := llmconfig.GroupModelRefs(modelRefs)
+	names := []string{}
+	for _, group := range providerGroups {
+		names = append(names, group.ProviderID)
+	}
+	if len(names) == 0 && !cfg.LLMCatalogSynced {
+		names = append(names, openClawAutoProviderName)
+	}
+	if err := managedmodelrefs.PrepareProviders(config, names, cfg.LLMBaseURL, cfg.LLMAPIKey); err != nil {
+		return err
+	}
+	managed := managedmodelrefs.ManagedProviderNames(config, names, cfg.LLMBaseURL, cfg.LLMAPIKey)
+	models := ensureObject(config, "models")
+	providers := ensureObject(models, "providers")
+	if cfg.LLMCatalogSynced {
+		pruneStartupModelCatalog(config, managed, modelRefs)
+	}
 
 	if len(modelRefs) > 0 {
 		// The incoming catalog owns every provider connected to the managed
@@ -1060,17 +1086,40 @@ func mergeOpenClawLLMConfig(config map[string]any, cfg gateway.Config) {
 			for _, entry := range provider["models"].([]any) {
 				model := entry.(map[string]any)
 				id := configStringValue(model["id"])
+				if name := cfg.LLMModelNames[id]; name != "" {
+					model["name"] = name
+				}
 				ref := llmconfig.ModelRef{ModelID: id, Qualified: group.ProviderID + "/" + id}
+				if window := llmconfig.FromGatewayConfig(cfg).ContextFor(group.ProviderID, id); window > 0 {
+					model["contextWindow"] = window
+					if maximum, ok := model["maxTokens"].(int); ok && maximum > window {
+						model["maxTokens"] = window
+					}
+				} else if cfg.LLMCatalogSynced {
+					delete(model, "contextWindow")
+				}
 				if vision, managed := openClawSettingForRef(cfg.LLMVision, ref); managed {
 					model["input"] = gateway.VisionInputModalities(model["input"], vision)
 				}
 			}
 		}
 
+		if cfg.LLMCatalogSynced {
+			if selected, ok := defaults["model"].(string); ok && selected != "" {
+				provider, _, _ := strings.Cut(selected, "/")
+				if !managed[provider] {
+					defaults["model"] = map[string]any{"primary": selected}
+				}
+			}
+		}
 		model := ensureObject(defaults, "model")
 		primaryModel := modelRefs[0].Qualified
-		model["primary"] = primaryModel
-		defaults["models"] = buildOpenClawAgentModelsFromRefs(defaults["models"], modelRefs)
+		previousPrimary, _ := model["primary"].(string)
+		previousProvider, _, _ := strings.Cut(previousPrimary, "/")
+		if !cfg.LLMCatalogSynced || previousPrimary == "" || managed[previousProvider] {
+			model["primary"] = primaryModel
+		}
+		defaults["models"] = managedmodelrefs.MergeAgentEntries(defaults["models"], buildOpenClawAgentModelsFromRefs(defaults["models"], modelRefs), managed)
 		for ref, value := range customModels {
 			defaults["models"].(map[string]any)[ref] = value
 		}
@@ -1082,10 +1131,11 @@ func mergeOpenClawLLMConfig(config map[string]any, cfg gateway.Config) {
 		if rawImageModel, exists := defaults["imageModel"]; !exists || rawImageModel == nil {
 			defaults["imageModel"] = map[string]any{"primary": primaryModel}
 		}
-	} else {
+	} else if !cfg.LLMCatalogSynced {
 		mergeOpenClawProviderConnection(providers, openClawAutoProviderName, cfg)
 	}
 	normalizeOpenClawProviderAuthContracts(config)
+	return nil
 }
 
 func removeObsoleteOpenClawModelRefs(parent map[string]any, key string, obsolete func(string) bool) {
@@ -1189,7 +1239,11 @@ func buildOpenClawProviderModels(existing any, modelIDs []string, reasoningByID 
 	byID := indexOpenClawModelsByID(existing)
 	models := make([]any, 0, len(modelIDs))
 	for _, id := range modelIDs {
-		if current, ok := byID[id]; ok {
+		current, ok := byID[id]
+		if !ok {
+			current, ok = byID[managedmodelrefs.ModelID(id)]
+		}
+		if ok {
 			cloned := cloneOpenClawMap(current)
 			cloned["id"] = id
 			if reasoning, managed := reasoningByID[id]; managed {
@@ -1254,6 +1308,10 @@ func buildOpenClawAgentModelsFromRefs(existing any, refs []llmconfig.ModelRef) m
 	for _, ref := range refs {
 		if current != nil {
 			if value, ok := current[ref.Qualified]; ok {
+				models[ref.Qualified] = value
+				continue
+			}
+			if value, ok := current[managedmodelrefs.Ref(ref.ProviderID, ref.ModelID)]; ok {
 				models[ref.Qualified] = value
 				continue
 			}

@@ -10,6 +10,16 @@ import (
 func OpenClawGatewayEnv(base []string, cfg gateway.Config, req gateway.CreateGatewayRequest, workspacePath string, port int) []string {
 	env := append([]string(nil), base...)
 	env = gateway.ApplyRequestEnvironment(env, req)
+	env = gateway.RemoveEnvironmentValues(env, gateway.TaskReceiptRootEnv, "CLAWMANAGER_GATEWAY_GENERATION")
+	env = gateway.SetEnvironmentValue(env, "CLAWMANAGER_GATEWAY_GENERATION", strconv.Itoa(req.Generation))
+	for _, entry := range base {
+		if strings.HasPrefix(entry, gateway.TaskReceiptRootEnv+"=") {
+			env = gateway.RemoveEnvironmentValues(env, "CLAWMANAGER_TASK_RECEIPT_DIR")
+			if directory, err := gateway.ReceiptDirectoryPath(strings.TrimPrefix(entry, gateway.TaskReceiptRootEnv+"="), cfg.WorkspaceRoot, req); err == nil {
+				env = gateway.SetEnvironmentValue(env, "CLAWMANAGER_TASK_RECEIPT_DIR", directory)
+			}
+		}
+	}
 	// Control-plane policy always overrides untrusted instance environment.
 	env = gateway.RemoveEnvironmentValues(env, "CLAWMANAGER_PROXY_POLICY_FILE")
 	env = gateway.RemoveEnvironmentValues(env, "CLAWMANAGER_PROXY_POLICY_NAMESPACE")

@@ -1,0 +1,59 @@
+name: Hermes model catalog regression
+
+on:
+  push:
+    paths:
+      - 'hermes/**'
+      - 'hermes/lite/**'
+      - 'clawmanager-agent/llmconfig/**'
+      - 'clawmanager-agent/gateway/**'
+      - '.github/workflows/hermes-model-catalog.yml'
+  pull_request:
+    paths:
+      - 'hermes/**'
+      - 'hermes/lite/**'
+      - 'clawmanager-agent/llmconfig/**'
+      - 'clawmanager-agent/gateway/**'
+      - '.github/workflows/hermes-model-catalog.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  config:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: clawmanager-agent/go.mod
+          cache-dependency-path: |
+            clawmanager-agent/go.sum
+            hermes/go.sum
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install config test dependency
+        run: python -m pip install PyYAML==6.0.3
+      - name: Check Pro script and complete configuration round trips
+        run: |
+          bash -n hermes/rootfs/usr/local/bin/hermes-apply-runtime-config
+          python hermes/tests/test_model_catalog_merge.py
+          python hermes/tests/test_managed_model_catalog.py
+      - name: Verify native provider patch against pinned upstream source
+        run: |
+          curl --fail --location --retry 3 --max-time 90 https://raw.githubusercontent.com/NousResearch/hermes-agent/29112bef099274229cadff79cdff7bf7b99c4b77/hermes_cli/runtime_provider.py -o "$RUNNER_TEMP/hermes-runtime-provider.py"
+          curl --fail --location --retry 3 --max-time 90 https://raw.githubusercontent.com/NousResearch/hermes-agent/29112bef099274229cadff79cdff7bf7b99c4b77/agent/tool_executor.py -o "$RUNNER_TEMP/hermes-tool-executor.py"
+          python hermes/tests/test_managed_model_catalog.py --native-source "$RUNNER_TEMP/hermes-runtime-provider.py" --native-tool-source "$RUNNER_TEMP/hermes-tool-executor.py"
+      - name: Verify managed hooks compose with locked Hermes Lite native source
+        run: |
+          python hermes/scripts/verify_lite_release.py --lock hermes/hermes-lite.lock.json --download "$RUNNER_TEMP/hermes-lite-native"
+          HERMES_LITE_NATIVE_ROOT="$RUNNER_TEMP/hermes-lite-native" python hermes/tests/test_managed_model_catalog_v0225.py
+      - name: Test Runtime configuration contracts
+        working-directory: clawmanager-agent
+        run: go test ./llmconfig -count=1
+      - name: Test Hermes image contracts
+        working-directory: hermes
+        run: go test ./... -count=1

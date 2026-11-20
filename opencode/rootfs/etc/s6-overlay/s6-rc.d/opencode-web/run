@@ -6,7 +6,7 @@ if [ -n "${RUNTIME_AGENT_CONTROL_TOKEN:-}" ] || [ -n "${RUNTIME_AGENT_REPORT_TOK
   exec sleep infinity
 fi
 
-/usr/local/bin/opencode-apply-runtime-config || true
+/usr/local/bin/opencode-apply-runtime-config
 
 # A persistent /config volume may contain files created by an older image that
 # ran OpenCode as root. Repair ownership on every Pro boot before handing the

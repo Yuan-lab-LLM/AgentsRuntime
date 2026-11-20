@@ -77,6 +77,16 @@ func TestParseModelIDsSupportsObjectEntries(t *testing.T) {
 	}
 }
 
+func TestParseModelIDsAllowsEmptyCatalog(t *testing.T) {
+	models, err := parseModelIDs(`[]`, ProviderModelsEnv)
+	if err != nil || len(models) != 0 {
+		t.Fatalf("models = %#v, error = %v", models, err)
+	}
+	if _, err := parseModelIDs(`[{}]`, ProviderModelsEnv); err == nil {
+		t.Fatal("nonempty array without model IDs must be rejected")
+	}
+}
+
 func TestLoadFromEnvUsesOpenAIModelFallback(t *testing.T) {
 	t.Setenv(ProviderModelsEnv, "")
 	t.Setenv(LegacyModelsEnv, "")

@@ -22,23 +22,25 @@ import (
 	"github.com/iamlovingit/clawmanager-openclaw-image/internal/profiler"
 	"github.com/iamlovingit/clawmanager-openclaw-image/internal/protocol"
 	"github.com/iamlovingit/clawmanager-openclaw-image/internal/session"
+	"github.com/iamlovingit/clawmanager-openclaw-image/internal/shutdownoutbox"
 	"github.com/iamlovingit/clawmanager-openclaw-image/internal/skills"
 	"github.com/iamlovingit/clawmanager-openclaw-image/internal/store"
 )
 
 type Supervisor struct {
-	cfg       appconfig.Config
-	store     *store.Store
-	process   *process.Manager
-	profiler  *profiler.Profiler
-	inspector *openclawinspector.Inspector
-	client    *control.Client
-	session   *session.Manager
-	config    *configmanager.Manager
-	skills    *skills.Manager
-	executor  *command.Executor
-	http      *httpserver.Server
-	logger    *log.Logger
+	shutdownQueue *shutdownoutbox.Queue
+	cfg           appconfig.Config
+	store         *store.Store
+	process       *process.Manager
+	profiler      *profiler.Profiler
+	inspector     *openclawinspector.Inspector
+	client        *control.Client
+	session       *session.Manager
+	config        *configmanager.Manager
+	skills        *skills.Manager
+	executor      *command.Executor
+	http          *httpserver.Server
+	logger        *log.Logger
 }
 
 func New(cfg appconfig.Config) (*Supervisor, error) {
@@ -64,6 +66,14 @@ func New(cfg appconfig.Config) (*Supervisor, error) {
 		return st.Snapshot().SessionToken
 	})
 	proc := process.New(cfg)
+	var queue *shutdownoutbox.Queue
+	if cfg.RuntimeType == "openclaw" || cfg.RuntimeType == "openclaw-shell" {
+		queue = shutdownoutbox.New(cfg.AgentDataDir, cfg.BootstrapToken, strings.TrimRight(cfg.ControlPlaneBaseURL, "/")+"/pro/"+cfg.InstanceID)
+		proc.ConfigureShutdownObservationSink(func() int { return st.Snapshot().OwnerUserID }, func(owner int, value process.ShutdownObservation) error {
+			id, _ := strconv.Atoi(cfg.InstanceID)
+			return queue.Put(shutdownoutbox.Event{InstanceID: id, OwnerUserID: owner, Generation: value.Generation, ClaimID: value.ClaimID, Outcome: value.Outcome})
+		})
+	}
 	prof := profiler.New(cfg)
 	inspector := openclawinspector.New(cfg.OpenClawConfigPath, cfg.OpenClawWorkspacePath, cfg.OpenClawBuiltinSkillsPath)
 	sessionManager := session.New(cfg, client, st)
@@ -73,18 +83,19 @@ func New(cfg appconfig.Config) (*Supervisor, error) {
 	httpServer := httpserver.New(cfg, proc, prof, inspector, st)
 
 	return &Supervisor{
-		cfg:       cfg,
-		store:     st,
-		process:   proc,
-		profiler:  prof,
-		inspector: inspector,
-		client:    client,
-		session:   sessionManager,
-		config:    configManager,
-		skills:    skillManager,
-		executor:  executor,
-		http:      httpServer,
-		logger:    logger,
+		shutdownQueue: queue,
+		cfg:           cfg,
+		store:         st,
+		process:       proc,
+		profiler:      prof,
+		inspector:     inspector,
+		client:        client,
+		session:       sessionManager,
+		config:        configManager,
+		skills:        skillManager,
+		executor:      executor,
+		http:          httpServer,
+		logger:        logger,
 	}, nil
 }
 
@@ -111,6 +122,12 @@ func (s *Supervisor) Run(ctx context.Context) error {
 
 	if err := s.ensureSession(ctx); err != nil {
 		return err
+	}
+	if s.shutdownQueue != nil {
+		pending, _ := s.shutdownQueue.Pending()
+		if len(pending) > 0 || os.Getenv("CLAWMANAGER_OPENCLAW_CAPABILITY_RENEWAL") == "1" {
+			s.refreshShutdownDeliveryScope(ctx)
+		}
 	}
 
 	state := s.store.Snapshot()
@@ -139,7 +156,8 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		s.modelGuardLoop(ctx)
 	}()
 
-	wg.Add(4)
+	wg.Add(5)
+	go func() { defer wg.Done(); s.shutdownDeliveryLoop(ctx) }()
 	go func() {
 		defer wg.Done()
 		s.heartbeatLoop(ctx, errCh)
@@ -265,6 +283,7 @@ func (s *Supervisor) reportLoop(ctx context.Context, errCh chan<- error) {
 					Capabilities:    defaultCapabilities(),
 				},
 				Runtime: protocol.RuntimePayload{
+					ShutdownObservation:     s.inlineShutdownObservation(snapshot.ShutdownObservation, state.OwnerUserID),
 					OpenClawStatus:          string(snapshot.Status),
 					OpenClawPID:             optionalInt(snapshot.PID),
 					OpenClawVersion:         inspect.Version,
@@ -272,7 +291,7 @@ func (s *Supervisor) reportLoop(ctx context.Context, errCh chan<- error) {
 				},
 				SystemInfo: systemInfo,
 				Health: map[string]any{
-					"runtime_process":                 runtimeProcessHealth(snapshot.Status),
+					"runtime_process":                 runtimeSnapshotHealth(snapshot),
 					"desktop":                         desktopHealth(s.cfg.DesktopBase),
 					"agent":                           "ok",
 					"metrics_collector":               "ok",
@@ -283,6 +302,7 @@ func (s *Supervisor) reportLoop(ctx context.Context, errCh chan<- error) {
 					"last_exit_reason":                snapshot.LastExitReason,
 					"last_operation":                  snapshot.LastOperation,
 					"last_result":                     snapshot.LastOperationResult,
+					"shutdown_audit":                  snapshot.ShutdownAudit,
 					"gateway_warmup_started":          snapshot.GatewayWarmupStarted,
 					"gateway_warmup_ready":            snapshot.GatewayWarmupReady,
 				},
@@ -296,6 +316,85 @@ func (s *Supervisor) reportLoop(ctx context.Context, errCh chan<- error) {
 					})
 				}
 			}
+		}
+	}
+}
+
+func (s *Supervisor) inlineShutdownObservation(value *process.ShutdownObservation, owner int) *protocol.RuntimeShutdownObservation {
+	// Bound runtimes deliver history independently; never let an old generation's
+	// inline diagnostic block current heartbeat/state reports. Older servers
+	// without scope negotiation retain the existing inline compatibility path.
+	if s.shutdownQueue != nil && owner > 0 {
+		return nil
+	}
+	return shutdownObservationPayload(value)
+}
+func shutdownObservationPayload(value *process.ShutdownObservation) *protocol.RuntimeShutdownObservation {
+	// Inline observations remain a compatibility diagnostic, separate from ACKed delivery.
+	if value == nil {
+		return nil
+	}
+	return &protocol.RuntimeShutdownObservation{Generation: value.Generation, ClaimID: value.ClaimID, Outcome: value.Outcome}
+}
+
+func (s *Supervisor) reportShutdownDeliveries(ctx context.Context) {
+	// A cached pre-upgrade Agent session may have no owner metadata. The
+	// optional scope probe binds it without forcing bootstrap re-registration.
+	// Runs independently of heartbeat/state/command loops. Network failure
+	// cannot stall the existing state-report cadence.
+	if s.shutdownQueue == nil {
+		return
+	}
+	if s.process.FlushShutdownObservation() != nil {
+		s.logger.Printf("shutdown observation persistence pending")
+		return
+	}
+	items, err := s.shutdownQueue.Pending()
+	if err != nil {
+		s.logger.Printf("shutdown observation queue unavailable")
+		return
+	}
+	if len(items) == 0 {
+		return
+	}
+	ack, err := s.client.ReportShutdownDeliveries(ctx, items)
+	if err != nil {
+		s.logger.Printf("shutdown observation delivery pending")
+		return
+	}
+	if s.shutdownQueue.Acknowledge(items, ack) != nil {
+		s.logger.Printf("shutdown observation acknowledgement unconfirmed")
+	}
+}
+
+func (s *Supervisor) refreshShutdownDeliveryScope(parent context.Context) {
+	ctx, cancel := context.WithTimeout(parent, 3*time.Second)
+	defer cancel()
+	scope, err := s.client.ShutdownDeliveryScope(ctx)
+	id, _ := strconv.Atoi(s.cfg.InstanceID)
+	owner := 0
+	if err == nil && scope.Version == 1 && scope.InstanceID == id && scope.OwnerUserID > 0 {
+		owner = scope.OwnerUserID
+	} else {
+		s.logger.Printf("shutdown observation durable scope unconfirmed; legacy status remains available")
+	}
+	if s.store.Update(func(st *store.State) { st.OwnerUserID = owner }) != nil {
+		s.logger.Printf("shutdown observation scope persistence unconfirmed")
+	}
+}
+
+func (s *Supervisor) shutdownDeliveryLoop(ctx context.Context) {
+	if s.shutdownQueue == nil {
+		return
+	}
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		s.reportShutdownDeliveries(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
 		}
 	}
 }
@@ -353,6 +452,15 @@ func isOpenClaw81Runtime(version string) bool {
 }
 
 func runtimeProcessHealth(status process.Status) string {
+	return runtimeStatusHealth(status)
+}
+func runtimeSnapshotHealth(snapshot process.Snapshot) string {
+	if snapshot.CapabilityReportReady != nil && !*snapshot.CapabilityReportReady {
+		return "degraded"
+	}
+	return runtimeStatusHealth(snapshot.Status)
+}
+func runtimeStatusHealth(status process.Status) string {
 	switch status {
 	case process.StatusRunning, process.StatusStarting, process.StatusConfiguring:
 		return "ok"

@@ -34,6 +34,17 @@ export function managedPresetPatches(entries) {
   return patches;
 }
 
+export function startupCatalogReceipt(env) {
+  if (env.CLAWMANAGER_MODEL_CATALOG_SYNC !== '1' || !env.CLAWMANAGER_MODEL_CATALOG_JSON) return null;
+  const snapshot = JSON.parse(env.CLAWMANAGER_MODEL_CATALOG_JSON);
+  const canonical = JSON.parse(env.CLAWMANAGER_LLM_RESOLVED_CONFIG_JSON || '{}');
+  const instance = Number(env.CLAWMANAGER_INSTANCE_ID), owner = Number(env.CLAWMANAGER_USER_ID), generation = Number(env.CLAWMANAGER_GATEWAY_GENERATION);
+  if (!Number.isSafeInteger(instance) || instance <= 0 || !Number.isSafeInteger(owner) || owner <= 0 || !Number.isSafeInteger(generation) || generation < 0 || snapshot.complete !== true || snapshot.catalog_protocol !== 2 || snapshot.generation !== generation || snapshot.owner_user_id !== owner || !/^[a-f0-9]{64}$/.test(snapshot.revision) || !Array.isArray(snapshot.models) || canonical.catalog_synced !== true || !Array.isArray(canonical.model_ids)) throw new Error('Managed startup catalog receipt mismatch');
+  const expected = snapshot.models.map(model => model.id === 'auto' ? 'auto' : model.stable_id);
+  if (expected.some(id => typeof id !== 'string' || (id !== 'auto' && !id.startsWith('cm-deploy-v1-'))) || new Set(expected).size !== expected.length || JSON.stringify([...expected].sort()) !== JSON.stringify([...canonical.model_ids].sort())) throw new Error('Managed startup catalog models mismatch');
+  return { instance_id: instance, owner_user_id: owner, generation, revision: snapshot.revision, model_count: expected.filter(id => id !== 'auto').length };
+}
+
 function main() {
   const basePatch = process.argv[2];
   if (!basePatch || !process.env.DSH_HOME) throw new Error('managed patch and DSH_HOME are required');
@@ -55,6 +66,13 @@ function main() {
   const temporary = `${target}.${process.pid}.tmp`;
   writeFileSync(temporary, yaml.dump(patches, { schema, noRefs: true, lineWidth: -1 }), { mode: 0o600 });
   renameSync(temporary, target);
+  const receipt = startupCatalogReceipt(process.env);
+  if (receipt) {
+    const receiptTarget = join(dirname(target), 'catalog-sync.json');
+    const receiptTemporary = `${receiptTarget}.${process.pid}.tmp`;
+    writeFileSync(receiptTemporary, JSON.stringify(receipt), { mode: 0o600 });
+    renameSync(receiptTemporary, receiptTarget);
+  }
   process.stdout.write(target + '\n');
 }
 

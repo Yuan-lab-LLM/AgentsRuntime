@@ -28,7 +28,8 @@ func main() {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		if err := dshproxy.RunCommand(ctx, os.Args[2:], os.Stdout, os.Stderr); err != nil && !errors.Is(err, context.Canceled) {
-			log.Fatal(err)
+			log.Print(err)
+			os.Exit(dshproxy.CommandExitCode(err))
 		}
 		return
 	}

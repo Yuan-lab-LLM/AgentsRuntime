@@ -10,7 +10,7 @@ func TestOpenClawVersionCapabilities(t *testing.T) {
 	if IsOpenClawAtLeast("2026.7.1-2", OpenClaw81Version) {
 		t.Fatal("2026.7.1-2 must remain on the legacy compatibility path")
 	}
-	for _, version := range []string{"2026.8.1", "v2026.8.1", "2026.9.0", "2026.10.2"} {
+	for _, version := range []string{"2026.8.1", "v2026.8.1", "2026.9.0", "2026.10.2", "v2026.10.2"} {
 		if !IsOpenClawAtLeast(version, OpenClaw81Version) {
 			t.Fatalf("%s must use the 8.1 compatibility path", version)
 		}

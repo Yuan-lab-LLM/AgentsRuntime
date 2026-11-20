@@ -40,7 +40,7 @@ func writeCanonicalLLMConfig(output io.Writer, fallbackProvider, defaultModel st
 	if err != nil {
 		return err
 	}
-	if len(settings.ModelIDs) == 0 && strings.TrimSpace(defaultModel) != "" {
+	if len(settings.ModelIDs) == 0 && !settings.CatalogSynced && strings.TrimSpace(defaultModel) != "" {
 		settings.ModelIDs = []string{strings.TrimSpace(defaultModel)}
 	}
 

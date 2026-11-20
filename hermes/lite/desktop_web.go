@@ -91,7 +91,7 @@ func desktopWebEnvironment(base []string, cfg gateway.Config, req gateway.Create
 			env = setEnv(env, key, value)
 		}
 	}
-	for _, key := range []string{"CLAWMANAGER_LLM_MODEL", "CLAWMANAGER_LLM_PROVIDER", "OPENAI_MODEL", "CLAWMANAGER_INSTANCE_TOKEN"} {
+	for _, key := range []string{"CLAWMANAGER_LLM_MODEL", "CLAWMANAGER_LLM_PROVIDER", "OPENAI_MODEL", "CLAWMANAGER_INSTANCE_TOKEN", "CLAWMANAGER_MODEL_REFERENCE_PROTOCOL"} {
 		if value, ok := requestEnvValue(req, key); ok {
 			env = setEnv(env, key, value)
 		}

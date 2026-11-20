@@ -105,7 +105,15 @@ func migrateModelPolicy(agentDefaults map[string]any) {
 	}
 	sort.Strings(refs)
 	policy := ensureObject(agentDefaults, "modelPolicy")
+	// Keep legacy managed-policy synchronization until policy provenance is
+	// tracked. Freezing an existing auto-generated allow list hides new models.
+	// The model map also carries aliases/parameters and must not be discarded.
 	policy["allow"] = appendUniqueStrings(stringArray(policy["allow"]), refs...)
+	for _, value := range legacy {
+		if entry, ok := value.(map[string]any); !ok || len(entry) > 0 {
+			return
+		}
+	}
 	delete(agentDefaults, "models")
 }
 

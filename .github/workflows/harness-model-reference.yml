@@ -1,0 +1,25 @@
+name: Harness model reference regression
+on:
+  push:
+    paths: ['deepseek-harness/**', '.github/workflows/harness-model-reference.yml']
+  pull_request:
+    paths: ['deepseek-harness/**', '.github/workflows/harness-model-reference.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  references:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.21.0'
+      - name: Install isolated pinned upstream for native contract tests
+        run: npm install --prefix "$RUNNER_TEMP/harness-native" --ignore-scripts --no-audit --no-fund @deepseek-ai/dsh@0.2.1-rc.3
+      - name: Check original source and native entry points
+        run: |
+          export DSH_NATIVE_TEST_ROOT="$RUNNER_TEMP/harness-native/node_modules/@deepseek-ai/dsh"
+          node --test deepseek-harness/scripts/managed-model-reference.test.mjs deepseek-harness/scripts/managed-config.test.mjs deepseek-harness/scripts/harness-pro-process.test.mjs
+          node deepseek-harness/scripts/native-model-reference-smoke.mjs "$DSH_NATIVE_TEST_ROOT"

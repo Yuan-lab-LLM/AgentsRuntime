@@ -27,6 +27,7 @@ ARG VCS_REF=unknown
 ARG DEBIAN_FRONTEND=noninteractive
 LABEL io.clawmanager.deepseek-harness.version="0.2.1-rc.3" org.opencontainers.image.revision=$VCS_REF
 
+
 ENV CLAWMANAGER_RUNTIME_TYPE=deepseek-harness \
     RUNTIME_WORKSPACE_ROOT=/workspaces \
     RUNTIME_AGENT_DATA_DIR=/var/lib/clawmanager-agent \
@@ -111,6 +112,10 @@ COPY deepseek-harness/config/team.cordis.patch.yml /usr/local/share/deepseek-har
 RUN node /opt/clawmanager-dsh/adapter/deepseek-harness/team/build.mjs /opt/clawmanager-dsh/adapter/deepseek-harness/team/protocol.mjs \
     && printf '{"protocol":"dsh-team-v1","native":"0.2.1-rc.3"}\n' > /opt/clawmanager-dsh/adapter/deepseek-harness/team/capability.json \
     && node /opt/clawmanager-dsh/verify-native.mjs /opt/clawmanager-dsh/native-manifest.json --patched
+
+COPY deepseek-harness/scripts/patch-model-reference.mjs deepseek-harness/scripts/managed-model-reference.mjs /usr/local/share/deepseek-harness/
+RUN node /usr/local/share/deepseek-harness/patch-model-reference.mjs /usr/local/lib/node_modules/@deepseek-ai/dsh \
+    && node /usr/local/share/deepseek-harness/patch-model-reference.mjs /usr/local/lib/node_modules/@deepseek-ai/dsh --verify
 
 EXPOSE 19090 20300-20399
 

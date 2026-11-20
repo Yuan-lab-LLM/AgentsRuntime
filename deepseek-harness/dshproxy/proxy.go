@@ -189,6 +189,24 @@ func unexpectedChildExit(err error) error {
 	return fmt.Errorf("DSH exited unexpectedly: %w", err)
 }
 
+// Preserve the opt-in fail-stop signal across the DSH proxy process boundary.
+// Text resembling an exit status must never be used as process evidence.
+func CommandExitCode(err error) int {
+	if os.Getenv("CLAWMANAGER_HARNESS_TASK_IDENTITY_PROTOCOL") != "1" ||
+		os.Getenv("CLAWMANAGER_HARNESS_FORCE_STOP_ON_REVOKE") != "1" {
+		return 1
+	}
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CLAWMANAGER_TEAM_ENABLED"))) {
+	case "1", "true", "yes", "on", "enabled":
+		return 1
+	}
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.ExitCode() == 78 {
+		return 78
+	}
+	return 1
+}
+
 func scanDSHStdout(reader io.Reader, output io.Writer, launchURLs chan<- *url.URL, scanErrors chan<- error) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64<<10), 1<<20)

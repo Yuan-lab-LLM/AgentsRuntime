@@ -97,9 +97,11 @@ func (h *HTTPGatewayHealthChecker) probeOnce(ctx context.Context, spec GatewaySt
 		}
 	}
 	if h.extraProbe != nil {
-		return h.extraProbe(ctx, spec)
+		if err := h.extraProbe(ctx, spec); err != nil {
+			return err
+		}
 	}
-	return nil
+	return checkCapabilityHealth(ctx, spec.Env)
 }
 
 func (h *HTTPGatewayHealthChecker) probeHTTP(ctx context.Context, rawURL string, withOrigin bool, extraHeaders ...map[string]string) error {

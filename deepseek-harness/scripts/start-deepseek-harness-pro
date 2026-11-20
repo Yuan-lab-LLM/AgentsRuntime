@@ -19,11 +19,34 @@ export CLAWMANAGER_LLM_RESOLVED_CONFIG_JSON="${resolved_llm_config}"
 source /usr/local/bin/prepare-deepseek-harness-resources
 managed_presets="$(node /usr/local/share/deepseek-harness/prepare-managed-config.mjs /usr/local/share/deepseek-harness/managed.cordis.patch.yml)"
 
+shared_runtime=false
+if [[ -n "${RUNTIME_AGENT_CONTROL_TOKEN:-}" || -n "${RUNTIME_AGENT_REPORT_TOKEN:-}" ]]; then
+  shared_runtime=true
+fi
 unset RUNTIME_AGENT_CONTROL_TOKEN RUNTIME_AGENT_REPORT_TOKEN
 unset CLAWMANAGER_AGENT_CONTROL_TOKEN CLAWMANAGER_AGENT_REPORT_TOKEN
 
 # The desktop and supervisor use one stable loopback endpoint. The proxy owns
 # the authenticated DSH session; no launch token is sent to logs or browsers.
+team_mode="${CLAWMANAGER_TEAM_ENABLED:-}"
+if [[ "${CLAWMANAGER_HARNESS_TASK_IDENTITY_PROTOCOL:-}" == "1" &&
+      "${CLAWMANAGER_HARNESS_FORCE_STOP_ON_REVOKE:-}" == "1" &&
+      "$shared_runtime" == "false" ]]; then
+  case "${team_mode,,}" in
+    1|true|yes|on|enabled) ;;
+    *)
+      command -v setsid >/dev/null 2>&1 || { echo "Harness fail-stop requires setsid" >&2; exit 78; }
+      exec setsid --wait /bin/bash -c \
+        'export CLAWMANAGER_HARNESS_FAIL_STOP_PGID="$$"; exec "$@"' \
+        harness-private-session /usr/local/libexec/clawmanager-agent-image dsh-web-proxy \
+        --desktop --listen-host 127.0.0.1 --port 3080 -- \
+        dsh web \
+        --patch /usr/local/share/deepseek-harness/managed.cordis.patch.yml \
+        --patch "${managed_presets}" \
+        --host 127.0.0.1 --port 0 --no-open
+      ;;
+  esac
+fi
 exec /usr/local/libexec/clawmanager-agent-image dsh-web-proxy \
   --desktop --listen-host 127.0.0.1 --port 3080 -- \
   dsh web \

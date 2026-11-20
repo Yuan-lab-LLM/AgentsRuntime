@@ -1,0 +1,66 @@
+name: OpenClaw model reference regression
+on:
+  push:
+    paths: ['openclaw/**', 'clawmanager-agent/gateway/**', 'openclaw/lite/**', 'clawmanager-agent/managedmodelrefs/**', 'clawmanager-agent/shutdownoutbox/**', 'clawmanager-agent/control/**', 'clawmanager-agent/agent/**', '.github/workflows/openclaw-model-reference.yml']
+  pull_request:
+    paths: ['openclaw/**', 'clawmanager-agent/gateway/**', 'openclaw/lite/**', 'clawmanager-agent/managedmodelrefs/**', 'clawmanager-agent/shutdownoutbox/**', 'clawmanager-agent/control/**', 'clawmanager-agent/agent/**', '.github/workflows/openclaw-model-reference.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  activation-entrypoints:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.21.0'
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: clawmanager-agent/go.mod
+          cache-dependency-path: |
+            clawmanager-agent/go.sum
+            openclaw/go.sum
+      - name: Test Lite startup activation gate
+        working-directory: clawmanager-agent
+        run: go test ./gateway -run 'TestOpenClaw|Test.*GatewayEnv' -count=1
+      - name: Test Lite runtime adapter
+        working-directory: openclaw
+        run: go test ./lite -run 'TestOpenClaw|Test.*GatewayEnv' -count=1
+      - name: Test Pro startup activation gate
+        working-directory: openclaw
+        run: go test ./internal/receiptstorage ./internal/bootstrap ./internal/process ./internal/supervisor -run 'TestOpenClaw|TestGateway|TestReceipt|TestProReceipt' -count=1
+      - name: Test Lite durable shutdown delivery
+        working-directory: clawmanager-agent
+        run: go test -vet=all ./shutdownoutbox ./gateway ./control ./agent -run 'TestOutbox|TestDelivery|TestShutdown' -count=1
+      - name: Test Pro durable shutdown delivery
+        working-directory: openclaw
+        run: go test -vet=all ./internal/shutdownoutbox ./internal/process ./internal/supervisor ./internal/control -run 'TestOutbox|TestDelivery|TestShutdown' -count=1
+  native-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.21.0'
+      - name: Download and verify pinned native source fixture
+        run: |
+          npm pack openclaw@2026.10.2 --ignore-scripts --pack-destination "$RUNNER_TEMP"
+          node --input-type=module -e '
+            import fs from "node:fs";
+            import crypto from "node:crypto";
+            import assert from "node:assert/strict";
+            const lock = JSON.parse(fs.readFileSync("openclaw/openclaw102.lock.json", "utf8"));
+            assert.equal(lock.version, "2026.10.2");
+            assert.equal(process.version, lock.nodeVersion);
+            const bytes = fs.readFileSync(process.env.RUNNER_TEMP + "/openclaw-2026.10.2.tgz");
+            assert.equal("sha512-" + crypto.createHash("sha512").update(bytes).digest("base64"), lock.integrity);
+          '
+          mkdir "$RUNNER_TEMP/openclaw-reference"
+          tar -xzf "$RUNNER_TEMP/openclaw-2026.10.2.tgz" -C "$RUNNER_TEMP/openclaw-reference"
+      - name: Test reference recovery, picker permissions and pinned native contracts
+        run: |
+          export OPENCLAW_NATIVE_FIXTURE_DIR="$RUNNER_TEMP/openclaw-reference/package/dist"
+          node --test openclaw/patches/test_managed_model_reference_102.mjs openclaw/patches/test_runtime_task_guard.mjs openclaw/patches/test_managed_turn_bridge.mjs openclaw/patches/test_task_receipt_store.mjs openclaw/patches/test_receipt_retry.mjs openclaw/patches/test_runtime_capability_renewal.mjs openclaw/patches/test_runtime_writer_guard.mjs openclaw/patches/test_managed_shutdown_scope.mjs openclaw/patches/test_shutdown_receipt_store.mjs

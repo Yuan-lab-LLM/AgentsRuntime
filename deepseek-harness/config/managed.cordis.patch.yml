@@ -22,8 +22,7 @@
       (() => {
         const config = JSON.parse(process.env.CLAWMANAGER_LLM_RESOLVED_CONFIG_JSON ?? '{}');
         const groups = Array.isArray(config.providers) ? config.providers : [];
-        const windows = JSON.parse(process.env.CLAWMANAGER_LLM_CONTEXT_WINDOWS ?? '{}');
-        // ClawManager uses 0 for unknown limits; DSH requires a positive limit.
+        const windows = config.context_windows ?? JSON.parse(process.env.CLAWMANAGER_LLM_CONTEXT_WINDOWS ?? '{}');
         const configuredWindow = Number(process.env.CLAWMANAGER_LLM_CONTEXT_WINDOW || 0);
         if (!Number.isSafeInteger(configuredWindow) || configuredWindow < 0) throw new Error('Invalid managed context window');
         const defaultWindow = configuredWindow || 128000;
@@ -40,7 +39,7 @@
               if (!Number.isSafeInteger(configuredModelWindow) || configuredModelWindow < 0) throw new Error('Invalid model context window');
               const contextWindow = configuredModelWindow || defaultWindow;
               const vision = config.vision?.[qualified] ?? config.vision?.[id] ?? false;
-              return { id, contextWindow, input: vision ? ['text', 'image'] : ['text'] };
+              return { id, name: config.model_names?.[id] ?? id, contextWindow, input: vision ? ['text', 'image'] : ['text'] };
             }),
           },
         ]));

@@ -82,6 +82,9 @@ func Run(profile gateway.RuntimeProfile) {
 		handled, err := handler.RunCommand(os.Args[1:])
 		if err != nil {
 			log.Printf("runtime command: %v", err)
+			if coded, ok := err.(interface{ ExitCode() int }); ok {
+				os.Exit(coded.ExitCode())
+			}
 			os.Exit(2)
 		}
 		if handled {

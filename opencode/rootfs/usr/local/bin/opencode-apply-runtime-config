@@ -15,13 +15,18 @@ if [ -z "${OPENCODE_SERVER_PASSWORD:-}" ]; then
 fi
 
 config_tmp="$(mktemp "${config_path}.XXXXXX")"
+# Standalone legacy installations without injected Gateway configuration may
+# continue using their own OpenCode config. Partial managed input still fails.
+if [ -z "${OPENCODE_CONFIG_CONTENT:-}${CLAWMANAGER_LLM_BASE_URL:-}${CLAWMANAGER_LLM_API_KEY:-}${OPENAI_BASE_URL:-}${OPENAI_API_BASE:-}" ]; then
+  rm -f "${config_tmp}"
+  echo "opencode-apply-runtime-config: no managed configuration; keeping user config"
+  exit 0
+fi
 trap 'rm -f "${config_tmp}"' EXIT
 
-if [ -n "${OPENCODE_CONFIG_CONTENT:-}" ]; then
-  printf '%s\n' "${OPENCODE_CONFIG_CONTENT}" >"${config_tmp}"
-elif ! /usr/local/bin/clawmanager-agent llm-config --format opencode >"${config_tmp}"; then
-  echo "opencode-apply-runtime-config: LLM configuration not ready; skipping"
-  exit 0
+if ! /usr/local/bin/clawmanager-agent llm-config --format opencode --merge-file "${config_path}" >"${config_tmp}"; then
+  echo "opencode-apply-runtime-config: invalid managed configuration; existing config preserved" >&2
+  exit 1
 fi
 
 mv -f "${config_tmp}" "${config_path}"

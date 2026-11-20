@@ -67,6 +67,9 @@ RUN set -eux; \
     npm cache clean --force
 
 COPY deepseek-harness/config/managed.cordis.patch.yml /usr/local/share/deepseek-harness/managed.cordis.patch.yml
+COPY deepseek-harness/scripts/patch-model-reference.mjs deepseek-harness/scripts/managed-model-reference.mjs /usr/local/share/deepseek-harness/
+RUN node /usr/local/share/deepseek-harness/patch-model-reference.mjs /usr/local/lib/node_modules/@deepseek-ai/dsh \
+    && node /usr/local/share/deepseek-harness/patch-model-reference.mjs /usr/local/lib/node_modules/@deepseek-ai/dsh --verify
 COPY deepseek-harness/scripts/prepare-managed-config.mjs /usr/local/share/deepseek-harness/prepare-managed-config.mjs
 COPY deepseek-harness/scripts/prepare-deepseek-harness-resources /usr/local/bin/prepare-deepseek-harness-resources
 COPY deepseek-harness/scripts/start-deepseek-harness-pro /usr/local/bin/start-deepseek-harness-pro

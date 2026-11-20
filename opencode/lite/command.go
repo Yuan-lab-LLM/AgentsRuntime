@@ -13,6 +13,7 @@ func (p Profile) RunCommand(args []string) (bool, error) {
 	}
 	flags := flag.NewFlagSet("llm-config", flag.ContinueOnError)
 	format := flags.String("format", "canonical", "output format")
+	mergeFile := flags.String("merge-file", "", "existing OpenCode config to preserve")
 	flags.String("fallback-provider", "auto", "canonical provider")
 	flags.String("default-model", "", "canonical model")
 	if err := flags.Parse(args[1:]); err != nil {
@@ -28,9 +29,15 @@ func (p Profile) RunCommand(args []string) (bool, error) {
 	if err != nil {
 		return true, err
 	}
-	raw, err := RenderConfig(settings)
+	raw, err := RenderManagedConfig(settings, os.Getenv("OPENCODE_CONFIG_CONTENT"))
 	if err != nil {
 		return true, err
+	}
+	if *mergeFile != "" {
+		raw, err = MergeManagedFile(*mergeFile, raw, settings)
+		if err != nil {
+			return true, err
+		}
 	}
 	_, err = os.Stdout.Write(raw)
 	return true, err

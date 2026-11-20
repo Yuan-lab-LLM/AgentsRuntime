@@ -57,6 +57,7 @@ func (m *Manager) Ensure(ctx context.Context) (store.State, error) {
 	}
 
 	if err := m.store.Update(func(s *store.State) {
+		s.OwnerUserID = resp.OwnerUserID
 		s.AgentID = agentID
 		s.SessionToken = resp.SessionToken
 		s.SessionExpiresAt = resp.SessionExpiresAt

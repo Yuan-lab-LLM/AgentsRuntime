@@ -16,6 +16,8 @@ type Profile struct {
 	capabilities *gateway.HealthCapabilities
 }
 
+func (p Profile) WritesStartupModelCatalog() bool { return true }
+
 func NewProfile(runtimeType string) Profile {
 	return Profile{runtimeType: strings.ToLower(strings.TrimSpace(runtimeType)), desktopWeb: desktopWebEnabled()}
 }

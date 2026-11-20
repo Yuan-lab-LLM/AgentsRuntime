@@ -3,6 +3,7 @@ package opencode
 import (
 	"context"
 	"github.com/iamlovingit/clawmanager-agent/gateway"
+	"github.com/iamlovingit/clawmanager-agent/llmconfig"
 	"github.com/iamlovingit/clawmanager-agent/managedconfig"
 )
 
@@ -49,25 +50,19 @@ func (Profile) MigrateManagedCredentials(ctx context.Context, cfg gateway.Config
 	}}})
 }
 
-func writeProtectedOpenCodeConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, workspace string, raw []byte) error {
+func writeProtectedOpenCodeConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, workspace string, raw []byte, settings llmconfig.Settings) error {
 	if _, err := managedconfig.SafeEnvironment(cfg, req); err != nil {
-		return err
-	}
-	overlay, err := managedconfig.JSON(raw)
-	if err != nil {
 		return err
 	}
 	written := false
 	transform := func(existing []byte) ([]byte, error) {
-		base, err := managedconfig.JSON(existing)
-		if err != nil {
-			return nil, err
+		merged, err := mergeManagedConfigData(existing, raw, settings)
+		if err == nil {
+			written = true
 		}
-		mergeOpenCodeManagedObject(base, overlay)
-		written = true
-		return managedconfig.EncodeJSON(base)
+		return merged, err
 	}
-	err = managedconfig.Rewrite(context.Background(), cfg.WorkspaceRoot, workspace, []managedconfig.Directory{{Path: "home/.opencode", Select: func(name string) managedconfig.Transform {
+	err := managedconfig.Rewrite(context.Background(), cfg.WorkspaceRoot, workspace, []managedconfig.Directory{{Path: "home/.opencode", Select: func(name string) managedconfig.Transform {
 		if name == "opencode.json" {
 			return transform
 		}

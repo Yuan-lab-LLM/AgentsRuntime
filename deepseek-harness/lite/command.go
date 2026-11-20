@@ -19,5 +19,12 @@ func (p Profile) RunCommand(args []string) (bool, error) {
 	if errors.Is(err, context.Canceled) {
 		err = nil
 	}
-	return true, err
+	if err != nil {
+		return true, commandFailure{err}
+	}
+	return true, nil
 }
+
+type commandFailure struct{ error }
+
+func (e commandFailure) ExitCode() int { return dshproxy.CommandExitCode(e.error) }

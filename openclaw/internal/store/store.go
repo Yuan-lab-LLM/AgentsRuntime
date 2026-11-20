@@ -11,6 +11,7 @@ import (
 )
 
 type State struct {
+	OwnerUserID                int                           `json:"owner_user_id,omitempty"`
 	AgentID                    string                        `json:"agent_id"`
 	SessionToken               string                        `json:"session_token"`
 	SessionExpiresAt           time.Time                     `json:"session_expires_at"`

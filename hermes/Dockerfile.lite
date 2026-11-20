@@ -29,6 +29,8 @@ RUN --mount=type=cache,target=/var/cache/hermes-lite \
     --lock /usr/local/share/hermes-lite/source-lock.json --download /opt/hermes-agent --archive-cache /var/cache/hermes-lite "$@"
 
 FROM source AS patched-source
+COPY hermes/patches/hermes-agent/apply_managed_model_catalog.py hermes/patches/hermes-agent/managed_model_catalog.py /tmp/lite-patch/
+COPY hermes/patches/hermes-agent/apply_managed_model_catalog_v0225.py /tmp/lite-patch/
 COPY hermes/patches/hermes-agent/apply_lite_model_catalog.py hermes/patches/hermes-agent/apply_lite_picker_budget.py hermes/patches/hermes-agent/apply_lite_models_metadata.py /tmp/lite-patch/
 COPY hermes/patches/hermes-agent/apply_lite_gateway_boundary.py /tmp/lite-patch/
 COPY hermes/patches/hermes-agent/lite_gateway_boundary.py /tmp/lite-patch/
@@ -44,6 +46,7 @@ COPY hermes/patches/hermes-agent/apply_lite_managed_reasoning.py /tmp/team-conte
 RUN python /usr/local/share/hermes-lite/verify_lite_release.py \
        --lock /usr/local/share/hermes-lite/source-lock.json --patch-root /tmp/lite-patch \
     && python /tmp/lite-patch/apply_lite_gateway_boundary.py /opt/hermes-agent \
+    && python /tmp/lite-patch/apply_managed_model_catalog_v0225.py /opt/hermes-agent \
     && python /tmp/lite-patch/apply_lite_non_native.py /opt/hermes-agent \
     && python /tmp/lite-patch/apply_lite_tool_executor.py /opt/hermes-agent \
     && python /tmp/lite-patch/apply_lite_startup.py /opt/hermes-agent \
@@ -130,6 +133,7 @@ COPY --from=agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agen
 COPY --from=source /usr/local/share/hermes-lite/ /usr/local/share/hermes-lite/
 COPY plugins/hermes-redis-team/ /opt/hermes-agent/plugins/platforms/redis_team/
 COPY hermes/scripts/run_release_check.py /usr/local/share/hermes-lite/run_release_check.py
+COPY hermes/patches/hermes-agent/apply_managed_model_catalog.py hermes/patches/hermes-agent/apply_managed_model_catalog_v0225.py hermes/patches/hermes-agent/managed_model_catalog.py /usr/local/share/hermes-lite/patches/
 COPY hermes/scripts/run_campaign.py hermes/scripts/campaign_signing.py hermes/scripts/verify_lite_promotion_oci.py hermes/scripts/verify_campaign_signature.mjs /usr/local/share/hermes-lite/
 COPY hermes/acceptance/release-trust.json hermes/acceptance/acceptance-protocol.json /usr/local/share/hermes-lite/
 COPY hermes/patches/hermes-agent/apply_lite_gateway_boundary.py hermes/patches/hermes-agent/lite_gateway_boundary.py hermes/patches/hermes-agent/apply_lite_non_native.py hermes/patches/hermes-agent/lite_non_native.py hermes/patches/hermes-agent/lite_environment.py hermes/patches/hermes-agent/apply_lite_tool_executor.py hermes/patches/hermes-agent/apply_team_completion_stop.py hermes/patches/hermes-agent/apply_profile_external_skill_dedupe.py /usr/local/share/hermes-lite/patches/

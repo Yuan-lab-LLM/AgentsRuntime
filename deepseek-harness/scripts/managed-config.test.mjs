@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
-import { managedPresetPatches } from './prepare-managed-config.mjs';
+import { managedPresetPatches, startupCatalogReceipt } from './prepare-managed-config.mjs';
 
 test('managed overlay preserves custom preset fields and expressions, disables nested web tools', () => {
   class Expression { constructor(source) { this.source = source; } }
@@ -36,8 +36,22 @@ test('model metadata uses qualified, bare and fallback context limits', () => {
   assert.equal(result.managed.models[1].contextWindow, 128000);
   assert.equal(result.managed.models[1].input.join(','), 'text,image');
   assert.equal(providers({}).managed.models[0].contextWindow, 128000);
+  assert.equal(providers({ CLAWMANAGER_LLM_CONTEXT_WINDOWS: '{"auto":0}' }).managed.models[0].contextWindow, 128000);
+  assert.equal(providers({ CLAWMANAGER_LLM_CONTEXT_WINDOW: '0' }).managed.models[0].contextWindow, 128000);
   assert.throws(() => providers({ CLAWMANAGER_LLM_CONTEXT_WINDOWS: '{"auto":-1}' }), /Invalid model context/);
   assert.throws(() => providers({ CLAWMANAGER_LLM_CONTEXT_WINDOW: 'bad' }), /Invalid managed context/);
+});
+
+test('startup receipt requires the resolved stable catalog and exact launch identity', () => {
+  const snapshot = { complete: true, catalog_protocol: 2, owner_user_id: 2, generation: 8, revision: 'a'.repeat(64), models: [{ id: 'auto' }, { id: 'recreated name', stable_id: 'cm-deploy-v1-new' }] };
+  const env = { CLAWMANAGER_MODEL_CATALOG_SYNC: '1', CLAWMANAGER_MODEL_CATALOG_JSON: JSON.stringify(snapshot), CLAWMANAGER_LLM_RESOLVED_CONFIG_JSON: JSON.stringify({ catalog_synced: true, model_ids: ['auto', 'cm-deploy-v1-new'] }), CLAWMANAGER_INSTANCE_ID: '42', CLAWMANAGER_USER_ID: '2', CLAWMANAGER_GATEWAY_GENERATION: '8' };
+  assert.deepEqual(startupCatalogReceipt(env), { instance_id: 42, owner_user_id: 2, generation: 8, revision: 'a'.repeat(64), model_count: 1 });
+  assert.equal(startupCatalogReceipt({}), null);
+  assert.throws(() => startupCatalogReceipt({ ...env, CLAWMANAGER_GATEWAY_GENERATION: '7' }), /mismatch/);
+  assert.throws(() => startupCatalogReceipt({ ...env, CLAWMANAGER_USER_ID: '3' }), /mismatch/);
+  assert.throws(() => startupCatalogReceipt({ ...env, CLAWMANAGER_LLM_RESOLVED_CONFIG_JSON: JSON.stringify({ catalog_synced: true, model_ids: ['auto', 'recreated name'] }) }), /models mismatch/);
+  assert.throws(() => startupCatalogReceipt({ ...env, CLAWMANAGER_LLM_RESOLVED_CONFIG_JSON: '{}' }), /mismatch/);
+  assert.equal(startupCatalogReceipt({ ...env, CLAWMANAGER_MODEL_CATALOG_JSON: JSON.stringify({ ...snapshot, models: [] }), CLAWMANAGER_LLM_RESOLVED_CONFIG_JSON: JSON.stringify({ catalog_synced: true, model_ids: [] }) }).model_count, 0);
 });
 
 test('unknown ClawManager context limits keep all provider models available', () => {

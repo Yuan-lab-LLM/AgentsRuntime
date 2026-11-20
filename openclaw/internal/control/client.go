@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/iamlovingit/clawmanager-openclaw-image/internal/protocol"
+	"github.com/iamlovingit/clawmanager-openclaw-image/internal/shutdownoutbox"
 )
 
 type HTTPStatusError struct {
@@ -77,6 +78,30 @@ func (c *Client) FinishCommand(ctx context.Context, id int, req protocol.Command
 
 func (c *Client) ReportState(ctx context.Context, req protocol.StateReportRequest) error {
 	return c.doJSON(ctx, http.MethodPost, "/api/v1/agent/state/report", req, nil, authSession)
+}
+
+type ShutdownDeliveryScope struct {
+	Version     int `json:"version"`
+	InstanceID  int `json:"instance_id"`
+	OwnerUserID int `json:"owner_user_id"`
+}
+
+func (c *Client) ShutdownDeliveryScope(ctx context.Context) (ShutdownDeliveryScope, error) {
+	var scope ShutdownDeliveryScope
+	if shutdownDeliveryJSON(ctx, c.httpClient, c.baseURL+"/api/v1/agent/shutdown-deliveries/scope", "Authorization", "Bearer "+c.getToken(), http.MethodGet, nil, &scope) != nil {
+		return scope, fmt.Errorf("shutdown delivery scope unavailable")
+	}
+	return scope, nil
+}
+func (c *Client) ReportShutdownDeliveries(ctx context.Context, items []shutdownoutbox.Delivery) (shutdownoutbox.Ack, error) {
+	var ack shutdownoutbox.Ack
+	err := shutdownDeliveryJSON(ctx, c.httpClient, c.baseURL+"/api/v1/agent/shutdown-deliveries", "Authorization", "Bearer "+c.getToken(), http.MethodPost, struct {
+		Deliveries []shutdownoutbox.Delivery `json:"deliveries"`
+	}{items}, &ack)
+	if err != nil || ack.Version != 1 || !ack.DiagnosticOnly || ack.AcceptedIDs == nil {
+		return ack, fmt.Errorf("shutdown delivery unconfirmed")
+	}
+	return ack, nil
 }
 
 func (c *Client) ReportSkillInventory(ctx context.Context, req protocol.SkillInventoryReportRequest) error {

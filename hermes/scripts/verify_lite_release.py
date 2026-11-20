@@ -36,6 +36,7 @@ FIXED_FILES += [
     "/usr/local/share/clawmanager/hermes/skills/redis-team-protocol/skill.json",
 ]
 MANDATORY = FIXED_FILES + ["/opt/hermes-agent/" + name for name in (
+    "hermes_cli/managed_model_catalog.py",
     "hermes_cli/web_server.py", "hermes_cli/runtime_provider.py", "hermes_cli/lite_gateway_boundary.py",
     "hermes_cli/lite_non_native.py", "hermes_cli/env_loader.py", "hermes_cli/lite_environment.py",
     "tui_gateway/server.py", "tui_gateway/methods_session.py",
@@ -48,11 +49,12 @@ MANDATORY = FIXED_FILES + ["/opt/hermes-agent/" + name for name in (
     ".venv/bin/hermes", "pyproject.toml", "uv.lock", "package-lock.json",
     "plugins/platforms/redis_team/adapter.py", "plugins/platforms/redis_team/plugin.yaml",
 )] + [SHARE + "/patches/" + name for name in (
+    "apply_managed_model_catalog.py", "apply_managed_model_catalog_v0225.py", "managed_model_catalog.py",
     "apply_lite_models_metadata.py", "apply_lite_picker_budget.py", "apply_lite_model_catalog.py", "apply_lite_gateway_boundary.py", "lite_gateway_boundary.py", "apply_lite_non_native.py", "lite_non_native.py", "lite_environment.py", "apply_lite_tool_executor.py", "apply_lite_startup.py", "lite_startup_timing.py", "lite_skills_sync.py", "apply_team_completion_stop.py", "apply_lite_team_completion_stop.py", "apply_lite_skill_dedupe.py", "apply_profile_external_skill_dedupe.py",
 )] + [SHARE + "/tests/" + name for name in (*SUITES.values(), "check_lite_tool_executor.py", "cm_bff_browser.mjs", "acceptance_model_stub.py")]
 ARTIFACT_TREES = ("/opt/hermes-agent", "/usr/local/lib/python3.14", SHARE + "/patches", SHARE + "/tests")
 HEX256 = re.compile(r"[0-9a-f]{64}")
-PATCH_FILES = {"apply_lite_models_metadata.py", "apply_lite_picker_budget.py", "apply_lite_model_catalog.py", "apply_lite_gateway_boundary.py", "lite_gateway_boundary.py", "apply_lite_non_native.py", "lite_non_native.py", "lite_environment.py", "apply_lite_tool_executor.py", "apply_lite_startup.py", "lite_startup_timing.py", "lite_skills_sync.py", "apply_team_completion_stop.py", "apply_lite_team_completion_stop.py", "apply_lite_skill_dedupe.py", "apply_profile_external_skill_dedupe.py"}
+PATCH_FILES = {"apply_managed_model_catalog.py", "apply_managed_model_catalog_v0225.py", "managed_model_catalog.py", "apply_lite_models_metadata.py", "apply_lite_picker_budget.py", "apply_lite_model_catalog.py", "apply_lite_gateway_boundary.py", "lite_gateway_boundary.py", "apply_lite_non_native.py", "lite_non_native.py", "lite_environment.py", "apply_lite_tool_executor.py", "apply_lite_startup.py", "lite_startup_timing.py", "lite_skills_sync.py", "apply_team_completion_stop.py", "apply_lite_team_completion_stop.py", "apply_lite_skill_dedupe.py", "apply_profile_external_skill_dedupe.py"}
 TEST_FILES = set(SUITES.values()) | {"test_lite_models_metadata.py", "test_lite_picker_budget.py", "test_lite_model_catalog.py", "check_lite_tool_executor.py", "cm_bff_browser.mjs", "acceptance_model_stub.py", "smoke_lite_team.py"}
 
 

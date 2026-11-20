@@ -22,9 +22,17 @@ GUARD = '''    from hermes_cli import lite_non_native as _lite_non_native
 
 
 def patched_source(content):
-    if hashlib.sha256(content).hexdigest() != EXPECTED:
-        raise ValueError("Lite executor patch requires exact locked upstream source")
+    # The shared catalog installer runs first for Pro and Lite. Preserve its
+    # fence while verifying the exact original pinned source.
+    TOOL_ANCHOR = "        block_message = scope_block\n"
+    TOOL_HOOK = ("        from hermes_cli.managed_model_catalog import managed_tool_block\n"
+                 "        block_message = scope_block or managed_tool_block(agent, effective_task_id)\n")
     source = content.decode("utf-8")
+    original = source.replace(TOOL_HOOK, TOOL_ANCHOR, 1)
+    from apply_managed_model_catalog_v0225 import TOOL_HOOK as V0225_HOOK, TOOL_ANCHOR as V0225_ANCHOR
+    original = original.replace(V0225_HOOK, V0225_ANCHOR, 1)
+    if hashlib.sha256(original.encode("utf-8")).hexdigest() != EXPECTED:
+        raise ValueError("Lite executor patch requires exact locked upstream source")
     if source.count(ANCHOR) != 1:
         raise ValueError("Lite executor patch anchor changed")
     result = source.replace(ANCHOR, ANCHOR + GUARD)

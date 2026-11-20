@@ -75,6 +75,10 @@ const files = [
     ['import { WebSearchTool }', 'import { ClawManagerImageTools } from "../clawmanager-image-tools.js"\nimport { ClawManagerTeamTools } from "../clawmanager-team-tools.js"\nimport { WebSearchTool }'],
     ['  WebSearchTool.Plugin,', '  WebSearchTool.Plugin,\n  ClawManagerImageTools.Plugin,\n  ClawManagerTeamTools.Plugin,'],
   ]),
+  patch("session/runner/model.ts", [
+    ['import { makeLocationNode }', 'import { Governance } from "../../clawmanager-governance.js"\nimport { makeLocationNode }'],
+    ['        const selected = (yield* available()).find(\n          (model) => model.providerID === session.model?.providerID && model.id === session.model.id,\n        )', '        const candidates = yield* available()\n        const selected = Governance.enabled\n          ? yield* Effect.promise(() => Governance.resolveCatalogModel(candidates, session.model!.providerID, session.model!.id, true))\n          : candidates.find((model) => model.providerID === session.model?.providerID && model.id === session.model.id)'],
+  ]),
   patch("session/runner/llm.ts", [
     ['import { Message }', 'import { Governance } from "../../clawmanager-governance.js"\nimport { Message }'],
     ['const runStep = Effect.fn("SessionRunner.runStep")', 'const runStepImpl = Effect.fn("SessionRunner.runStep")'],
@@ -172,10 +176,10 @@ const files = [
     }))
     return Service.of({
       transform:`],
-    ['        read().pipe(Effect.map((value) => value.byProvider.get(providerID)?.get(modelID))),', '        projected().pipe(Effect.map((value) => value.find((item) => item.providerID === providerID && item.id === modelID))),'],
+    ['        read().pipe(Effect.map((value) => value.byProvider.get(providerID)?.get(modelID))),', '        read().pipe(Effect.flatMap((value) => Effect.promise(() => Governance.resolveCatalogModel(value.all, providerID, modelID)))),'],
     ['      all: Effect.fn("Model.all")(() => read().pipe(Effect.map((value) => value.all))),', '      all: Effect.fn("Model.all")(projected),'],
     ['      available: Effect.fn("Model.available")(() => read().pipe(Effect.map((value) => value.available))),', '      available: Effect.fn("Model.available")(() => projected().pipe(Effect.map((value) => value.filter((item) => item.enabled)))),'],
-    ['        const model = requested && value.byProvider.get(requested.providerID)?.get(requested.modelID)\n        return model?.enabled ? model : value.available.find(supportsText)', '        const available = (yield* projected()).filter((item) => item.enabled)\n        const model = requested && available.find((item) => item.providerID === requested.providerID && item.id === requested.modelID)\n        return model ?? available.find(supportsText)'],
+    ['        const model = requested && value.byProvider.get(requested.providerID)?.get(requested.modelID)\n        return model?.enabled ? model : value.available.find(supportsText)', '        if (requested && Governance.enabled) return yield* Effect.promise(() => Governance.resolveCatalogModel(value.all, requested.providerID, requested.modelID, true))\n        const available = (yield* projected()).filter((item) => item.enabled)\n        const model = requested && available.find((item) => item.providerID === requested.providerID && item.id === requested.modelID)\n        return model ?? available.find(supportsText)'],
     ['        const models = value.available.filter(', '        const models = (yield* projected()).filter((item) => item.enabled).filter('],
     ['        return ["gpt-luna",', '        if (Governance.enabled && providerID === "clawmanager") return models.find((item) => item.id === "auto")\n        return ["gpt-luna",'],
     ['      small: Effect.fn("Model.small")(function* (providerID) {\n        const value = yield* read()', '      small: Effect.fn("Model.small")(function* (providerID) {'],
