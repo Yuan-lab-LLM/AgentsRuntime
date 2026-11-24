@@ -64,9 +64,10 @@ export function transform(name, source) {
 }
 
 export function install(root, verify = false) {
-  const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+  const packagePath = join(realpathSync(root), 'package.json');
+  const pkg = JSON.parse(readFileSync(packagePath, 'utf8'));
   if (pkg.name !== '@deepseek-ai/dsh' || pkg.version !== '0.2.1-rc.3') throw new Error('Requires Harness 0.2.1-rc.3');
-  const requireFromDSH = createRequire(join(root, 'package.json'));
+  const requireFromDSH = createRequire(packagePath);
   const files = Object.keys(contracts).map(name => {
     const target = realpathSync(requireFromDSH.resolve('@deepseek-ai/' + name));
     const source = readFileSync(target, 'utf8');

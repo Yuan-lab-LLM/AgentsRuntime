@@ -1,8 +1,7 @@
 name: Harness model reference regression
 on:
   push:
-    paths: ['deepseek-harness/**', '.github/workflows/harness-model-reference.yml']
-  pull_request:
+    branches: [main]
     paths: ['deepseek-harness/**', '.github/workflows/harness-model-reference.yml']
   workflow_dispatch:
 permissions:

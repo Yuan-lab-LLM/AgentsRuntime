@@ -21,18 +21,17 @@ def check():
         if not condition:
             errors.append(message)
 
-    workflow = (ROOT / ".github/workflows/docker-ghcr.yml").read_text()
-    mappings = re.findall(r'"([^"|]+)-lite\|([^|]+)\|([^|]+)\|[^"|]+"', workflow)
+    specs = json.loads((ROOT / ".github/runtime-images.json").read_text())
+    dockerfiles = {spec["runtime"]: spec["dockerfile"] for spec in specs}
+    require(len(dockerfiles) == len(specs), "runtime image names must be unique")
     for runtime in RUNTIMES:
         if runtime == "hermes":
             module_vendor = ROOT / runtime / "vendor"
             require(not module_vendor.exists() or (module_vendor / "modules.txt").is_file(),
                     "hermes: vendor is reserved for Go dependencies and requires vendor/modules.txt; put bootstrap assets elsewhere")
-        selected = [(context, dockerfile) for name, context, dockerfile in mappings if name == runtime]
-        require(bool(selected), f"{runtime}: missing Lite publish mapping")
-        for context, dockerfile in selected:
-            require(context == "." and dockerfile == f"./{runtime}/Dockerfile.lite",
-                    f"{runtime}: Lite must publish its dedicated Dockerfile with root context; got {dockerfile}")
+        dockerfile = dockerfiles.get(f"{runtime}-lite")
+        require(dockerfile == f"./{runtime}/Dockerfile.lite",
+                f"{runtime}: Lite must build its dedicated Dockerfile; got {dockerfile}")
         path = ROOT / runtime / "Dockerfile.lite"
         require(path.is_file(), f"{runtime}: missing Dockerfile.lite")
         if not path.is_file():
