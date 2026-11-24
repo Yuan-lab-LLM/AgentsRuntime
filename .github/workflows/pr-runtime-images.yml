@@ -1,0 +1,94 @@
+name: PR runtime images
+
+"on":
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-runtime-images-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prepare-images:
+    name: Prepare PR image matrix
+    runs-on: ubuntu-latest
+    outputs:
+      images: ${{ steps.matrix.outputs.images }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify Lite image build contracts
+        run: |
+          python3 tests/lite/check_build_contract.py
+          python3 tests/lite/check_entrypoints.py
+
+      - name: Read runtime image matrix
+        id: matrix
+        run: |
+          images="$(jq -ec . .github/runtime-images.json)"
+          echo "images=${images}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    name: Verify ${{ matrix.image.runtime }} linux/${{ matrix.platform.arch }}
+    needs: prepare-images
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.prepare-images.outputs.images) }}
+        platform:
+          - {arch: amd64, runner: ubuntu-latest}
+          - {arch: arm64, runner: ubuntu-24.04-arm}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check OpenCode Lite startup
+        if: matrix.platform.arch == 'amd64' && (matrix.image.runtime == 'opencode' || matrix.image.runtime == 'opencode-lite')
+        run: node opencode/tests/start-opencode-web.test.mjs
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build runtime image without publishing
+        shell: bash
+        env:
+          DOCKERFILE: ${{ matrix.image.dockerfile }}
+          RUNTIME: ${{ matrix.image.runtime }}
+          ARCH: ${{ matrix.platform.arch }}
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH="$(git log -1 --pretty=%ct)"
+          docker buildx build \
+            --file "${DOCKERFILE}" \
+            --platform "linux/${ARCH}" \
+            --pull \
+            --provenance=false \
+            --sbom=false \
+            --build-arg BUILDKIT_MULTI_PLATFORM=1 \
+            --build-arg SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}" \
+            --cache-from "type=gha,scope=${RUNTIME}-${ARCH}" \
+            --output type=cacheonly \
+            .
+
+  require-image-builds:
+    name: Require runtime image builds
+    if: ${{ always() }}
+    needs: [prepare-images, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all image builds to succeed
+        env:
+          PREPARE_RESULT: ${{ needs.prepare-images.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+        run: |
+          if [ "${PREPARE_RESULT}" != success ] || [ "${BUILD_RESULT}" != success ]; then
+            echo "Image matrix: ${PREPARE_RESULT}. Image builds: ${BUILD_RESULT}." >&2
+            exit 1
+          fi

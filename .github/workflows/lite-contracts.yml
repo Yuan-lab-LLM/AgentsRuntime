@@ -5,6 +5,7 @@ name: Lite image contracts
     paths:
       - ".github/workflows/lite-contracts.yml"
       - ".github/workflows/docker-ghcr.yml"
+      - ".github/runtime-images.json"
       - ".dockerignore"
       - "clawmanager-agent/**"
       - "legacy-agent/**"

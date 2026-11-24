@@ -1,0 +1,10 @@
+[
+  {"runtime": "hermes", "dockerfile": "./hermes/Dockerfile"},
+  {"runtime": "hermes-lite", "dockerfile": "./hermes/Dockerfile.lite"},
+  {"runtime": "openclaw", "dockerfile": "./openclaw/Dockerfile.openclaw"},
+  {"runtime": "openclaw-lite", "dockerfile": "./openclaw/Dockerfile.lite"},
+  {"runtime": "opencode", "dockerfile": "./opencode/Dockerfile"},
+  {"runtime": "opencode-lite", "dockerfile": "./opencode/Dockerfile.lite"},
+  {"runtime": "deepseek-harness", "dockerfile": "./deepseek-harness/Dockerfile.pro"},
+  {"runtime": "deepseek-harness-lite", "dockerfile": "./deepseek-harness/Dockerfile.lite"}
+]

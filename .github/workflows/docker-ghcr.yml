@@ -6,6 +6,7 @@ name: Build and push runtime images
       - main
     paths:
       - ".github/workflows/docker-ghcr.yml"
+      - ".github/runtime-images.json"
       - ".dockerignore"
       - "clawmanager-agent/**"
       - "legacy-agent/**"
@@ -86,65 +87,27 @@ jobs:
           registry="${image_namespace%%/*}"
           date_tag="$(TZ=Asia/Shanghai date '+v%Y.%-m.%-d')"
 
-          specs=(
-            "hermes|.|./hermes/Dockerfile|hermes"
-            "hermes-lite|.|./hermes/Dockerfile.lite|hermes-lite"
-            "openclaw|.|./openclaw/Dockerfile.openclaw|openclaw"
-            "openclaw-lite|.|./openclaw/Dockerfile.lite|openclaw-lite"
-            "opencode|.|./opencode/Dockerfile|opencode"
-            "opencode-lite|.|./opencode/Dockerfile.lite|opencode-lite"
-            "deepseek-harness|.|./deepseek-harness/Dockerfile.pro|deepseek-harness"
-            "deepseek-harness-lite|.|./deepseek-harness/Dockerfile.lite|deepseek-harness-lite"
-          )
-
-          # Pushes and manual "all" builds share the complete Lite/Pro matrix.
-          # Only a manual single-runtime selection narrows it.
-          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && [ -n "${RUNTIME_INPUT}" ] && [ "${RUNTIME_INPUT}" != "all" ]; then
-            selected=()
-            for spec in "${specs[@]}"; do
-              IFS="|" read -r runtime _ <<< "${spec}"
-              if [ "${runtime}" = "${RUNTIME_INPUT}" ]; then
-                selected+=("${spec}")
-              fi
-            done
-            if [ "${#selected[@]}" -ne 1 ]; then
-              echo "Unknown runtime selection: ${RUNTIME_INPUT}" >&2
-              exit 1
-            fi
-            specs=("${selected[@]}")
+          runtime_filter=all
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            runtime_filter="${RUNTIME_INPUT:-all}"
           fi
 
-          entries=()
-          for spec in "${specs[@]}"; do
-            IFS="|" read -r runtime context dockerfile image_name <<< "${spec}"
-
-            if [ ! -d "${context}" ]; then
-              echo "Build context does not exist for ${runtime}: ${context}" >&2
-              exit 1
-            fi
+          matrix_json="$(jq -c --arg runtime "${runtime_filter}" --arg namespace "${image_namespace}" '
+            {include: [
+              .[] | select($runtime == "all" or .runtime == $runtime)
+              | . + {context: ".", image: "\($namespace)/\(.runtime)"}
+            ]}' .github/runtime-images.json)"
+          if [ "$(jq '.include | length' <<< "${matrix_json}")" -eq 0 ]; then
+            echo "Unknown runtime selection: ${runtime_filter}" >&2
+            exit 1
+          fi
+          while IFS= read -r dockerfile; do
             if [ ! -f "${dockerfile}" ]; then
-              echo "Dockerfile does not exist for ${runtime}: ${dockerfile}" >&2
+              echo "Dockerfile does not exist: ${dockerfile}" >&2
               exit 1
             fi
+          done < <(jq -r '.include[].dockerfile' <<< "${matrix_json}")
 
-            image="${image_namespace}/${image_name}"
-            entry="$(
-              jq -cn \
-                --arg runtime "${runtime}" \
-                --arg context "${context}" \
-                --arg dockerfile "${dockerfile}" \
-                --arg image "${image}" \
-                '{
-                  runtime: $runtime,
-                  context: $context,
-                  dockerfile: $dockerfile,
-                  image: $image
-                }'
-            )"
-            entries+=("${entry}")
-          done
-
-          matrix_json="$(printf '%s\n' "${entries[@]}" | jq -sc '{include: .}')"
           {
             echo "matrix=${matrix_json}"
             echo "date_tag=${date_tag}"
