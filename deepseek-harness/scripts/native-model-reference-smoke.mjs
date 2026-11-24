@@ -1,13 +1,23 @@
 // Run ONLY against a disposable pinned installation: installs the native patch.
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { install } from './patch-model-reference.mjs';
 
 const root = resolve(process.argv[2]);
-install(root);
-install(root, true);
+// The images invoke the installer through a link to the native npm tree.
+const linkDir = mkdtempSync(join(tmpdir(), 'dsh-image-link-'));
+try {
+  const linkedRoot = join(linkDir, 'dsh');
+  symlinkSync(root, linkedRoot, 'dir');
+  install(linkedRoot);
+  install(linkedRoot, true);
+} finally {
+  rmSync(linkDir, { recursive: true, force: true });
+}
 const fromDSH = createRequire(join(root, 'package.json'));
 const core = await import(pathToFileURL(fromDSH.resolve('@deepseek-ai/dsh-llm')));
 const pi = await import(pathToFileURL(fromDSH.resolve('@deepseek-ai/dsh-llm-pi-ai')));
