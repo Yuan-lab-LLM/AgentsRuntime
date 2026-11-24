@@ -16,6 +16,10 @@ import (
 	"github.com/iamlovingit/clawmanager-agent/workspacegit"
 )
 
+const workbenchSlotBudget = 2 * time.Second
+
+var errWorkbenchSlotUnavailable = errors.New("workbench slot state is temporarily unavailable")
+
 func decodeWorkbench(r *http.Request) (workbench.Request, []byte, error) {
 	var req workbench.Request
 	if r.Method != "POST" {
@@ -36,6 +40,9 @@ func workbenchError(w http.ResponseWriter, err error) {
 	case errors.Is(err, gateway.ErrStaleGeneration):
 		status = 409
 		safe = &workbench.Error{Code: "stale_generation", Message: "Instance assignment has changed."}
+	case errors.Is(err, errWorkbenchSlotUnavailable):
+		status = http.StatusServiceUnavailable
+		safe = &workbench.Error{Code: "slot_state_unavailable", Message: "Runtime slot state is temporarily unavailable."}
 	case errors.Is(err, gateway.ErrGatewayIdleBusy):
 		status = 423
 		safe = &workbench.Error{Code: "instance_busy", Message: "Instance is stopping or unavailable."}
@@ -82,7 +89,8 @@ func (w *Worker) admitsWorkbench(req workbench.Request) bool {
 	if w.cfg.SandboxProfile != "nfs-rootless-v1" {
 		return true
 	}
-	if !w.currentNFSWriter() || w.network.unavailable() {
+	_, networkUnavailable := w.network.snapshotHealth()
+	if !w.currentNFSWriter() || networkUnavailable {
 		return false
 	}
 	dir := filepath.Join(w.cfg.WorkspaceRoot, ".clawmanager-slot-locks")
@@ -125,11 +133,8 @@ func (w *Worker) serveWorkbench(out http.ResponseWriter, r *http.Request) {
 		workbenchError(out, err)
 		return
 	}
-	w.mu.Lock()
-	valid := w.admitsWorkbench(req)
-	if !valid {
-		w.mu.Unlock()
-		workbenchError(out, gateway.ErrStaleGeneration)
+	if err = w.lockWorkbenchSlot(r.Context(), req); err != nil {
+		workbenchError(out, err)
 		return
 	}
 	result, err := w.manager.WorkbenchWithAdmission(r.Context(), req, w.mu.Unlock)
@@ -140,6 +145,25 @@ func (w *Worker) serveWorkbench(out http.ResponseWriter, r *http.Request) {
 	writeJSON(out, 200, result)
 }
 
+// On success the caller holds the assignment fence through manager admission.
+func (w *Worker) lockWorkbenchSlot(ctx context.Context, req workbench.Request) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !w.mu.TryLock() {
+		return errWorkbenchSlotUnavailable
+	}
+	if !w.admitsWorkbench(req) {
+		w.mu.Unlock()
+		return gateway.ErrStaleGeneration
+	}
+	if w.storageHealth != nil && w.manager.Health() != nil {
+		w.mu.Unlock()
+		return errWorkbenchSlotUnavailable
+	}
+	return nil
+}
+
 func (p *Pool) workbenchSlot(ctx context.Context, req workbench.Request) (int, error) {
 	p.mu.RLock()
 	draining := p.draining
@@ -147,12 +171,12 @@ func (p *Pool) workbenchSlot(ctx context.Context, req workbench.Request) (int, e
 	if draining {
 		return -1, gateway.ErrGatewayIdleBusy
 	}
-	snapshotCtx := ctx
+	budget := workbenchSlotBudget
 	if p.cfg.SandboxProfile == "nfs-rootless-v1" {
-		var cancel context.CancelFunc
-		snapshotCtx, cancel = context.WithTimeout(ctx, time.Second)
-		defer cancel()
+		budget = time.Second
 	}
+	snapshotCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
 	snapshots, healthy := p.snapshots(snapshotCtx)
 	selected := -1
 	matches := 0
@@ -174,6 +198,11 @@ func (p *Pool) workbenchSlot(ctx context.Context, req workbench.Request) (int, e
 		}
 	}
 	if selected < 0 || matches != 1 {
+		for _, snapshot := range snapshots {
+			if snapshot.unreachable || snapshot.StorageUnavailable {
+				return -1, errWorkbenchSlotUnavailable
+			}
+		}
 		return -1, gateway.ErrStaleGeneration
 	}
 	return selected, nil

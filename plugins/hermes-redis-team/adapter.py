@@ -392,7 +392,10 @@ def _active_envelope_path(settings: RedisTeamSettings) -> Path:
 
 def _load_active_envelope(settings: RedisTeamSettings) -> dict[str, Any]:
     value = _read_json(_active_envelope_path(settings))
-    return value if isinstance(value, dict) else {}
+    # A narrative/diagnostic record alone is not an execution identity. Keep
+    # the original file for diagnosis, but never let it poison presence or
+    # invent a task/session from an ordinary reply.
+    return value if isinstance(value, dict) and _trim(value.get("taskId") or value.get("rootTaskId")) else {}
 
 
 def _persist_active_envelope(settings: RedisTeamSettings, envelope: dict[str, Any]) -> None:
@@ -3668,7 +3671,7 @@ class RedisTeamAdapter(BasePlatformAdapter):
             and not active.get("terminalNarrativePublished")
             and (not source_message_id or source_message_id == active_message_id)
         )
-        if not terminal_callback and (not source_message_id or source_message_id == active_message_id):
+        if active and not terminal_callback and (not source_message_id or source_message_id == active_message_id):
             active["lastAssistantResponse"] = content
             active["lastAssistantResponseAt"] = _now_iso()
             _persist_active_envelope(self.settings, active)
@@ -4733,10 +4736,13 @@ class RedisTeamAdapter(BasePlatformAdapter):
         self._team_agent_reader = reader
 
     def _context_source(self, active: dict[str, Any]) -> SessionSource:
-        return SessionSource(platform=Platform("redis_team"), chat_id=str(active["taskId"]),
+        task_id = _trim(active.get("taskId") or active.get("rootTaskId"))
+        if not task_id:
+            raise ValueError("Team context requires the original task identity")
+        return SessionSource(platform=Platform("redis_team"), chat_id=task_id,
             chat_name=f"Team {self.settings.team_id}", chat_type="dm", user_id=str(active.get("from") or ""),
             user_name=str(active.get("role") or active.get("from") or ""),
-            thread_id=str(active.get("conversationId") or active["taskId"]), message_id=str(active.get("messageId") or ""))
+            thread_id=str(active.get("conversationId") or task_id), message_id=str(active.get("messageId") or ""))
 
     async def _accept_active_context(self, envelope: dict[str, Any]) -> bool:
         active = _load_active_envelope(self.settings)

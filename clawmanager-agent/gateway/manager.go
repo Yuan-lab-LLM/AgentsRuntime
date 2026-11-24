@@ -690,13 +690,18 @@ func (m *GatewayManager) Health() error {
 	if m.cfg.WorkspaceRoot == "" {
 		return fmt.Errorf("workspace root is empty")
 	}
-	if err := os.MkdirAll(m.cfg.WorkspaceRoot, 0o755); err != nil {
-		return fmt.Errorf("workspace root unavailable: %w", err)
-	}
 	if m.IsolatedGatewayLifecycle() {
 		if m.cfg.GatewayPortStart < 1 || m.cfg.GatewayPortEnd > 65535 || m.cfg.GatewayPortEnd < m.cfg.GatewayPortStart || (m.cfg.GatewayPortBlockSize > 1 && !m.cfg.IsolatedLifecycle) || (m.cfg.IsolatedLifecycle && m.cfg.GatewayPortBlockSize < 1) {
 			return fmt.Errorf("port_conflict: invalid configured pool")
 		}
+	}
+	if m.cfg.ManagementStorageHealth != nil {
+		return m.cfg.ManagementStorageHealth()
+	}
+	if err := os.MkdirAll(m.cfg.WorkspaceRoot, 0o755); err != nil {
+		return fmt.Errorf("workspace root unavailable: %w", err)
+	}
+	if m.IsolatedGatewayLifecycle() {
 		file, err := os.CreateTemp(m.cfg.WorkspaceRoot, ".runtime-health-*")
 		if err != nil {
 			return fmt.Errorf("workspace_unavailable")

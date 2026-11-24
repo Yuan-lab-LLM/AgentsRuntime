@@ -45,6 +45,8 @@ type Snapshot struct {
 	Assignment             *Assignment                `json:"assignment,omitempty"`
 	Skills                 gateway.SkillReportPayload `json:"skills"`
 	Quarantined            bool                       `json:"quarantined"`
+	StorageUnavailable     bool                       `json:"storage_unavailable,omitempty"`
+	unreachable            bool
 }
 
 type Pool struct {
@@ -101,6 +103,7 @@ func (p *Pool) snapshots(ctx context.Context) ([]Snapshot, int) {
 			status, data, err := p.call(ctx, i, http.MethodGet, "/v1/slot-state", nil)
 			if err != nil || status != 200 || json.Unmarshal(data, &snapshots[i]) != nil {
 				snapshots[i].Quarantined = true
+				snapshots[i].unreachable = true
 				return
 			}
 		}(i)

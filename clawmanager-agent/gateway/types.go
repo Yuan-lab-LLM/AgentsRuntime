@@ -14,16 +14,17 @@ const (
 )
 
 var (
-	ErrNoFreePort         = errors.New("no free port")
-	ErrDraining           = errors.New("runtime pod is draining")
-	ErrUpgradeStandby     = errors.New("runtime pod is waiting for upgrade activation")
-	ErrRuntimeType        = errors.New("agent_type does not match runtime type")
-	ErrWorkspacePath      = errors.New("workspace path is outside requested instance")
-	ErrStaleGeneration    = errors.New("stale gateway generation")
-	ErrActiveGeneration   = errors.New("previous gateway generation is still active")
-	ErrGatewayStartFailed = errors.New("gateway start failed")
-	ErrGatewayStopFailed  = errors.New("gateway stop was not confirmed")
-	ErrWriterLeaseActive  = errors.New("workspace writer lease is active")
+	ErrNoFreePort               = errors.New("no free port")
+	ErrDraining                 = errors.New("runtime pod is draining")
+	ErrUpgradeStandby           = errors.New("runtime pod is waiting for upgrade activation")
+	ErrRuntimeType              = errors.New("agent_type does not match runtime type")
+	ErrWorkspacePath            = errors.New("workspace path is outside requested instance")
+	ErrStaleGeneration          = errors.New("stale gateway generation")
+	ErrActiveGeneration         = errors.New("previous gateway generation is still active")
+	ErrGatewayStartFailed       = errors.New("gateway start failed")
+	ErrGatewayStopFailed        = errors.New("gateway stop was not confirmed")
+	ErrNetworkAuthorizationLost = errors.New("network_authorization_lost")
+	ErrWriterLeaseActive        = errors.New("workspace writer lease is active")
 )
 
 type Config struct {
@@ -31,12 +32,14 @@ type Config struct {
 	// It pins the authorized directory across a user namespace's GID mapping.
 	NativeTeamGrant *NativeTeamGrant
 	// WorkspaceHealthCheck performs fixed private-file validation under the active instance identity.
-	WorkspaceHealthCheck   func(context.Context, GatewayStartSpec) error
-	SandboxProfile         string
-	NetworkSecurityProfile string
-	NetworkSlotIndex       int
-	NetworkSlotCount       int
-	NetworkEgressProxyURL  string
+	WorkspaceHealthCheck func(context.Context, GatewayStartSpec) error
+	// ManagementStorageHealth supplies workspace health for a managed slot.
+	ManagementStorageHealth func() error
+	SandboxProfile          string
+	NetworkSecurityProfile  string
+	NetworkSlotIndex        int
+	NetworkSlotCount        int
+	NetworkEgressProxyURL   string
 	// IsolatedLifecycle joins startup and teardown before releasing a container slot.
 	IsolatedLifecycle bool
 	// Non-nil GatewayBaseEnv prevents supervisor secrets entering user processes.

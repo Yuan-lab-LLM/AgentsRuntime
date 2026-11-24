@@ -52,10 +52,8 @@ func (w *Worker) serveWorkbenchPreview(out http.ResponseWriter, r *http.Request)
 		return
 	}
 	req := route.Scope()
-	w.mu.Lock()
-	if !w.admitsWorkbench(req) {
-		w.mu.Unlock()
-		workbenchError(out, gateway.ErrStaleGeneration)
+	if err = w.lockWorkbenchSlot(r.Context(), req); err != nil {
+		workbenchError(out, err)
 		return
 	}
 	err = w.manager.WorkbenchPreviewWithAdmission(r.Context(), req, w.mu.Unlock, func(ctx context.Context, dial func(context.Context, string, string) (net.Conn, error)) error {

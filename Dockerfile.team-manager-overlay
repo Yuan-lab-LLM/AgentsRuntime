@@ -5,5 +5,30 @@ ARG RUNTIME_TYPE
 ARG VCS_REF
 COPY --chmod=755 --from=manager-binaries /${RUNTIME_TYPE}-agent /usr/local/bin/clawmanager-agent
 COPY --chmod=755 --from=manager-binaries /${RUNTIME_TYPE}-agent /usr/local/libexec/clawmanager-agent-image
-RUN if [ "$RUNTIME_TYPE" = hermes ]; then python3 /usr/local/share/hermes-lite/verify_lite_release.py --lock /usr/local/share/hermes-lite/source-lock.json --generate-release --verify-release; fi
+COPY plugins/openclaw-redis-team/ /tmp/team-refresh/openclaw/
+COPY plugins/hermes-redis-team/ /tmp/team-refresh/hermes/
+COPY opencode/team/ /tmp/team-refresh/opencode/
+COPY deepseek-harness/team/ /tmp/team-refresh/deepseek/
+RUN set -eu; \
+    case "$RUNTIME_TYPE" in \
+      openclaw) \
+        for target in /defaults/.openclaw/extensions/redis-team /usr/local/lib/node_modules/openclaw/dist/extensions/redis-team; do \
+          test -d "$target"; cp -a /tmp/team-refresh/openclaw/. "$target/"; chmod -R a+rX "$target"; \
+        done ;; \
+      hermes) \
+        cp -a /tmp/team-refresh/hermes/. /opt/hermes-agent/plugins/platforms/redis_team/; \
+        chown -R root:root /opt/hermes-agent/plugins/platforms/redis_team; \
+        chmod -R go-w /opt/hermes-agent/plugins/platforms/redis_team; \
+        python3 /usr/local/share/hermes-lite/verify_lite_release.py --lock /usr/local/share/hermes-lite/source-lock.json --generate-release --verify-release ;; \
+      opencode) \
+        cp -a /tmp/team-refresh/opencode/. /usr/local/share/clawmanager/opencode-team/; \
+        node /usr/local/share/clawmanager/opencode-team/build-protocol.mjs /usr/local/share/clawmanager/opencode-team/protocol.mjs /tmp/team-refresh/openclaw/dist/index.js ;; \
+      deepseek-harness) \
+        cp -a /tmp/team-refresh/opencode/. /opt/clawmanager-dsh/adapter/opencode/team/; \
+        cp -a /tmp/team-refresh/deepseek/. /opt/clawmanager-dsh/adapter/deepseek-harness/team/; \
+        cp /tmp/team-refresh/openclaw/dist/index.js /opt/clawmanager-dsh/adapter/plugins/openclaw-redis-team/dist/index.js; \
+        node /opt/clawmanager-dsh/adapter/deepseek-harness/team/build.mjs /opt/clawmanager-dsh/adapter/deepseek-harness/team/protocol.mjs ;; \
+      *) echo 'Unsupported Runtime overlay' >&2; exit 64 ;; \
+    esac; \
+    rm -rf /tmp/team-refresh
 LABEL org.opencontainers.image.revision=$VCS_REF
